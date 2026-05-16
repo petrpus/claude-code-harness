@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-code-harness",
+  "description": "Universal Claude Code harness for code-dev projects (Petr Pus, private)",
+  "owner": {
+    "name": "Petr Pus"
+  },
+  "plugins": [
+    {
+      "name": "claude-code-harness",
+      "description": "Skills (Pocock + Vercel + own orchestration), code-reviewer agent, generic git/dev hooks.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
