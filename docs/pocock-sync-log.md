@@ -40,5 +40,15 @@ Procedure:
 
 ## Own (no external source)
 
-`next` lives in `skills/next/`. Authored here, no upstream — change in this repo
-directly. Excluded from the sync table on purpose.
+Authored in this repo, no upstream. Track changes via git history; not listed
+in the sync table.
+
+- `skills/next/`
+- `skills/commit-agent/`
+- `skills/implement-issue/`
+- `skills/start-feature/`
+- `skills/migration-check/`
+- `skills/harness-init/`
+- `skills/harness-doctor/`
+- `agents/code-reviewer.md`
+- `hooks/*.sh` + `hooks/hooks.json`
