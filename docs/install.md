@@ -1,81 +1,59 @@
 # Install
 
-## Primary: Anthropic plugin (recommended)
+## In a new project
 
-In any code-dev project (your repo root):
+Four lines inside a Claude Code session at the project root:
 
-```bash
-# Inside a Claude Code session:
+```
 /plugin marketplace add github:petrpus/claude-code-harness
 /plugin install claude-code-harness
+/harness-init
+/harness-doctor
 ```
 
-That installs the plugin globally per-user. Skills, agent, and hooks become available in **every** project automatically.
+What each does:
 
-To update:
+| Step | Effect |
+|---|---|
+| `marketplace add` | Registers this repo as a plugin source |
+| `install` | Installs skills, agents, hooks globally for your user |
+| `/harness-init` | Bootstraps `.claude/settings.json` + `tmp/` in the current project |
+| `/harness-doctor` | Read-only sanity check; flags stale local files, missing config |
 
-```bash
+After `/harness-init` you'll typically want to:
+- Add project-specific WebFetch domains, Read paths, allow patterns to `.claude/settings.json`
+- Create `CLAUDE.md` at the repo root with project rules
+- (Optional) Add project-local hooks at `.claude/hooks/*.local.sh` for project-specific guards
+
+## Updating
+
+When the harness repo changes:
+
+```
 /plugin update claude-code-harness
 ```
 
-To uninstall:
+Updates are **per-project manual** — a push to the harness repo doesn't propagate until each project runs `/plugin update`. That's intentional: one project upgrading can't break another.
 
-```bash
+After updating, re-run `/harness-doctor` to catch any newly-shadowed local files.
+
+## Uninstalling
+
+```
 /plugin uninstall claude-code-harness
 ```
 
-## Per-project setup (one-time, per repo)
-
-After installing the plugin, do this once per project where you want full functionality:
-
-### 1. Bootstrap baseline permissions
-
-The plugin doesn't ship `settings.json` (Claude Code doesn't let plugins write to projects). Copy the template:
-
-```bash
-cp ~/.claude/plugins/claude-code-harness/templates/project-settings.template.json \
-   your-project/.claude/settings.json
-```
-
-…or manually merge it into your existing `your-project/.claude/settings.json`. Adjust:
-
-- WebFetch domains (defaults are generic — add your scrapers/docs)
-- File globs for Edit/Write (defaults: `app/**`, `tests/**`, `prisma/**`, etc.)
-- Project-specific hooks (the template only wires the plugin's hooks; add your own `pre-edit.local.sh` etc. if needed)
-
-### 2. (Optional) Add project-specific hook wrappers
-
-If your project has domain-specific guards (e.g. block edits to auto-generated docs), create:
-
-```
-your-project/.claude/hooks/pre-edit.local.sh
-your-project/.claude/hooks/pre-bash.local.sh
-```
-
-…and register them in `your-project/.claude/settings.json` **alongside** the plugin hooks (both fire — they don't conflict).
-
-### 3. Initialize verify status file
-
-If your project uses `npm run verify` / `pnpm verify`:
-
-```bash
-mkdir -p tmp
-echo "ok" > tmp/.last-verify-status
-```
-
-(Your verify script should write `ok` or `fail` to this file on completion. The hooks `inject-git-context`, `on-stop`, and `pre-commit-gate` read it.)
-
 ## Cloud Claude Code
 
-Plugin installs are per-user globally, so they apply to cloud sessions too — as long as you're signed in with the same account. The plugin is private; cloud will request access to your private repos on first install.
+Plugin installs are per-user globally, so they apply to cloud sessions as long as you're signed in with the same account. The plugin is private; cloud will request access on first install.
 
-## Removing the legacy `~/.agents/` setup
+## Migrating from the legacy setup
 
-If you're migrating from Matt Pocock's CLI install:
+If you have the old `~/.agents/` install from Pocock's CLI:
 
 ```bash
 rm -rf ~/.agents
-rm -rf ~/.claude/skills      # dead symlinks
+rm -rf ~/.claude/skills      # dead symlinks if any
 ```
 
-The plugin replaces what was there.
+If a project already has `.claude/skills/`, `.claude/agents/code-reviewer.md`, or `.claude/hooks/*.sh` that the plugin now provides, **don't delete them blind** — run `/harness-doctor` first; it'll list exactly what's stale and shadow which plugin file.
