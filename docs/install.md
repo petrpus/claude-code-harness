@@ -5,7 +5,7 @@
 Four lines inside a Claude Code session at the project root:
 
 ```
-/plugin marketplace add github:petrpus/claude-code-harness
+/plugin marketplace add git@github.com:petrpus/claude-code-harness.git
 /plugin install claude-code-harness
 /harness-init
 /harness-doctor

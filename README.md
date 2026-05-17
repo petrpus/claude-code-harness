@@ -19,7 +19,7 @@ Pocock-derived content is vendored ad-hoc from [`mattpocock/skills`](https://git
 In any code-dev project:
 
 ```bash
-/plugin marketplace add github:petrpus/claude-code-harness
+/plugin marketplace add git@github.com:petrpus/claude-code-harness.git
 /plugin install claude-code-harness
 ```
 

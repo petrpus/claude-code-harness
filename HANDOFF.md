@@ -28,7 +28,7 @@ Private under `petrpus`. Don't push without confirming with the user.
 **Gated**: don't start until current `feat/admin-sidebar-flatten` work in 101 is committed/merged. Confirm with the user before touching 101.
 
 Then in a fresh branch `chore/harness-migration` in 101:
-1. `/plugin marketplace add github:petrpus/claude-code-harness && /plugin install claude-code-harness`
+1. `/plugin marketplace add git@github.com:petrpus/claude-code-harness.git && /plugin install claude-code-harness`
 2. `rm -rf 101/.claude/agents/`
 3. `rm 101/.claude/skills/{commit-agent,implement-issue,start-feature,migration-check}/SKILL.md && rmdir those dirs`
 4. `rm 101/.claude/hooks/{inject-git-context,on-stop,pre-bash,pre-commit-gate,post-edit}.sh`
