@@ -1,5 +1,6 @@
 {
   "name": "claude-code-harness",
+  "version": "0.1.0",
   "description": "Universal code-dev harness for Claude Code: cherry-picked Pocock + Vercel skills, custom orchestration (next, implement-issue, start-feature, commit-agent, migration-check), code-reviewer agent, and generic git/dev hooks.",
   "author": {
     "name": "Petr Pus"
