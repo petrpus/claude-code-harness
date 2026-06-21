@@ -15,7 +15,9 @@ Procedure:
 | Skill | Upstream path | Vendored SHA | First vendored | Last synced | Notes |
 |---|---|---|---|---|---|
 | caveman | `skills/productivity/caveman/SKILL.md` | `17972a1` | 2026-05-16 | 2026-05-16 | initial vendor |
+| codebase-design | `skills/engineering/codebase-design/SKILL.md` | `6eeb81b` | 2026-06-21 | 2026-06-21 | initial vendor; incl. `DEEPENING.md`, `DESIGN-IT-TWICE.md` |
 | diagnose | `skills/engineering/diagnose/SKILL.md` | `43d464d` | 2026-05-16 | 2026-05-16 | initial vendor |
+| domain-modeling | `skills/engineering/domain-modeling/SKILL.md` | `6eeb81b` | 2026-06-21 | 2026-06-21 | initial vendor; incl. `ADR-FORMAT.md`, `CONTEXT-FORMAT.md` |
 | grill-me | `skills/productivity/grill-me/SKILL.md` | `2a1ad17` | 2026-05-16 | 2026-05-16 | initial vendor |
 | grill-with-docs | `skills/engineering/grill-with-docs/SKILL.md` | `3c4ac97` | 2026-05-16 | 2026-05-16 | initial vendor |
 | handoff | `skills/productivity/handoff/SKILL.md` | `85c644d` | 2026-05-16 | 2026-05-16 | initial vendor |

@@ -6,9 +6,9 @@ Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code
 
 | Area | What |
 |---|---|
-| **Skills (Pocock-derived, vendored)** | `caveman`, `diagnose`, `grill-me`, `grill-with-docs`, `handoff`, `improve-codebase-architecture`, `prototype`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
+| **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `handoff`, `improve-codebase-architecture`, `prototype`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
 | **Skills (Vercel Labs)** | `find-skills` |
-| **Skills (own)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog` |
+| **Skills (own)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
 | **Agents** | `code-reviewer` (independent cold diff review) |
 | **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks) |
 
