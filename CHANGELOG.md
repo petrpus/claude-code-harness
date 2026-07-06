@@ -2,6 +2,25 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [0.2.1] — 2026-07-06
+
+Documentation & distribution polish on top of 0.2.0.
+
+### Added
+- `docs/guide.html` — self-contained, offline, theme-aware visual guide (content
+  map, install, six typical workflows, the autopilot gate pipeline, model-tiering
+  table, best practices), with a repo link in the topbar and footer.
+- `docs/index.html` — forwards to the guide so a GitHub Pages site served from
+  `/docs` lands on it.
+- README: Credits & acknowledgements crediting Matt Pocock (`mattpocock/skills`),
+  Vercel Labs (`vercel-labs/skills`), Archive228 (`loopkit`, ideas re-engineered),
+  and Anthropic (Claude Code); link to the guide.
+
+### Notes
+- GitHub Pages must be enabled once by the repo owner (Settings → Pages → Deploy
+  from a branch → `main` / `/docs`). An Actions-based auto-enable was attempted
+  and removed: the default `GITHUB_TOKEN` can't create a Pages site.
+
 ## [0.2.0] — 2026-07-06
 
 The "autonomous harness" release — fuses a re-sync of the vendored Pocock skills
