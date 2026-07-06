@@ -1,0 +1,41 @@
+# .github/workflows/ci.yml — installed by `/project-infra ci`.
+#
+# Minimal, stack-neutral: one job that installs deps and runs the project's
+# own `npm run verify` (installed by `/project-infra verify`). Keep the real
+# logic (typecheck/lint/test) inside `verify`, not duplicated here — this
+# workflow is just the runner + trigger.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm" # swap to "pnpm" if this project uses pnpm-lock.yaml
+
+      # npm:
+      - run: npm ci
+      # pnpm equivalent — replace the two steps above and this one with:
+      #   - uses: pnpm/action-setup@v4
+      #   - uses: actions/setup-node@v4
+      #     with: { node-version: "20", cache: "pnpm" }
+      #   - run: pnpm install --frozen-lockfile
+
+      - run: npm run verify
+      # pnpm: - run: pnpm run verify
+
+      - name: Upload verify status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: last-verify-status
+          path: tmp/.last-verify-status
+          if-no-files-found: ignore
