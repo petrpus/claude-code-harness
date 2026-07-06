@@ -29,7 +29,8 @@ The skill checks at start:
 - Read `CONTEXT.md` (shared language)
 - Identify affected files (predicted edits)
 - Identify entities + types affected
-- If TS types will be non-trivial, **invoke the `typescript-expert` subagent** (Pocock)
+- If the types/interfaces will be non-trivial, re-read `/codebase-design`
+  (and its `DESIGN-IT-TWICE.md`) before committing to a shape
 
 Output: short step-by-step plan (5–10 steps). **Show to user and wait for
 approval.**
@@ -142,7 +143,7 @@ Once verify is green:
 
 | Failure | What to do |
 |---|---|
-| TS types don't fit | `typescript-expert` subagent |
+| TS types don't fit | re-read `/codebase-design` + `DESIGN-IT-TWICE.md` |
 | Test keeps failing | `/diagnose` |
 | Spec is ambiguous | Stop, invoke `/grill-with-docs` on that section |
 | Issue turns out too big | Stop, go back to `/to-issues` and split |

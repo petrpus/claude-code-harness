@@ -54,8 +54,11 @@ but not in current settings, and ask whether to merge selected entries.
 mkdir -p "$PROJECT_ROOT/tmp"
 ```
 
-If `.gitignore` exists and doesn't already ignore `tmp/`, append `tmp/` to it.
-If `.gitignore` doesn't exist, create one with `tmp/` + `.env*` + `node_modules/`.
+If `.gitignore` exists and doesn't already ignore `tmp/`, append `tmp/` to it
+(this also covers `tmp/autopilot/` run state and `tmp/session-log.jsonl`).
+If `.gitignore` doesn't exist, create one with `tmp/` + `.env*` +
+`!.env.example` + `node_modules/`. The `!.env.example` un-ignore is important:
+`/project-infra env` writes `.env.example` and it should be committed.
 
 ### 5. Print checklist
 
@@ -71,7 +74,13 @@ Next steps:
    specific review checklist that extends the code-reviewer agent.
 3. (Optional) Add project-local hooks at .claude/hooks/*.local.sh and register
    them in .claude/settings.json alongside the plugin hooks.
-4. Run /harness-doctor to verify the setup.
+4. Run /project-infra to provision a verify command, CI, and a devcontainer
+   (autopilot requires an objective verify command before it will run).
+5. Run /harness-doctor to verify the setup.
+
+New in this harness: /autopilot (controlled long autonomous runs),
+/cost-discipline + /usage-report (token/cost awareness), /openapi-sync and
+/code-map (docs), /project-infra (infra + CI/CD).
 ```
 
 ## When not to use

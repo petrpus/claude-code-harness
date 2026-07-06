@@ -45,6 +45,23 @@ Notes:
 - `--no-merges` strips merge noise. If the user explicitly asks for merges, drop that flag.
 - Both subject (`%s`) and body (`%b`) are captured — the body often holds the real reasoning.
 
+### 3b. Enrich with session activity (if present)
+
+The harness `session-log.sh` Stop hook appends a per-turn JSONL entry to
+`tmp/session-log.jsonl` (`{ts, session_id, cwd, branch, dirty_files,
+last_commit, event}`). It captures work that never became a commit (research
+turns, aborted attempts, long dirty-tree stretches).
+
+```bash
+[[ -f tmp/session-log.jsonl ]] && jq -c "select(.ts >= \"$(date -d "${X} days ago" +%Y-%m-%d)\")" tmp/session-log.jsonl 2>/dev/null
+```
+
+If the file exists, fold these into the digest as a secondary signal — commits
+stay the **primary** record; session entries fill the gaps between them (e.g.
+"several turns on branch X with no commit → exploratory/blocked"). Collapse the
+many per-turn entries per (day, branch) into one line; don't list every turn.
+If the file is absent or `jq` is missing, skip silently.
+
 ### 4. Group and synthesize
 
 Group by `(date desc, author)`. For each block:
