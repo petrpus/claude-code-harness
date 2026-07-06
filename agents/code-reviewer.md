@@ -1,7 +1,8 @@
 ---
 name: code-reviewer
 description: Independent review of a diff before PR. Reads the diff "cold" without project memory and applies the checklist. Use at the end of /implement-issue's BUILD phase.
-tools: [Read, Bash, Grep]
+tools: Read, Bash, Grep
+model: sonnet
 ---
 
 # Agent: code-reviewer
