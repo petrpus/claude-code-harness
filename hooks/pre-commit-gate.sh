@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
-# PreToolUse hook for `git commit` — checks verify freshness.
+# PreToolUse hook for `git commit` — warns (never blocks) on stale/red verify.
 #
-# Warns (does not block) if the project verify was last run more than 30
-# minutes ago, or was red. Some commits (docs-only, WIP before context
-# switch) legitimately don't need a fresh verify. The hook just makes
-# the staleness visible.
+# Some commits (docs-only, WIP before a context switch) legitimately don't
+# need a fresh verify. This hook just makes staleness visible.
+#
+# Contract: reads tool_input.command from stdin. Always exits 0 (warn-only,
+# stderr).
 
-set -eo pipefail
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lib.sh"
 
-CMD="${CLAUDE_TOOL_BASH_COMMAND:-}"
+read_stdin_json
+CMD="$(hook_tool_command)"
 
-# Only act on `git commit` (not commit --amend, which is handled elsewhere)
-if [[ ! "$CMD" =~ ^git\ commit($|\ ) ]]; then
-  exit 0
-fi
+# Only act on `git commit` (word-boundary, allowing a leading `cd x && `).
+case " $CMD " in
+  *" git commit "*|*" git commit"|"git commit "*|"git commit") : ;;
+  *) exit 0 ;;
+esac
 
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
+cd_repo_root
 STATUS_FILE="tmp/.last-verify-status"
 
 if [[ ! -f "$STATUS_FILE" ]]; then
@@ -24,15 +29,15 @@ if [[ ! -f "$STATUS_FILE" ]]; then
   exit 0
 fi
 
-AGE_SEC=$(( $(date +%s) - $(stat -c %Y "$STATUS_FILE" 2>/dev/null || stat -f %m "$STATUS_FILE" 2>/dev/null || echo 0) ))
-STATUS=$(cat "$STATUS_FILE" 2>/dev/null || echo "unknown")
+NOW="$(date +%s 2>/dev/null || echo 0)"
+AGE_SEC=$(( NOW - $(mtime_of "$STATUS_FILE") ))
+STATUS="$(cat "$STATUS_FILE" 2>/dev/null || echo 'unknown')"
 
-if [[ "$AGE_SEC" -gt 1800 ]]; then  # 30 min
-  AGE_MIN=$((AGE_SEC / 60))
-  echo "Last verify was ${AGE_MIN} min ago. Consider re-running before commit." >&2
+if [[ "$AGE_SEC" -gt 1800 ]]; then
+  echo "Last verify was $((AGE_SEC / 60)) min ago. Consider re-running before commit." >&2
 fi
 
-if [[ "$STATUS" != "ok" ]] && [[ "$STATUS" != "unknown" ]]; then
+if [[ "$STATUS" != "ok" && "$STATUS" != "unknown" ]]; then
   echo "Last verify status: $STATUS (not 'ok'). Make sure verify is green before push." >&2
 fi
 

@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# UserPromptSubmit hook — injects current git context + verify status
-# into agent context at start of each turn.
+# UserPromptSubmit hook — injects current git context + verify status into
+# agent context at the start of each turn.
 #
-# Reads project verify status from tmp/.last-verify-status (convention).
-# Projects that don't follow that convention will just see "never".
+# stdout from UserPromptSubmit IS fed to the model as context. Reads verify
+# status from tmp/.last-verify-status (harness convention); projects that
+# don't follow it just see "never".
+#
+# Best-effort: never hard-fail a turn. No `set -e`; guard the `git status |
+# head` pipe against SIGPIPE by capturing full status before trimming.
 
-# Best-effort injection: never hard-fail a turn. No `set -e` (a non-zero exit on
-# UserPromptSubmit can disrupt the turn), and capture full status before trimming
-# to avoid SIGPIPE from `git status | head` under pipefail.
 set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lib.sh"
 
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 0
+read_stdin_json
+cd_repo_root
 
 BRANCH="$(git branch --show-current 2>/dev/null || echo 'detached')"
 DIRTY="$(git status --porcelain 2>/dev/null || true)"
