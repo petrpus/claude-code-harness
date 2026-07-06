@@ -1,5 +1,6 @@
 {
   "_comment": "Baseline permissions + deny for code-dev projects using claude-code-harness. Copy to .claude/settings.json in the project, then add project-specific WebFetch domains / Read paths / extra allows on top.",
+  "_policy_layering": "Three layers, single source of truth each: (L1) this deny list = static string patterns (force-push, rm -rf /, reading .env). (L2) hooks/pre-bash.sh = context-dependent logic that a static pattern can't express (push FROM main needs the branch). (L3) skills like commit-agent = workflow advice that references, never re-implements, L1/L2. Don't duplicate a rule across layers.",
   "permissions": {
     "allow": [
       "Edit(**/*.md)",
@@ -58,6 +59,8 @@
       "Write(.claude/**)",
       "Edit(.github/**)",
       "Write(.github/**)",
+      "Edit(docs/**)",
+      "Write(docs/**)",
       "Edit(tmp/**)",
       "Write(tmp/**)",
 
@@ -77,7 +80,9 @@
       "Bash(rm -rf /*)",
       "Bash(rm -rf .git*)",
       "Write(.env)",
-      "Edit(.env)"
+      "Edit(.env)",
+      "Read(.env)",
+      "Read(.env.*)"
     ],
     "additionalDirectories": ["/tmp"]
   }

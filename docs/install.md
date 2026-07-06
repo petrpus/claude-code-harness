@@ -23,7 +23,12 @@ What each does:
 After `/harness-init` you'll typically want to:
 - Add project-specific WebFetch domains, Read paths, allow patterns to `.claude/settings.json`
 - Create `CLAUDE.md` at the repo root with project rules
+- Run `/project-infra` to provision a verify command, CI, and a devcontainer
+  (`autopilot` requires an objective verify command before it will run)
 - (Optional) Add project-local hooks at `.claude/hooks/*.local.sh` for project-specific guards
+
+**Note:** the guard hooks parse tool input with `jq` and fail open without it —
+ensure `jq` is on `PATH` (`/harness-doctor` flags it if missing).
 
 ## Updating
 

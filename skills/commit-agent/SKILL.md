@@ -36,6 +36,14 @@ skill.
 | Includes `console.log` / `debugger` | Warn (lint should catch; double check) |
 | Touches generated/derived files directly | Block — must regenerate via the proper skill |
 
+> **Policy layering.** This skill is the **L3 workflow layer** — it advises and
+> composes a clean commit. It does **not** re-implement enforcement. The hard
+> "push from main" block lives in `hooks/pre-bash.sh` (L2, needs the branch),
+> and static denials (force-push, `rm -rf /`, `.env` writes) live in
+> `settings.json` deny (L1). If those layers already block something, don't
+> duplicate the rule here — just reference it. See
+> `docs/architecture.md` § Policy layering.
+
 ### 2. Compose commit plan
 
 Output a **commit plan**:

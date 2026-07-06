@@ -1,31 +1,47 @@
 #!/usr/bin/env bash
-# Pre-edit hook — runs before any Write or Edit tool call.
+# PreToolUse hook for Write|Edit — blocks edits to secrets and lock files.
 #
-# Blocks:
-# - Edits to .env files (sensitive)
-# - Edits to lock files outside of `pnpm install` / `npm install` flow
+# Contract: reads tool_input.file_path from the JSON on stdin.
+#   exit 0 = allow · exit 2 = BLOCK (stderr shown to Claude).
 #
-# Project-specific blocks (e.g. auto-generated docs, schema files) belong
-# in a project-local pre-edit.local.sh registered alongside this one.
+# Project-specific blocks (auto-generated docs, schema files) belong in a
+# project-local hook registered alongside this one.
 
-set -eo pipefail
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/lib.sh"
 
-PATH_ARG="${CLAUDE_TOOL_FILE_PATH:-}"
+read_stdin_json
+PATH_ARG="$(hook_tool_file_path)"
 
-if [[ -z "$PATH_ARG" ]]; then
-  exit 0
-fi
+[[ -z "$PATH_ARG" ]] && exit 0
 
-# Block .env edits
-if [[ "$PATH_ARG" == *.env || "$PATH_ARG" == *.env.* ]]; then
-  echo "Don't edit .env files via agent — keep secrets out of agent context."
-  exit 1
-fi
+base="$(basename "$PATH_ARG")"
 
-# Block lock file direct edits
-if [[ "$PATH_ARG" == */pnpm-lock.yaml || "$PATH_ARG" == */package-lock.json || "$PATH_ARG" == */yarn.lock ]]; then
-  echo "Don't edit lock files directly. Run \`pnpm install <pkg>\` (or your package manager equivalent) instead."
-  exit 1
-fi
+# Allow example/template env files FIRST — .env.example is meant to be edited
+# (project-infra's `env` mode writes it; .gitignore un-ignores it).
+case "$base" in
+  .env.example|*.env.example|.env.template|*.env.template|.env.sample|*.env.sample)
+    exit 0
+    ;;
+esac
+
+# Block real .env files (secrets).
+case "$base" in
+  .env|.env.*|*.env)
+    echo "Don't edit .env files via agent — keep secrets out of agent context." >&2
+    echo "(.env.example / .env.template are allowed for documenting variable names.)" >&2
+    exit 2
+    ;;
+esac
+
+# Block direct lock-file edits.
+case "$base" in
+  pnpm-lock.yaml|package-lock.json|yarn.lock|bun.lockb|Cargo.lock|poetry.lock)
+    echo "Don't edit lock files directly. Run your package manager (e.g. \`pnpm install <pkg>\`) instead." >&2
+    exit 2
+    ;;
+esac
 
 exit 0

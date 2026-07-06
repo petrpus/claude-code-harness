@@ -23,30 +23,40 @@ If not: 🟠 — harness baseline isn't applied. Suggest `/harness-init`.
 
 Check `.claude/skills/` for any of these (each shadows the plugin version):
 
-- Vendored: `caveman`, `diagnose`, `grill-me`, `grill-with-docs`, `handoff`,
-  `improve-codebase-architecture`, `prototype`, `tdd`, `to-issues`, `to-prd`,
-  `triage`, `write-a-skill`, `zoom-out`, `find-skills`, `next`
-- Own: `commit-agent`, `implement-issue`, `start-feature`, `migration-check`,
-  `harness-init`, `harness-doctor`
+- Vendored: `caveman`, `codebase-design`, `diagnose`, `domain-modeling`,
+  `grill-me`, `grill-with-docs`, `grilling`, `handoff`,
+  `improve-codebase-architecture`, `prototype`, `research`, `tdd`, `to-issues`,
+  `to-prd`, `triage`, `write-a-skill`, `zoom-out`, `find-skills`
+- Own: `next`, `commit-agent`, `implement-issue`, `start-feature`,
+  `migration-check`, `worklog`, `harness-init`, `harness-doctor`, `autopilot`,
+  `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`, `code-map`
 
 Each match → 🟠. Suggest `rm -rf .claude/skills/<name>/`.
 
-### 4. Stale local agent
+### 4. Stale local agents
 
-Check `.claude/agents/code-reviewer.md`. If present → 🟠 (plugin provides it).
+Check `.claude/agents/` for `code-reviewer.md` and `verifier.md`. Each present
+→ 🟠 (plugin provides them).
 
 ### 5. Stale local hooks
 
-Check `.claude/hooks/` for each of: `inject-git-context.sh`, `on-stop.sh`,
-`pre-bash.sh`, `pre-commit-gate.sh`, `pre-edit.sh`. Each match → 🟠.
+Check `.claude/hooks/` for each of: `lib.sh`, `inject-git-context.sh`,
+`on-stop.sh`, `session-log.sh`, `pre-bash.sh`, `pre-commit-gate.sh`,
+`pre-edit.sh`. Each match → 🟠.
 
 `.local.sh` files (e.g. `pre-edit.local.sh`) are project-specific overrides
 and **fine** — don't flag those.
 
+### 5b. jq available (hooks depend on it)
+
+Run `command -v jq`. If missing → 🟡: "The Bash/edit guard hooks parse tool
+input with jq and **fail open** (allow) without it — install jq to restore the
+guards." (`inject-git-context` / `on-stop` still work; only the guards degrade.)
+
 ### 6. settings.json hook entries duplicating plugin hooks
 
 Parse `.claude/settings.json` `hooks`. Any command path ending in one of the
-five harness hook filenames and pointing under `${CLAUDE_PROJECT_DIR}/.claude/`
+harness hook filenames (see §5) and pointing under `${CLAUDE_PROJECT_DIR}/.claude/`
 → 🟠 (plugin registers them via `${CLAUDE_PLUGIN_ROOT}` automatically).
 
 Entries pointing at `*.local.sh` are fine.

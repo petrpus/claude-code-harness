@@ -1,0 +1,33 @@
+<!doctype html>
+<!--
+  docs/api/index.html — instantiated by `/openapi-sync` from this template.
+
+  Renders docs/api/openapi.yaml via Redoc standalone, loaded from a CDN.
+  Generating and syncing the spec (and `/openapi-sync --check`) are fully
+  offline; only *viewing this page* needs network, since the Redoc bundle
+  itself is fetched from cdn.redoc.ly at load time. No local build step, no
+  bundler, no dependency added to the consumer repo.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>API Reference</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      spec-url is relative to this file. `/openapi-sync` writes this page
+      next to openapi.yaml (both under docs/api/), so the default
+      "./openapi.yaml" needs no rewriting. If you move the spec, update the
+      spec-url below to match.
+    -->
+    <redoc spec-url="./openapi.yaml"></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+  </body>
+</html>

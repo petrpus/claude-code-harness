@@ -29,19 +29,29 @@ docs/                  # architecture.md, install.md, pocock-sync-log.md
 
 1. **Vendored from Pocock** (`mattpocock/skills`) — cherry-picked by hand.
 2. **Vendored from Vercel Labs** (`vercel-labs/skills`) — currently `find-skills`.
-3. **Own** — authored here, no upstream (`next`, `commit-agent`, `implement-issue`,
-   `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor`).
+3. **Own** — authored here, no upstream. Workflow: `next`, `commit-agent`,
+   `implement-issue`, `start-feature`, `migration-check`, `worklog`,
+   `harness-init`, `harness-doctor`. Autonomy & infra: `autopilot` (loop engine),
+   `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`, `code-map`.
+   Plus agents `code-reviewer` (sonnet) + `verifier` (haiku). Loopkit ideas were
+   re-engineered, not vendored (see sync-log's Loopkit section).
 
 ### Vendoring discipline (important)
 
 Sync is **manual, never automated**. `docs/pocock-sync-log.md` is the source of
 truth for what is vendored and at which upstream SHA. To pull an update:
 
-1. Clone/inspect the upstream repo at its current HEAD.
+1. Inspect the upstream repo at its target SHA. In this environment the GitHub
+   API/codeload tarballs are proxy-blocked — fetch per-file from
+   `raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` (sleep/retry on 429).
 2. Diff `SKILL.md` (and any bundled resource files) against our vendored copy.
-3. Copy what you want, then update the sync-log row: new SHA, new sync date, note
-   what changed.
-4. Commit as `vendor: sync <skill> from <short-sha>`.
+3. Copy what you want, then update the sync-log row: new SHA, review date, note
+   what changed. Record local dir-name patches (e.g. `diagnose` ←
+   `diagnosing-bugs`) explicitly.
+4. Commit as `vendor: sync <skill> from <short-sha>`. For a **broad re-sync to
+   one SHA**, a single `vendor: re-sync <source> to <short-sha>` commit is more
+   auditable than many per-skill commits — bulk is the exception the sync-log
+   procedure allows.
 
 When vendoring, copy the **whole skill dir** including resource files (e.g.
 `ADR-FORMAT.md`, `DEEPENING.md`). Keep frontmatter as upstream unless it conflicts
@@ -63,13 +73,24 @@ its bootstrapped conventions are baked into the skills and documented here inste
 
 ## Hooks model
 
-Wired in `hooks/hooks.json` against `${CLAUDE_PLUGIN_ROOT}`:
+Wired in `hooks/hooks.json` against `${CLAUDE_PLUGIN_ROOT}`. **All hooks read
+tool input as JSON on stdin** (via `hooks/lib.sh`) — NOT from `$CLAUDE_TOOL_*`
+env vars (those don't exist; assuming them is what made the pre-0.2.0 guards
+silent no-ops). PreToolUse blocks with **exit 2**. See `docs/architecture.md` §
+Hook contract.
 
-- `PreToolUse` Write|Edit → `pre-edit.sh` (block `.env` + lockfile edits)
-- `PreToolUse` Bash → `pre-bash.sh` (push-from-main / force-push / rm -rf guards),
-  `pre-commit-gate.sh` (verify-freshness warning)
+- `PreToolUse` Write|Edit → `pre-edit.sh` (block `.env` + lockfile edits; allow `.env.example`)
+- `PreToolUse` Bash → `pre-bash.sh` (push-from-main / force-push / rm -rf guards,
+  segment-split for compound commands), `pre-commit-gate.sh` (verify-freshness warning)
 - `UserPromptSubmit` → `inject-git-context.sh` (branch / dirty / verify status)
-- `Stop` → `on-stop.sh` (uncommitted-changes + stale-verify reminders)
+- `Stop` → `on-stop.sh` (uncommitted-changes + stale-verify reminders),
+  `session-log.sh` (append per-turn JSONL to `tmp/session-log.jsonl`)
+
+`hooks/lib.sh` parses stdin with `jq` only and **fails open** without it (the
+hard layer is `settings.json` deny). Guard changes must keep the stdin-JSON
+contract and the exit-2 block semantics. Run `scripts/check-consistency.sh` and
+the hook test matrix (`echo '{"tool_input":{"command":"…"}}' | hooks/pre-bash.sh`)
+after touching hooks.
 
 Hook rules:
 - Hooks must degrade gracefully outside a git repo and when the verify-status file
@@ -89,4 +110,7 @@ config, unrelated to this repo, and only adds session-init overhead.
 
 ## Versioning
 
-Semver via git tags. No CI/CD yet.
+Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record,
+`scripts/check-consistency.sh` asserts they agree. Tag `v0.x.0` on the merge
+commit on `main`, never on a feature branch. The harness generates CI/CD for
+*consumer* projects (`/project-infra ci`); the harness repo has no pipeline yet.

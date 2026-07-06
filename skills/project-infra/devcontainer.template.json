@@ -1,0 +1,12 @@
+{
+  "//": "Installed by `/project-infra devcontainer`. JSONC is fine here — devcontainer.json supports comments. Minimal Node/TS baseline; swap the image or add features for other stacks.",
+  "name": "project-dev",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:20",
+  "postCreateCommand": "npm ci",
+  "//sessionStart": "This devcontainer targets Claude Code on the web. Pair it with a SessionStart hook (see the built-in `session-start-hook` skill) so a fresh web session can run tests/lint immediately without manual setup.",
+  "customizations": {
+    "vscode": {
+      "extensions": []
+    }
+  }
+}

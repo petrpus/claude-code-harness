@@ -1,5 +1,5 @@
 {
-  "description": "claude-code-harness hooks — git context injection, verify-status gates, edit/bash guards",
+  "description": "claude-code-harness hooks — git context injection, verify-status gates, edit/bash guards, session logging",
   "hooks": {
     "PreToolUse": [
       {
@@ -41,6 +41,10 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/on-stop.sh"
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-log.sh"
           }
         ]
       }

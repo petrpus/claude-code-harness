@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "claude-code-harness",
-      "description": "Skills (Pocock + Vercel + own orchestration), code-reviewer agent, generic git/dev hooks.",
+      "description": "Skills (Pocock + Vercel + own orchestration + autopilot loop engine, cost/usage, project-infra, docs), code-reviewer + verifier agents, stdin-JSON git/dev guard hooks.",
       "source": "./",
       "category": "productivity"
     }
