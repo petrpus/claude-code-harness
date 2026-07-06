@@ -81,6 +81,37 @@ Manual, on demand. When you want to check for updates:
 
 We don't use Pocock's `setup-matt-pocock-skills` installer — conventions are baked into the skills directly (see above).
 
+## Guide
+
+A full visual guide — content map, usage, typical workflows, and best practices —
+lives at [`docs/guide.html`](docs/guide.html) (self-contained, offline, open it
+in any browser).
+
+## Credits & acknowledgements
+
+This harness stands on the work of others. Vendored skills keep their upstream
+authorship; the sync log (`docs/pocock-sync-log.md`) records exactly what came
+from where and at which commit.
+
+- **[Matt Pocock](https://github.com/mattpocock) — [`mattpocock/skills`](https://github.com/mattpocock/skills)**
+  — the vendored engineering & productivity skills (`codebase-design`,
+  `domain-modeling`, `diagnose`, `tdd`, `to-prd`, `to-issues`, `triage`,
+  `grill-*`, `grilling`, `research`, `improve-codebase-architecture`,
+  `prototype`, `handoff`, `write-a-skill`, `zoom-out`, `caveman`) and the
+  CONTEXT.md + ADR + verify-loop conventions the harness assumes.
+- **[Vercel Labs](https://github.com/vercel-labs) — [`vercel-labs/skills`](https://github.com/vercel-labs/skills)**
+  — the `find-skills` skill and the `npx skills` ecosystem.
+- **[Archive228](https://github.com/Archive228) — [`loopkit`](https://github.com/Archive228/loopkit) (MIT)**
+  — the adversarial-verify "shortcuts" checklist, the fresh-context loop with
+  state on disk, and the context-budget / tool-restraint / subagent-fanout
+  doctrine. These **ideas were re-engineered** (not copied) into `autopilot`,
+  the `verifier` agent, and `cost-discipline`.
+- **[Anthropic](https://www.anthropic.com) — [Claude Code](https://docs.claude.com/claude-code)**
+  — the platform this plugin extends (skills, agents, hooks, headless `claude -p`).
+
+Own skills, agents, hooks, and the loop engine are authored in this repo.
+Licensed under [MIT](LICENSE).
+
 ## Versioning
 
 Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record and
