@@ -6,13 +6,30 @@ Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code
 
 | Area | What |
 |---|---|
-| **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `handoff`, `improve-codebase-architecture`, `prototype`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
+| **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `grilling`, `handoff`, `improve-codebase-architecture`, `prototype`, `research`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
 | **Skills (Vercel Labs)** | `find-skills` |
-| **Skills (own)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
-| **Agents** | `code-reviewer` (independent cold diff review) |
-| **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks) |
+| **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
+| **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `code-map` |
+| **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 11-shortcuts gate, haiku) |
+| **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` + `session-log` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks); all parse stdin JSON via `hooks/lib.sh` |
 
-Pocock-derived content is vendored ad-hoc from [`mattpocock/skills`](https://github.com/mattpocock/skills). See `docs/pocock-sync-log.md` for what we have and which upstream SHA it came from.
+Pocock-derived content is vendored ad-hoc from [`mattpocock/skills`](https://github.com/mattpocock/skills). Ideas (not files) from [`Archive228/loopkit`](https://github.com/Archive228/loopkit) were re-engineered into `autopilot`, `verifier`, and `cost-discipline`. See `docs/pocock-sync-log.md` for provenance and upstream SHAs.
+
+## Long autonomous runs (autopilot)
+
+For controlled multi-step work that runs unattended without risking quality or
+safety:
+
+```bash
+/project-infra verify          # ensure an objective verify command exists
+# scaffold tmp/autopilot/PROMPT.md from a PRD or issue, then:
+${CLAUDE_PLUGIN_ROOT}/skills/autopilot/loop.sh --max-iterations 10 --budget-usd 10
+```
+
+Each iteration is a fresh `claude -p` with state on disk; the runner enforces
+hard gates (machine verify + secret scan + adversarial haiku verifier), caps
+(iteration/time/budget), git checkpoints, and a JSONL run log. Cheap models
+verify, mid implements, top plans — see `docs/model-policy.md`.
 
 ## Install
 
@@ -66,4 +83,7 @@ We don't use Pocock's `setup-matt-pocock-skills` installer — conventions are b
 
 ## Versioning
 
-Semver via git tags. No CI/CD yet.
+Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record and
+`scripts/check-consistency.sh` asserts the two agree. Tag on the merge commit on
+`main`, never on a feature branch. The harness can generate CI/CD for *consumer*
+projects (`/project-infra ci`); the harness repo itself has no pipeline yet.

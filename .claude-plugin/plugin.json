@@ -1,7 +1,7 @@
 {
   "name": "claude-code-harness",
-  "version": "0.1.0",
-  "description": "Universal code-dev harness for Claude Code: cherry-picked Pocock + Vercel skills, custom orchestration (next, implement-issue, start-feature, commit-agent, migration-check), code-reviewer agent, and generic git/dev hooks.",
+  "version": "0.2.0",
+  "description": "Universal code-dev harness for Claude Code: cherry-picked Pocock + Vercel skills; own orchestration (next, implement-issue, start-feature, commit-agent, migration-check, worklog, harness-init, harness-doctor); an autopilot loop engine for controlled long autonomous runs with hard verify gates and cost caps; cost-discipline + usage-report for token/cost awareness; project-infra for verify/CI/devcontainer provisioning; openapi-sync + code-map documentation skills; code-reviewer and haiku verifier agents; and stdin-JSON git/dev guard hooks.",
   "author": {
     "name": "Petr Pus"
   }
