@@ -267,7 +267,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section class="hero" id="thesis" style="border-top:none">
     <div class="hero-grid">
       <div>
-        <p class="eyebrow">Claude Code plugin · v0.2.1</p>
+        <p class="eyebrow">Claude Code plugin · v0.3.0</p>
         <h1>A harness for safe, cost-conscious autonomous development.</h1>
         <p class="lead">Curated skills, two review agents, and git/dev guard hooks — plus a loop engine that runs long unattended sessions behind hard verify gates and real cost caps. Install once; every project gets the same disciplined toolkit.</p>
         <div class="pillrow">
@@ -328,7 +328,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
         <span class="chip">codebase-design</span><span class="chip">domain-modeling</span><span class="chip">diagnose</span>
         <span class="chip">tdd</span><span class="chip">to-prd</span><span class="chip">to-issues</span><span class="chip">triage</span>
         <span class="chip">grill-me</span><span class="chip">grill-with-docs</span><span class="chip">grilling</span>
-        <span class="chip">research</span><span class="chip">improve-codebase-architecture</span><span class="chip">prototype</span>
+        <span class="chip">research</span><span class="chip">resolving-merge-conflicts</span><span class="chip">improve-codebase-architecture</span><span class="chip">prototype</span>
         <span class="chip">handoff</span><span class="chip">write-a-skill</span><span class="chip">zoom-out</span><span class="chip">caveman</span>
       </div>
     </div>
@@ -375,6 +375,11 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
           <li><code>on-stop</code> + <code>session-log</code> — reminders + JSONL log</li>
         </ul>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:24px">
+      <h3>Verify &amp; verification tiers</h3>
+      <p style="margin-bottom:0">The harness has its own gate, <code>scripts/verify.sh</code> — check-consistency + a stdin-JSON hook test matrix + a <code>bash&nbsp;-n</code> floor — run before every PR and by autopilot as its machine-verify. Verification is <b>reminders by default</b> (the Stop hooks always exit&nbsp;0); for unattended runs you can opt into a <b>hard gate</b>, <code>templates/require-verify-before-stop.sh</code>, which blocks the turn (exit&nbsp;2) until verify is a fresh <code>ok</code>. Opt-in only, never wired by default (ADR-0002).</p>
     </div>
   </section>
 
@@ -575,7 +580,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 
 <footer>
   <div class="wrap">
-    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.2.1 · MIT</span>
+    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.3.0 · MIT</span>
     <span class="muted">press <span class="kbd">t</span> to flip theme</span>
   </div>
 </footer>
