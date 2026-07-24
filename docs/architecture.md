@@ -21,7 +21,7 @@ agents/<name>.md               # auto-discovered
 hooks/hooks.json               # hook registration
 hooks/*.sh                     # hook scripts (bash)
 templates/                     # files copied into projects on first install
-scripts/                       # check-consistency.sh (repo self-verify)
+scripts/                       # verify.sh (the gate) + check-consistency.sh
 docs/                          # this folder
 ```
 
@@ -45,6 +45,18 @@ sed/grep JSON parser, because regex-scraping arbitrary shell out of
 `tool_input.command` both false-blocks and false-allows. Without `jq` the guards
 **fail open** (allow) and `harness-doctor` flags the missing dependency; the hard
 security layer is `settings.json` deny, which needs no jq. No hook uses `set -e`.
+
+## Verifying the harness itself
+
+The harness demands an objective Verify gate from consumer projects and now has
+its own: `scripts/verify.sh`. It composes three offline layers —
+`scripts/check-consistency.sh` (structural invariants), a **hook test matrix**
+(each guard hook fed representative stdin-JSON with its exit code asserted —
+block cases exit 2, allow cases exit 0, per the Hook contract above), and a
+`bash -n` syntax floor over every `*.sh`. On a green run it writes `ok` to
+`tmp/.last-verify-status` in the format the freshness hooks read
+(`pre-commit-gate.sh`, `on-stop.sh`), so their staleness reminders go quiet.
+Run it before every PR; the autopilot loop runs it as its machine-verify gate.
 
 ## Policy layering (single source of truth)
 
