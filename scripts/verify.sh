@@ -30,12 +30,30 @@ section() { echo; echo "== $1 =="; }
 # regardless of the branch verify.sh itself runs on. Cleaned up on exit.
 TMP_MAIN_REPO=""
 TMP_FEAT_REPO=""
+TMP_GATE_DIRS=()
 cleanup() {
   [[ -n "$TMP_MAIN_REPO" && -d "$TMP_MAIN_REPO" ]] && rm -rf "$TMP_MAIN_REPO"
   [[ -n "$TMP_FEAT_REPO" && -d "$TMP_FEAT_REPO" ]] && rm -rf "$TMP_FEAT_REPO"
+  local d
+  for d in "${TMP_GATE_DIRS[@]:-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf "$d"; done
   return 0
 }
 trap cleanup EXIT
+
+# mk_gate_repo <status-or-"none"> <age-seconds> -> echoes a fresh temp git repo
+# whose tmp/.last-verify-status holds <status> (skipped if "none"), with its
+# mtime set <age-seconds> in the past. Used by the Stop-gate matrix below.
+mk_gate_repo() {
+  local status="$1" age="$2" repo
+  repo="$(mktemp -d)"; TMP_GATE_DIRS+=("$repo")
+  git -C "$repo" init -q >/dev/null 2>&1
+  if [[ "$status" != "none" ]]; then
+    mkdir -p "$repo/tmp"
+    printf '%s\n' "$status" > "$repo/tmp/.last-verify-status"
+    touch -d "@$(( $(date +%s) - age ))" "$repo/tmp/.last-verify-status" 2>/dev/null || true
+  fi
+  printf '%s' "$repo"
+}
 
 # ---------------------------------------------------------------------------
 section "check-consistency"
@@ -109,6 +127,23 @@ else
     '{"tool_input":{"file_path":"/repo/.env.example"}}'
   assert_hook "pre-edit allows a normal source file" 0 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/src/index.ts"}}'
+
+  # require-verify-before-stop template (opt-in Stop gate) — same stdin-JSON
+  # style: block while verify is missing/stale/not-ok, allow when fresh + ok.
+  GATE=templates/require-verify-before-stop.sh
+  r_ok="$(mk_gate_repo ok 0)"
+  r_missing="$(mk_gate_repo none 0)"
+  r_fail="$(mk_gate_repo fail 0)"
+  r_stale="$(mk_gate_repo ok 4000)"
+  json_cwd() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+  assert_hook "stop-gate allows fresh ok verify" 0 "$GATE" \
+    "{\"hook_event_name\":\"Stop\",\"cwd\":\"$(json_cwd "$r_ok")\"}"
+  assert_hook "stop-gate blocks when verify status missing" 2 "$GATE" \
+    "{\"hook_event_name\":\"Stop\",\"cwd\":\"$(json_cwd "$r_missing")\"}"
+  assert_hook "stop-gate blocks when verify status is fail" 2 "$GATE" \
+    "{\"hook_event_name\":\"Stop\",\"cwd\":\"$(json_cwd "$r_fail")\"}"
+  assert_hook "stop-gate blocks when verify is stale" 2 "$GATE" \
+    "{\"hook_event_name\":\"Stop\",\"cwd\":\"$(json_cwd "$r_stale")\"}"
 fi
 
 # ---------------------------------------------------------------------------

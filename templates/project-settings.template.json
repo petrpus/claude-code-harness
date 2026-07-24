@@ -1,6 +1,7 @@
 {
   "_comment": "Baseline permissions + deny for code-dev projects using claude-code-harness. Copy to .claude/settings.json in the project, then add project-specific WebFetch domains / Read paths / extra allows on top.",
   "_policy_layering": "Three layers, single source of truth each: (L1) this deny list = static string patterns (force-push, rm -rf /, reading .env). (L2) hooks/pre-bash.sh = context-dependent logic that a static pattern can't express (push FROM main needs the branch). (L3) skills like commit-agent = workflow advice that references, never re-implements, L1/L2. Don't duplicate a rule across layers.",
+  "_verify_gate": "Verification is reminders by default (the harness Stop hooks always exit 0). For UNATTENDED runs you can opt into a hard gate: register templates/require-verify-before-stop.sh as a Stop hook here (hooks.Stop[].hooks[].command) — it exits 2 until tmp/.last-verify-status is a fresh 'ok', blocking the turn from ending. It is opt-in only and never wired into the plugin's hooks/hooks.json (ADR-0002); Claude Code lifts the block after 8 refusals so it can't deadlock. autopilot enables it for the duration of a run and removes it on run end.",
   "permissions": {
     "allow": [
       "Edit(**/*.md)",

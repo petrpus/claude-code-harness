@@ -77,3 +77,12 @@ stay active (they fire in headless mode too), so the push-from-main and
 `.env`/secret guards apply mid-run. For fully unattended runs, run inside a
 devcontainer (`/project-infra devcontainer`). Before opening a PR, do a manual
 `/security-review` pass — the loop's secret scan is a floor, not a full audit.
+
+**Opt-in Stop gate.** For a run, autopilot MAY register
+`templates/require-verify-before-stop.sh` as a Stop hook in the project's
+`.claude/settings.json` — the deterministic verification tier (ADR-0002), so a
+turn cannot end on a stale or failing verify. If it does, it **MUST remove that
+hook entry on run end** (success or abort), leaving the project's Stop config
+exactly as it found it. The runner's own machine-verify gate is unaffected
+either way; the Stop gate only adds belt-and-suspenders for the interactive
+iterations.
