@@ -78,10 +78,13 @@ else
   # pre-bash: blocks
   assert_hook "pre-bash blocks git push on main" 2 hooks/pre-bash.sh \
     "{\"cwd\":\"$MAIN_JSON_CWD\",\"tool_input\":{\"command\":\"git push\"}}"
-  assert_hook "pre-bash blocks force-push" 2 hooks/pre-bash.sh \
-    '{"tool_input":{"command":"git push --force"}}'
+  # Force-push cases run against the feature-branch repo so the block comes from
+  # the force guard specifically, not the push-from-main guard (deterministic
+  # regardless of the branch verify.sh itself runs on).
+  assert_hook "pre-bash blocks force-push (feature branch)" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force\"}}"
   assert_hook "pre-bash segment-split catches cd && git push --force" 2 hooks/pre-bash.sh \
-    '{"tool_input":{"command":"cd sub && git push --force"}}'
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"cd sub && git push --force\"}}"
   assert_hook "pre-bash blocks broad rm -rf /" 2 hooks/pre-bash.sh \
     '{"tool_input":{"command":"rm -rf /"}}'
   assert_hook "pre-bash blocks broad rm -rf ~" 2 hooks/pre-bash.sh \
@@ -89,6 +92,8 @@ else
   # pre-bash: allows
   assert_hook "pre-bash allows plain ls" 0 hooks/pre-bash.sh \
     '{"tool_input":{"command":"ls -la"}}'
+  assert_hook "pre-bash allows plain git push on a feature branch" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push\"}}"
   assert_hook "pre-bash allows --force-with-lease on a feature branch" 0 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force-with-lease\"}}"
 
@@ -109,7 +114,11 @@ fi
 # ---------------------------------------------------------------------------
 section "shell syntax (bash -n)"
 while IFS= read -r f; do
-  bash -n "$f" 2>/dev/null && ok "$f" || note "$f has a syntax error"
+  if err="$(bash -n "$f" 2>&1)"; then
+    ok "$f"
+  else
+    note "$f has a syntax error: $err"
+  fi
 done < <(find hooks scripts skills templates -name '*.sh' -type f 2>/dev/null | sort)
 
 # ---------------------------------------------------------------------------
