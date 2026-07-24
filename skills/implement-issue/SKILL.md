@@ -63,10 +63,17 @@ In each cycle:
 1. Write failing test (red)
 2. Write minimum code to pass (green)
 3. Refactor — DRY, better names, decoupling
-4. Run tests
+4. Typecheck, and run the single test file(s) you're touching
 
 If the agent stalls in BUILD (more than 2 cycles without progress), invoke
 Pocock's `/diagnose` skill.
+
+**Test cadence.** Keep the inner loop tight: **typecheck continuously** and
+**run single test files continuously** — the file(s) for the unit under work,
+never the whole suite each cycle. Run the **full test suite once, at the end of
+BUILD**, as its exit condition; only then hand off to REVIEW. (The VERIFY gate
+in §5 still runs the full verify command — the end-of-BUILD suite run is the
+fast local checkpoint, not a replacement for it.)
 
 In parallel:
 
