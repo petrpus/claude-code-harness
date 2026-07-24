@@ -96,6 +96,32 @@ secrets, and has a cheap haiku `verifier` agent adversarially check the diff
 before an iteration counts as done. See `skills/autopilot/LOOP-PROTOCOL.md` and
 `docs/model-policy.md`.
 
+## Decomposition doctrine (when to reach for subagents)
+
+The harness defaults to **a single agent in one context**. Reach for subagents
+only when there is a concrete reason:
+
+- **Context protection** — a subtask would flood the main context with output
+  you don't need to keep (broad searches, reading many files for one
+  conclusion). The subagent returns the conclusion, not the file dumps.
+- **Parallelization** — genuinely independent work that can run at once.
+- **Specialization** — a task wants a different tool-set, model tier, or an
+  adversarial stance (our `verifier` on haiku).
+
+**Decompose by context, not by problem phase.** Do *not* split a task into a
+planner → implementer → tester relay just because those are conceptual stages —
+that multiplies context-handoff cost without buying isolation. Split when a
+*chunk of context* can be sealed off and handed to an agent that returns a small
+result. The **verification subagent** is the officially sanctioned pattern (an
+independent agent that checks the primary agent's work); the harness ships it as
+`agents/verifier.md` and wires it into `autopilot`.
+
+Sources: [Building multi-agent systems — when and how](https://claude.com/blog/building-multi-agent-systems-when-and-how-to-use-them),
+[Effective context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents),
+[Best practices for Claude Code](https://code.claude.com/docs/en/best-practices).
+See also `skills/cost-discipline/` (the token-budget / subagent-restraint
+doctrine) and `docs/research/2026-07-harness-upgrade.md` § B.
+
 ## Conventions assumed by skills
 
 Skills baked here assume:

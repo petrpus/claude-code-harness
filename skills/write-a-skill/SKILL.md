@@ -105,13 +105,33 @@ Split into separate files when:
 - Content has distinct domains (finance vs sales schemas)
 - Advanced features are rarely needed
 
+**Progressive-disclosure rules** (official skill-authoring guidance):
+
+- **SKILL.md body under 500 lines** — a hard cap, not a target. Past it, the
+  model is reading more than it needs to act. Split earlier (~100) when domains
+  are distinct.
+- **Reference files exactly one level deep** — SKILL.md links directly to each
+  reference file. No nested chains (a reference file that links to another the
+  model must then chase); flatten instead.
+- **Long reference files start with a table of contents** so the model can jump
+  to the relevant section without reading the whole file.
+
+## Naming
+
+Prefer a **gerund / verb phrase** for the skill name (`resolving-merge-conflicts`,
+`writing-great-skills`) — it reads as the action the skill performs. Respect
+existing local names where the repo has already settled on one (e.g. `to-issues`,
+`diagnose`); don't churn a working name just to gerund it.
+
 ## Review Checklist
 
 After drafting, verify:
 
-- [ ] Description includes triggers ("Use when...")
-- [ ] SKILL.md under 100 lines
+- [ ] Description in **third person**: what it does + "Use when [triggers]"
+- [ ] SKILL.md body **under 500 lines** (split at ~100 if domains are distinct)
+- [ ] Reference files **one level deep** — no nested reference chains
+- [ ] Long reference files **open with a table of contents**
+- [ ] Name is a **gerund/verb phrase** (or a deliberate existing local name)
 - [ ] No time-sensitive info
 - [ ] Consistent terminology
 - [ ] Concrete examples included
-- [ ] References one level deep
