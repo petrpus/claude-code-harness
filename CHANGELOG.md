@@ -2,6 +2,47 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [0.3.0] — 2026-07-24
+
+Upstream re-sync + the harness's own verify gate + agentic doctrine (PRD 0001,
+slices S0–S5).
+
+### Added
+- `scripts/verify.sh` — the harness's own Verify gate: `check-consistency.sh` +
+  a stdin-JSON **hook test matrix** (guard exit codes asserted — block=2,
+  allow=0, via throwaway repos so branch-dependent guards are deterministic) +
+  a `bash -n` syntax floor. Writes `tmp/.last-verify-status` (`ok`) in the
+  format the freshness hooks read. Run before every PR; autopilot's
+  machine-verify gate.
+- `skills/resolving-merge-conflicts/` — new vendored Pocock skill.
+- `templates/require-verify-before-stop.sh` — **opt-in** Stop-hook verify gate
+  for unattended runs (exit 2 until verify is a fresh `ok`). Never wired into
+  `hooks/hooks.json`; opt-in only (ADR-0002).
+- `docs/architecture.md`: "Verifying the harness itself", "Verification tiers",
+  and "Decomposition doctrine" (single agent by default; subagents only for
+  context protection / parallelization / specialization; `verifier` as the
+  sanctioned verification-subagent pattern; cites official Anthropic sources).
+
+### Changed
+- **Vendor re-sync to `ed37663`** (pocock) / `e173b8c` (vercel):
+  - `to-issues` (← upstream `to-tickets`): blocking edges, one-context-window
+    slice sizing, prefactoring-first, expand–contract for wide refactors (incl.
+    integration-branch variant); dropped HITL/AFK typing. Kept the `to-issues`
+    name (local patch) and GitHub-Issues-via-`gh` wording.
+  - `to-prd` (← upstream `to-spec`): seams-first step (prefer existing seams,
+    highest possible, ideal one). Kept PRD terminology + name.
+  - `find-skills`: `--owner` scope flag; dropped the removed `skills check` line.
+  - `docs/pocock-sync-log.md`: re-survey at `ed37663`, rename local patches,
+    `disable-model-invocation` decision (not adopted), watch list.
+- `skills/implement-issue/`: BUILD adopts the test cadence — typecheck + single
+  test files continuously; full suite once at end of BUILD.
+- `skills/write-a-skill/`: progressive-disclosure checklist — SKILL.md < 500
+  lines, reference files one level deep, TOC in long refs, third-person
+  description, gerund naming.
+- `skills/autopilot/`: MAY enable the opt-in Stop gate for a run, MUST remove it
+  on run end.
+- README + `docs/guide.html` refreshed for 0.3.0.
+
 ## [0.2.1] — 2026-07-06
 
 Documentation & distribution polish on top of 0.2.0.
