@@ -58,6 +58,22 @@ block cases exit 2, allow cases exit 0, per the Hook contract above), and a
 (`pre-commit-gate.sh`, `on-stop.sh`), so their staleness reminders go quiet.
 Run it before every PR; the autopilot loop runs it as its machine-verify gate.
 
+## Verification tiers: reminders by default, opt-in gate for unattended runs
+
+Two tiers, chosen by how much autonomy the session has:
+
+- **Reminders (default).** The Stop / pre-commit hooks (`on-stop.sh`,
+  `pre-commit-gate.sh`) only *warn* on a stale or failing verify and **always
+  exit 0**. A blocking Stop hook would hard-fail every consumer project that
+  doesn't follow our verify convention, so the default never blocks.
+- **Hard gate (opt-in).** For unattended runs, `templates/require-verify-before-stop.sh`
+  is a Stop hook that **exits 2** until `tmp/.last-verify-status` reports a fresh
+  `ok`, forcing verify to run before the turn ends. It is deliberately an
+  exception to "Stop hooks always exit 0" and is safe only because it is opt-in:
+  never wired into `hooks/hooks.json`, enabled consciously by a project (or by
+  `autopilot` for the duration of a run), and Claude Code lifts the block after
+  8 consecutive refusals so it cannot deadlock. See **ADR-0002**.
+
 ## Policy layering (single source of truth)
 
 Three layers, each owning its rule kind — don't duplicate a rule across them:
