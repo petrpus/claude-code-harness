@@ -30,9 +30,14 @@ STATUS_FILE="tmp/.last-verify-status"
 
 # --- stdin JSON (mirrors hooks/lib.sh; fail open without jq) ----------------
 IFS= read -r -d '' HOOK_INPUT 2>/dev/null || true
+
+# Fail OPEN without jq: we can't reliably locate the repo (the .cwd field is
+# unreadable), so never block on a guess — allow the stop, exactly like the
+# guard hooks. The hard layer is the run's own machine-verify gate.
+command -v jq >/dev/null 2>&1 || exit 0
+
 json_field() {
   [[ -z "${HOOK_INPUT:-}" ]] && { echo ""; return 0; }
-  command -v jq >/dev/null 2>&1 || { echo ""; return 0; }
   printf '%s' "$HOOK_INPUT" | jq -r "$1 // empty" 2>/dev/null || echo ""
 }
 
