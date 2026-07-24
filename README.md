@@ -6,12 +6,14 @@ Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code
 
 | Area | What |
 |---|---|
-| **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `grilling`, `handoff`, `improve-codebase-architecture`, `prototype`, `research`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
+| **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `grilling`, `handoff`, `improve-codebase-architecture`, `prototype`, `research`, `resolving-merge-conflicts`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
 | **Skills (Vercel Labs)** | `find-skills` |
 | **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
 | **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `code-map` |
 | **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 11-shortcuts gate, haiku) |
 | **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` + `session-log` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks); all parse stdin JSON via `hooks/lib.sh` |
+| **Own verify** | `scripts/verify.sh` — the harness's own gate: check-consistency + a stdin-JSON hook test matrix + a `bash -n` floor. Run before every PR. |
+| **Templates** | `project-settings.template.json` (baseline permissions/deny) + `require-verify-before-stop.sh` (opt-in Stop-hook gate for unattended runs — never wired by default; ADR-0002) |
 
 Pocock-derived content is vendored ad-hoc from [`mattpocock/skills`](https://github.com/mattpocock/skills). Ideas (not files) from [`Archive228/loopkit`](https://github.com/Archive228/loopkit) were re-engineered into `autopilot`, `verifier`, and `cost-discipline`. See `docs/pocock-sync-log.md` for provenance and upstream SHAs.
 
@@ -96,9 +98,10 @@ from where and at which commit.
 - **[Matt Pocock](https://github.com/mattpocock) — [`mattpocock/skills`](https://github.com/mattpocock/skills)**
   — the vendored engineering & productivity skills (`codebase-design`,
   `domain-modeling`, `diagnose`, `tdd`, `to-prd`, `to-issues`, `triage`,
-  `grill-*`, `grilling`, `research`, `improve-codebase-architecture`,
-  `prototype`, `handoff`, `write-a-skill`, `zoom-out`, `caveman`) and the
-  CONTEXT.md + ADR + verify-loop conventions the harness assumes.
+  `grill-*`, `grilling`, `research`, `resolving-merge-conflicts`,
+  `improve-codebase-architecture`, `prototype`, `handoff`, `write-a-skill`,
+  `zoom-out`, `caveman`) and the CONTEXT.md + ADR + verify-loop conventions the
+  harness assumes.
 - **[Vercel Labs](https://github.com/vercel-labs) — [`vercel-labs/skills`](https://github.com/vercel-labs/skills)**
   — the `find-skills` skill and the `npx skills` ecosystem.
 - **[Archive228](https://github.com/Archive228) — [`loopkit`](https://github.com/Archive228/loopkit) (MIT)**
