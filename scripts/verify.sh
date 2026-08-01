@@ -130,6 +130,38 @@ else
   assert_hook "pre-bash allows --force-with-lease on a feature branch" 0 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force-with-lease\"}}"
 
+  # Tag pushes from main. A tag doesn't advance a branch, and blocking it broke
+  # this repo's own release step (tag v0.x.0 on the merge commit on main). Needs
+  # a repo with a real commit, tag and branch so the ambiguous bare-name form
+  # can actually be resolved.
+  TMP_TAG_REPO="$(mktemp -d)"; TMP_GATE_DIRS+=("$TMP_TAG_REPO")
+  git -C "$TMP_TAG_REPO" init -q >/dev/null 2>&1
+  git -C "$TMP_TAG_REPO" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1
+  printf 'x\n' > "$TMP_TAG_REPO/f"
+  git -C "$TMP_TAG_REPO" add -A >/dev/null 2>&1
+  git -C "$TMP_TAG_REPO" -c user.email=t@t.est -c user.name=test commit -q -m init
+  git -C "$TMP_TAG_REPO" tag v9.9.9 >/dev/null 2>&1
+  git -C "$TMP_TAG_REPO" branch relbranch >/dev/null 2>&1
+  TAG_JSON_CWD="$(printf '%s' "$TMP_TAG_REPO" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+
+  assert_hook "pre-bash allows a bare tag name push from main" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin v9.9.9\"}}"
+  assert_hook "pre-bash allows refs/tags/... push from main" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin refs/tags/v9.9.9\"}}"
+  assert_hook "pre-bash allows --tags push from main" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin --tags\"}}"
+  assert_hook "pre-bash allows 'push origin tag <name>' from main" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin tag v9.9.9\"}}"
+  # …and everything that could still move a branch stays blocked.
+  assert_hook "pre-bash blocks --follow-tags from main (pushes commits too)" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push --follow-tags\"}}"
+  assert_hook "pre-bash blocks a branch+tag push from main" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin main v9.9.9\"}}"
+  assert_hook "pre-bash blocks a non-tag ref that only looks like one" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin relbranch\"}}"
+  assert_hook "pre-bash still blocks force-pushing a tag from main" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force origin refs/tags/v9.9.9\"}}"
+
   # pre-edit: blocks
   assert_hook "pre-edit blocks .env" 2 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/.env"}}'

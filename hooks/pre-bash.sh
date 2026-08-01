@@ -84,6 +84,65 @@ seg_has_force() {
   [[ "$seg" == *" --force "* || "$seg" == *" -f "* ]]
 }
 
+# Return 0 if a push targets ONLY tags. A tag doesn't advance a branch, so the
+# push-from-main rule has nothing to say about it — and blocking it broke this
+# repo's own documented release step, which tags on the merge commit on main.
+#
+# Conservative by construction: anything that could also move a branch is not
+# tag-only. That includes a bare `git push`, any explicit branch refspec, and
+# `--follow-tags`, which pushes commits *and* tags. Refspecs containing `:`
+# (deletes, explicit src:dst mappings) are not recognised either — they are
+# rare enough that falling through to the normal rules costs nothing.
+seg_is_tag_only_push() {
+  local seg; seg="$(seg_words "$1")"
+  [[ "$seg" == *" --follow-tags "* ]] && return 1
+
+  # Everything after the `push` word.
+  local after="${seg#* git }"
+  case " $after " in *" push "*) after="${after#*push }" ;; *) return 1 ;; esac
+
+  local word tags_flag=0 tag_kw=0 operands=0 tagrefs=0 names=()
+  for word in $after; do
+    case "$word" in
+      --tags)      tags_flag=1; continue ;;
+      -*)          continue ;;
+      *:*)         return 1 ;;
+    esac
+    operands=$(( operands + 1 ))
+    # First operand is the remote.
+    [[ "$operands" -eq 1 ]] && continue
+    if [[ "$word" == "tag" && "$tag_kw" -eq 0 && "$operands" -eq 2 ]]; then
+      tag_kw=1; continue
+    fi
+    if [[ "$word" == refs/tags/* ]]; then
+      tagrefs=$(( tagrefs + 1 )); continue
+    fi
+    names+=("$word")
+  done
+
+  # No remote named at all -> bare `git push`, which pushes the branch.
+  [[ "$operands" -eq 0 ]] && return 1
+
+  # `git push origin tag v1`
+  [[ "$tag_kw" -eq 1 && "${#names[@]}" -le 1 && "$tagrefs" -eq 0 ]] && return 0
+  # `git push origin --tags` with nothing else named
+  [[ "$tags_flag" -eq 1 && "$tagrefs" -eq 0 && "${#names[@]}" -eq 0 ]] && return 0
+  # Every named ref was an explicit refs/tags/... path
+  [[ "$tagrefs" -gt 0 && "${#names[@]}" -eq 0 ]] && return 0
+
+  # A bare name like `v0.4.0` is ambiguous — ask git. It must resolve to a tag
+  # and NOT to a branch; anything ambiguous stays blocked.
+  if [[ "$GIT_OK" -eq 1 && "$tagrefs" -eq 0 && "${#names[@]}" -gt 0 ]]; then
+    local n
+    for n in "${names[@]}"; do
+      git rev-parse --verify --quiet "refs/tags/$n" >/dev/null 2>&1 || return 1
+      git rev-parse --verify --quiet "refs/heads/$n" >/dev/null 2>&1 && return 1
+    done
+    return 0
+  fi
+  return 1
+}
+
 # Return 0 if a segment is a dangerous broad `rm -rf` against a root-ish target.
 seg_is_dangerous_rm() {
   local seg; seg="$(seg_words "$1")"
@@ -109,7 +168,9 @@ while IFS= read -r seg; do
     # express, because it needs the current branch. If git couldn't tell us,
     # this guard is not guarding — say so rather than waving the push through
     # as though the branch had been checked and found safe.
-    if [[ "$GIT_OK" -ne 1 || -z "$BRANCH" ]]; then
+    if seg_is_tag_only_push "$seg"; then
+      : # tags don't move a branch — this rule doesn't apply
+    elif [[ "$GIT_OK" -ne 1 || -z "$BRANCH" ]]; then
       echo "claude-code-harness: could not determine the current branch (git unavailable, not a repo, or detached HEAD) — the push-from-main guard did NOT run for this command." >&2
     elif [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
       echo "Push from \`$BRANCH\` blocked. Use a feature branch." >&2
