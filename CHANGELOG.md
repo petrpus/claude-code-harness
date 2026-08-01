@@ -2,6 +2,16 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [Unreleased]
+
+### Fixed
+- `autopilot/loop.sh`: BUILD's `--allowedTools` allowlist mirrored a JS project
+  template, so a repo whose verify is its own script (`./scripts/verify.sh`) had
+  that call **denied** — the BUILD prompt told the model to run verify and the
+  permission layer refused, leaving every slice unprovable before the runner's
+  own gate. The resolved verify command is now granted explicitly, plus a new
+  `--extra-allowed-tools` flag for run-specific grants.
+
 ## [0.3.0] — 2026-07-24
 
 Upstream re-sync + the harness's own verify gate + agentic doctrine (PRD 0001,
