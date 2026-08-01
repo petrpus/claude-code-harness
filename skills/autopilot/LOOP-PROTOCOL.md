@@ -37,13 +37,41 @@ loop:
   BUILD                    sonnet   acceptEdits + explicit --allowedTools
     └─ one plan item, TDD (red-green-refactor), ADR if architectural,
        run verify, tick box, append MEMORY, set STATUS
-  GATE a  sentinel         runner    grep '^STATUS: done'
   GATE b  machine verify   runner    executes the verify command itself
   GATE c  secret scan      runner    greps the diff for keys/tokens
   GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict
-  ├─ all green → checkpoint commit, exit 0
-  └─ any fail  → FEEDBACK.md, reset sentinel, checkpoint WIP, maybe replan
+  then, gates green:
+    STATUS: done          → checkpoint, exit 0
+    more boxes ticked     → checkpoint "progress", continue (NOT a failure)
+    nothing moved         → no-progress failure
+  any gate red            → FEEDBACK.md, reset sentinel, checkpoint WIP, maybe replan
 ```
+
+### Why completion is not a per-iteration gate
+
+BUILD is told to do exactly **one** plan item per iteration, so on any plan
+longer than one slice `STATUS: done` is false by construction until the last
+one. Treating that as a gate failure — which this loop did until the flaw was
+found in its first real run — made every intermediate iteration
+indistinguishable from a genuine failure, fingerprinted them all identically,
+and tripped the stuck detector after three. **A plan of more than three slices
+could not finish**, and the loop applied pressure toward doing everything in a
+single iteration: exactly the opposite of the slice-by-slice discipline it
+exists to enforce.
+
+So progress is *measured* instead: the runner counts ticked checkboxes in
+`IMPLEMENTATION_PLAN.md` before and after BUILD. More ticked, with every gate
+green, is progress — checkpointed and continued, and it resets the stuck
+counter. Nothing ticked and not done is the real no-progress signal, and that
+is what the stuck detector counts. `STATUS: done` keeps one job only: ending
+the run.
+
+Two consequences worth knowing. Gates (b)–(d) now run on **every** iteration;
+previously the completion check short-circuited them, so incremental work was
+committed as "wip" without the runner ever verifying it. And because progress
+is read from checkboxes, a plan written without them can't be measured — the
+runner says so and falls back to the iteration/time/budget caps rather than
+inventing a failure.
 
 ### Why the runner runs verify, not the model
 

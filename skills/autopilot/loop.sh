@@ -204,6 +204,24 @@ append_feedback() { printf '\n## Iteration %s — %s\n%s\n' "${ITER:-0}" "$1" "$
 # Stuck detection: same gate-failure fingerprint twice → one replan; third → abort.
 LAST_FP=""; REPEAT=0
 
+# Progress is measured from the plan's checkboxes, not claimed by the model.
+# BUILD is told to do exactly ONE item per iteration, so on any plan longer than
+# one slice the completion sentinel is false by construction until the last
+# iteration — counting that as a gate failure (as this loop used to) made every
+# intermediate iteration look identical to a real failure and tripped the stuck
+# detector after three of them. A plan of more than three slices could not
+# finish, and the loop rewarded doing everything at once.
+count_ticked() {
+  local n
+  n="$(grep -ciE '^[[:space:]]*[-*][[:space:]]+\[[xX]\]' "$PLAN_FILE" 2>/dev/null)" || n=0
+  echo "${n:-0}"
+}
+count_boxes() {
+  local n
+  n="$(grep -ciE '^[[:space:]]*[-*][[:space:]]+\[[ xX]\]' "$PLAN_FILE" 2>/dev/null)" || n=0
+  echo "${n:-0}"
+}
+
 # ---------------------------------------------------------------------------
 # Prompts.
 # ---------------------------------------------------------------------------
@@ -214,8 +232,13 @@ charter, derived from a PRD or GitHub issue with acceptance criteria).
 
 Write $PLAN_FILE as a checklist of INDEPENDENTLY VERIFIABLE vertical slices —
 each item, when done, leaves the app working and is provable by the verify
-command. Order them so each builds on the last. End the file with the exact
-line:
+command. Order them so each builds on the last.
+
+Every slice MUST be a markdown checkbox at the start of its line: "- [ ] ...".
+The runner measures progress by counting ticked boxes, so a plan without them
+cannot be measured and the run falls back to its caps.
+
+End the file with the exact line:
 
 STATUS: in-progress
 
@@ -313,26 +336,26 @@ while :; do
   log_err "── iteration $ITER (elapsed $(elapsed_min)m, spent \$$TOTAL_COST)"
   write_status "building"
 
+  TICKED_BEFORE="$(count_ticked)"
+  TOTAL_BOXES="$(count_boxes)"
+
   # BUILD
   run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt)" >/dev/null
 
+  TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
 
-  # GATE a: sentinel
-  if ! grep -q '^STATUS: done' "$PLAN_FILE" 2>/dev/null; then
-    FAIL_REASON="plan not marked done"; FP="sentinel"
-  fi
-
-  # GATE b: machine verify (runner runs it — no LLM trust)
-  if [[ -z "$FAIL_REASON" ]]; then
-    write_status "verifying"
-    if timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
-      logline "verify_cmd" "-" 0 0 0 0 0 "pass"
-    else
-      logline "verify_cmd" "-" 0 0 0 0 1 "fail"
-      FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
-      FP="verify_cmd"
-    fi
+  # GATE b: machine verify (runner runs it — no LLM trust).
+  # Runs on EVERY iteration now. Under the old sentinel gate it was skipped
+  # whenever the plan wasn't complete, which meant incremental work was checked
+  # in as "wip" without the runner ever verifying it.
+  write_status "verifying"
+  if timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
+    logline "verify_cmd" "-" 0 0 0 0 0 "pass"
+  else
+    logline "verify_cmd" "-" 0 0 0 0 1 "fail"
+    FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    FP="verify_cmd"
   fi
 
   # GATE c: secret scan (zero-cost)
@@ -359,13 +382,48 @@ while :; do
   # Prune memory mechanically (instructions to the model are advisory).
   if [[ -f "$MEMORY_FILE" ]]; then tail -n 100 "$MEMORY_FILE" > "$MEMORY_FILE.tmp" && mv "$MEMORY_FILE.tmp" "$MEMORY_FILE"; fi
 
-  if [[ -z "$FAIL_REASON" ]]; then
-    # SUCCESS — all gates green.
+  # STATUS: done is now the run-completion signal ONLY — never a per-iteration
+  # pass/fail gate.
+  PLAN_DONE=0
+  grep -q '^STATUS: done' "$PLAN_FILE" 2>/dev/null && PLAN_DONE=1
+
+  if [[ -z "$FAIL_REASON" && "$PLAN_DONE" -eq 1 ]]; then
+    # SUCCESS — plan complete and every gate green.
     git add -A && git commit -q -m "autopilot: iteration $ITER (green)" 2>/dev/null || true
+    logline "iteration" "-" 0 0 0 0 0 "done"
     log_err "✅ all gates green at iteration $ITER — run complete."
     : > "$FEEDBACK_FILE"
     write_status "done"
     exit 0
+  fi
+
+  # A plan with no checkboxes can't be measured for progress. Don't invent a
+  # failure out of that — say so and let the iteration/time/budget caps bound
+  # the run instead.
+  if [[ -z "$FAIL_REASON" && "$TOTAL_BOXES" -eq 0 ]]; then
+    log_err "plan has no checkboxes — progress can't be measured; relying on the caps."
+    git add -A && git commit -q -m "autopilot: iteration $ITER (unmeasured)" 2>/dev/null || true
+    logline "iteration" "-" 0 0 0 0 0 "unmeasured"
+    : > "$FEEDBACK_FILE"
+    continue
+  fi
+
+  if [[ -z "$FAIL_REASON" && "$TICKED_AFTER" -gt "$TICKED_BEFORE" ]]; then
+    # PROGRESS — an incomplete plan that moved forward with every gate green is
+    # exactly what a slice-by-slice run looks like. Not a failure.
+    git add -A && git commit -q -m "autopilot: iteration $ITER (progress: $TICKED_BEFORE→$TICKED_AFTER of $TOTAL_BOXES)" 2>/dev/null || true
+    logline "iteration" "-" 0 0 0 0 0 "progressed"
+    log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
+    : > "$FEEDBACK_FILE"
+    LAST_FP=""; REPEAT=0
+    continue
+  fi
+
+  # Gates green but nothing moved: that is the real no-progress signal, and it
+  # is what the stuck detector should be counting.
+  if [[ -z "$FAIL_REASON" ]]; then
+    FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
+    FP="no-progress"
   fi
 
   # FAILURE — feed back, reset sentinel, checkpoint WIP, maybe replan.
