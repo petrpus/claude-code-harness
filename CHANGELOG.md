@@ -5,6 +5,36 @@ All notable changes to claude-code-harness. Semver via git tags.
 ## [Unreleased]
 
 ### Fixed
+- **Guard hooks stopped guarding, silently, whenever a tool they use broke.**
+  Failing open without `jq` is deliberate — failing open *quietly* was not.
+  Worse, `jq` was never the only way in: `pre-bash.sh` split its input with
+  `tr | sed`, so a broken `sed` produced no segments, nothing matched, and
+  `rm -rf /` was allowed at exit 0 with no warning. The segmenter is pure bash
+  now (no tool, no fault), and any remaining fall-open path announces itself on
+  stderr, naming the missing dependency.
+- **A broken `git` disabled the push-from-main guard with no trace.** That
+  guard is the one rule `settings.json` deny cannot express, because it needs
+  the current branch — and a `git` printing nonsense returned a branch name
+  that merely *looked* valid, making "not main" indistinguishable from "safe".
+  The hook now asks git a question with a known answer before trusting its
+  answer to the one that matters, and says so when it can't.
+- **`pre-commit-gate.sh` could exit non-zero**, which an advisory hook must
+  never do. A `stat` or `date` that exits 0 while printing nothing fed a bare
+  word into `$(( ))`; the arithmetic error left `AGE_SEC` unset and `set -u`
+  killed the hook. `mtime_of` and the new `now_epoch` in `hooks/lib.sh` always
+  return an integer, and a meaningless age is now reported as nothing rather
+  than as a nonsense number.
+
+### Added
+- `scripts/test-hook-faults.sh` — fault injection for the hooks, the inverted
+  companion to `test-fault-injection.sh`. Guard hooks must either still block
+  or announce that guarding is degraded; advisory hooks must exit 0 under every
+  fault, never hang, and never emit reserved harness tags on stdout (which is
+  model context). 8 tools × 3 fault modes × every blocked case. Found all three
+  bugs above on its first run, and validated by regression: reverting the fixes
+  fails 15 rows.
+
+### Fixed
 - **autopilot could not finish a plan of more than three slices.** BUILD does
   exactly one plan item per iteration, so `STATUS: done` is false by
   construction until the last one — and the loop treated that as a gate failure.
