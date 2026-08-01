@@ -4,6 +4,32 @@ All notable changes to claude-code-harness. Semver via git tags.
 
 ## [Unreleased]
 
+### Fixed
+- **autopilot could not finish a plan of more than three slices.** BUILD does
+  exactly one plan item per iteration, so `STATUS: done` is false by
+  construction until the last one — and the loop treated that as a gate failure.
+  Every intermediate iteration therefore looked identical to a real failure,
+  carried the same `sentinel` fingerprint, and tripped the stuck detector after
+  three of them. The loop rewarded doing everything in a single iteration,
+  precisely inverting the slice-by-slice discipline it exists to enforce.
+  Progress is now **measured** — ticked checkboxes counted before and after
+  BUILD — and `STATUS: done` means only "the run is over". Nothing ticked and
+  not done is the real no-progress signal, and that is what the stuck detector
+  counts.
+- **Intermediate iterations were never verified by the runner.** The completion
+  check short-circuited gates (b) verify, (c) secret scan and (d) semantic
+  verifier, so incremental work was committed as "wip" with none of them having
+  run. All three now run every iteration.
+
+### Added
+- `scripts/test-autopilot-loop.sh` — end-to-end control-flow tests for
+  `loop.sh`, driven by a stub `claude` on PATH so the runner's decisions
+  (progress vs. failure, when to abort, which exit code) are exercised without
+  spending anything. The loop previously had **no test at all**, which is how
+  the gating flaw above shipped. Validated by regression: restoring the old
+  behaviour makes the suite fail with the exact symptoms seen in the first real
+  run — exit 4, zero progressed iterations, `gate=sentinel` checkpoints.
+
 ### Added
 - `skills/repo-map/` — a machine-readable module/dependency map
   (`tmp/repo-map.json`, Schema v1) that agents query instead of grepping the

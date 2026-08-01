@@ -200,7 +200,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# The BUILD phase's tool grants are a permission surface: a prefix grant derived
+# The loop had no test at all until its gating flaw shipped and made any plan
+# longer than three slices impossible to finish. This drives it end-to-end with
+# a stub `claude`, so the runner's decisions are exercised without spending.
+section "autopilot loop control flow"
+if [[ -f scripts/test-autopilot-loop.sh ]]; then
+  if bash scripts/test-autopilot-loop.sh; then
+    ok "autopilot loop control flow passed"
+  else
+    note "autopilot loop control flow failed (see above)"
+  fi
+else
+  note "scripts/test-autopilot-loop.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
 # The same defect kept returning in different clothes — a dependency breaks and
 # the generator writes a plausible, silently wrong map at exit 0. This sweeps
 # the class instead of guarding its instances one at a time.
@@ -216,6 +230,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# The BUILD phase's tool grants are a permission surface: a prefix grant derived
 # from an interpreter ('bash scripts/verify.sh' -> Bash(bash:*)) would hand an
 # unattended run arbitrary shell. Assert the derivation directly.
 section "autopilot verify-command grants"
