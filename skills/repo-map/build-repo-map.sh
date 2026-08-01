@@ -175,26 +175,38 @@ done
 # 3. Scan raw import specifiers into RAW as "file<TAB>specifier".
 : > "$RAW"
 
+# A specifier named inside a line comment — `// copied from './legacy/old'` —
+# is prose, not a dependency, but it reads exactly like one to a regex. Left in,
+# it invents an edge and inflates the target's fan_in, which is the very metric
+# `hotspots` ranks on. Strip line comments before matching. A specifier inside a
+# string literal still slips through: that is the accuracy ceiling of a regex
+# backend, and precisely why the Graphify backend exists (see SKILL.md).
+strip_line_comments() { # file comment-marker-regex
+  sed -E "s:${2}.*$::" "$1" 2>/dev/null
+}
+
 scan_js() {
-  local f="$1"
+  local f="$1" src
+  src="$(strip_line_comments "$f" '//')"
   # import ... from '...'  /  export ... from '...'
-  rg -oN -P "from\s+['\"][^'\"]+['\"]" "$f" 2>/dev/null | sed -E "s/^from[[:space:]]+['\"]//; s/['\"]$//" \
+  printf '%s\n' "$src" | rg -oN "from\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^from[[:space:]]+['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
   # bare side-effect import: import '...'
-  rg -oN -P "^\s*import\s+['\"][^'\"]+['\"]" "$f" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+['\"]//; s/['\"]$//" \
+  printf '%s\n' "$src" | rg -oN "^\s*import\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
   # require('...')
-  rg -oN -P "require\(\s*['\"][^'\"]+['\"]" "$f" 2>/dev/null | sed -E "s/^require\([[:space:]]*['\"]//; s/['\"]$//" \
+  printf '%s\n' "$src" | rg -oN "require\(\s*['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^require\([[:space:]]*['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
 }
 
 scan_py() {
-  local f="$1"
+  local f="$1" src
+  src="$(strip_line_comments "$f" '#')"
   # from a.b import x
-  rg -oN -P "^\s*from\s+[\w.]+\s+import" "$f" 2>/dev/null | sed -E "s/^[[:space:]]*from[[:space:]]+//; s/[[:space:]]+import$//" \
+  printf '%s\n' "$src" | rg -oN "^\s*from\s+[\w.]+\s+import" 2>/dev/null | sed -E "s/^[[:space:]]*from[[:space:]]+//; s/[[:space:]]+import$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "${spec//./\/}"; done >> "$RAW"
   # import a.b (module-only form)
-  rg -oN -P "^\s*import\s+[\w.]+\s*$" "$f" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+//; s/[[:space:]]+$//" \
+  printf '%s\n' "$src" | rg -oN "^\s*import\s+[\w.]+\s*$" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+//; s/[[:space:]]+$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "${spec//./\/}"; done >> "$RAW"
 }
 

@@ -51,6 +51,15 @@ cat > "$FIXTURE/src/third.js" <<'EOF'
 import util from './lib/util.js';
 EOF
 
+# Prose that reads like an import: the comment names util.js and the string
+# literal names a real file, but neither is a dependency. Both must stay out of
+# the graph — a phantom edge inflates the target's fan_in, which is what
+# `hotspots` ranks on.
+cat > "$FIXTURE/src/commented.js" <<'EOF'
+// this helper was moved out of './lib/util.js'
+import foo from './lib/foo.js';
+EOF
+
 : > "$FIXTURE/src/lib/util.js"
 : > "$FIXTURE/src/dead.js"
 cat > "$FIXTURE/node_modules/lodash/index.js" <<'EOF'
@@ -173,8 +182,14 @@ else
   STATS_OUT="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" stats 2>/dev/null)"
   STATS_NODES="$(jq -r '.nodes' <<< "$STATS_OUT" 2>/dev/null)"
   STATS_EDGES="$(jq -r '.edges' <<< "$STATS_OUT" 2>/dev/null)"
-  [[ "$STATS_NODES" == "6" ]] && ok "query stats nodes == 6" || note "query stats nodes: got '$STATS_NODES'"
-  [[ "$STATS_EDGES" == "4" ]] && ok "query stats edges == 4" || note "query stats edges: got '$STATS_EDGES'"
+  [[ "$STATS_NODES" == "7" ]] && ok "query stats nodes == 7" || note "query stats nodes: got '$STATS_NODES'"
+  [[ "$STATS_EDGES" == "5" ]] && ok "query stats edges == 5" || note "query stats edges: got '$STATS_EDGES'"
+
+  # The commented-out specifier must not have become an edge.
+  COMMENTED_DEPS="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" deps src/commented.js 2>/dev/null | sort | tr '\n' ',')"
+  [[ "$COMMENTED_DEPS" == "src/lib/foo.js," ]] \
+    && ok "line-comment specifier ignored (deps == foo.js only)" \
+    || note "line-comment specifier leaked into deps: got '$COMMENTED_DEPS'"
 
   bash "$QUERY" bogus-subcommand >/dev/null 2>&1
   [[ "$?" -ne 0 ]] && ok "query unknown subcommand exits non-zero" || note "query unknown subcommand exited 0"

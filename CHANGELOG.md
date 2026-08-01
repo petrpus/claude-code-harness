@@ -20,6 +20,14 @@ All notable changes to claude-code-harness. Semver via git tags.
   implementation and `code-map` just projects it to the render shape.
 
 ### Fixed
+- `repo-map`'s grep backend counted specifiers named in **line comments** as
+  real edges (`// moved out of './lib/util'` invented a dependency and inflated
+  that file's `fan_in` — the metric `hotspots` ranks on). Comments are stripped
+  before matching, and the residual ceiling (specifiers inside string literals,
+  dynamic `import()`) is documented in the SKILL rather than left implied.
+- `repo-map`'s scanner no longer passes `rg -P`. The patterns never needed
+  PCRE2, and on a ripgrep built without it every scan would have failed into a
+  `2>/dev/null` and produced a silently edgeless map.
 - `autopilot/loop.sh`: BUILD's `--allowedTools` allowlist mirrored a JS project
   template, so a repo whose verify is its own script (`./scripts/verify.sh`) had
   that call **denied** — the BUILD prompt told the model to run verify and the

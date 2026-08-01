@@ -50,6 +50,18 @@ it's the thing that gets run) *and* dead files (nothing imports them because
 nothing uses them). The query doesn't try to tell them apart; read the list
 with that in mind.
 
+**Honest caveat on grep-backend accuracy:** the grep backend matches import
+syntax with a regex; it does not parse. Line comments are stripped before
+matching, so `// moved out of './lib/util'` no longer invents an edge, but a
+specifier inside a *string literal* — `const s = "import x from './fake'"` —
+still reads as an import and becomes one. Such phantom edges inflate the
+target's `fan_in`, which is exactly what `hotspots` ranks on, so treat a
+surprising hotspot as a question rather than a fact. Dynamic `import()`,
+re-exports through barrel files, and runtime-computed specifiers are invisible
+to it. This is the accuracy ceiling of a zero-dependency regex scan and the
+reason the Graphify backend exists: when precision matters more than having no
+dependencies, run Graphify and let the adapter pick its AST-derived graph up.
+
 ## Schema v1
 
 ```json

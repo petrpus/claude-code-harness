@@ -46,3 +46,11 @@ per ADR-0001's file-not-MCP stance.
 Two backends must stay comparable under the same schema, so any future field
 added to the grep backend's output has to make sense for (or be omittable by)
 the Graphify adapter too — the schema, not either scanner, is the contract.
+
+The two backends also differ in accuracy, and that difference is the point. A
+regex scan cannot distinguish an import from a specifier quoted inside a string
+literal, and it never sees dynamic `import()` or runtime-computed paths. Such
+phantom edges inflate `fan_in`, the metric `hotspots` ranks on, so the cheap
+backend's output is a navigational hint, not ground truth. Rather than chase
+parsing accuracy we do not want to own, we accept that ceiling for the
+zero-dependency tier and let projects that need precision run Graphify.
