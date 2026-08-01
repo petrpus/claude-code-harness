@@ -13,7 +13,7 @@
 #   loop.sh [--max-iterations 10] [--max-minutes 120] [--budget-usd 10]
 #           [--plan-model opus] [--build-model sonnet] [--verify-model haiku]
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
-#           [--resume-run] [--dry-run]
+#           [--extra-allowed-tools '<csv>'] [--resume-run] [--dry-run]
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
 #             cap · 1 runner error (bad preconditions, missing deps).
@@ -49,6 +49,7 @@ MAX_TURNS=80
 PER_CALL_TIMEOUT=1200   # 20 min per claude -p call
 RESUME=0
 DRY_RUN=0
+EXTRA_ALLOWED_TOOLS=""
 
 BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
@@ -66,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --verify-cmd)       VERIFY_CMD="$2"; shift 2 ;;
     --max-turns)        MAX_TURNS="$2"; shift 2 ;;
     --per-call-timeout) PER_CALL_TIMEOUT="$2"; shift 2 ;;
+    --extra-allowed-tools) EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
     -h|--help)          sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -99,6 +101,22 @@ if [[ -z "$VERIFY_CMD" ]]; then
   log_err "Run '/project-infra verify' to provision one, or pass --verify-cmd '<cmd>'."
   exit 1
 fi
+
+# The BUILD prompt instructs the model to run the verify command, but the
+# allowlist above mirrors a JS project template — a repo whose verify is its own
+# script (./scripts/verify.sh, make verify, …) would have that call *denied*,
+# leaving BUILD unable to prove a slice before ticking it. Grant exactly the
+# resolved verify command, nothing broader.
+#
+# "Nothing broader" is the whole point, so the prefix grant is conditional —
+# see allowlist.sh, which owns the derivation so it can be tested on its own.
+# shellcheck source=allowlist.sh
+. "$SCRIPT_DIR/allowlist.sh"
+BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},$(verify_grants "$VERIFY_CMD")"
+if verify_grants_are_narrow "$VERIFY_CMD"; then
+  log_err "verify command starts with an interpreter ('${VERIFY_CMD%% *}'); granting only the exact command."
+fi
+[[ -n "$EXTRA_ALLOWED_TOOLS" ]] && BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},${EXTRA_ALLOWED_TOOLS}"
 
 [[ -f "$PROMPT_FILE" ]] || { log_err "missing $PROMPT_FILE. Scaffold it from the autopilot skill first."; exit 1; }
 

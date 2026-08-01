@@ -3,13 +3,20 @@
 #
 # The harness demands an objective Verify gate from consumer projects; this is
 # ours. The autopilot loop and any contributor run it before opening a PR.
-# Three offline layers:
+# Six offline layers:
 #   1. scripts/check-consistency.sh — structural invariants (skills, sync-log,
 #      version==changelog, hooks.json resolves, …).
 #   2. Hook test matrix — each guard hook is fed representative stdin-JSON and
 #      its exit code asserted (block cases exit 2, allow cases exit 0), per the
 #      stdin-JSON / exit-2 contract in docs/architecture.md § Hook contract.
-#   3. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
+#   3. docs cross-references — every relative markdown link inside docs/adr/*.md
+#      must resolve to a file that actually exists.
+#   4. repo-map contract — scripts/test-repo-map.sh builds a fixture tree and
+#      asserts skills/repo-map/build-repo-map.sh + query.sh's output against
+#      Schema v1, the five queries, staleness, and the Graphify adapter.
+#   5. code-map renders repo-map — skills/code-map/SKILL.md must point at
+#      tmp/repo-map.json + the repo-map generator, not run its own import scan.
+#   6. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
 # On success writes tmp/.last-verify-status ("ok") in the format the freshness
@@ -144,6 +151,121 @@ else
     "{\"hook_event_name\":\"Stop\",\"cwd\":\"$(json_cwd "$r_fail")\"}"
   assert_hook "stop-gate blocks when verify is stale" 2 "$GATE" \
     "{\"hook_event_name\":\"Stop\",\"cwd\":\"$(json_cwd "$r_stale")\"}"
+fi
+
+# ---------------------------------------------------------------------------
+section "docs cross-references"
+if [[ -d docs/adr ]]; then
+  while IFS= read -r adr; do
+    adr_dir="$(dirname "$adr")"
+    while IFS= read -r link; do
+      [[ -z "$link" ]] && continue
+      case "$link" in
+        http://*|https://*|\#*) continue ;;
+      esac
+      target="${link%%#*}"
+      [[ -z "$target" ]] && continue
+      if [[ -f "$adr_dir/$target" ]]; then
+        ok "$adr: link to $link resolves"
+      else
+        note "$adr: link to $link does not resolve (looked for $adr_dir/$target)"
+      fi
+    done < <(grep -oE '\]\([^)]+\)' "$adr" | sed -E 's/^\]\((.*)\)$/\1/')
+  done < <(find docs/adr -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)
+
+  if [[ -f docs/adr/0004-graphify-as-optional-repo-map-backend.md ]]; then
+    ok "docs/adr/0004-graphify-as-optional-repo-map-backend.md exists"
+    if grep -q '0001-repo-map-as-file-not-mcp.md' docs/adr/0004-graphify-as-optional-repo-map-backend.md; then
+      ok "ADR-0004 references ADR-0001"
+    else
+      note "ADR-0004 does not reference 0001-repo-map-as-file-not-mcp.md"
+    fi
+  else
+    note "docs/adr/0004-graphify-as-optional-repo-map-backend.md is missing"
+  fi
+else
+  echo "  (docs/adr absent — skipping)"
+fi
+
+# ---------------------------------------------------------------------------
+section "repo-map contract"
+if [[ -f scripts/test-repo-map.sh ]]; then
+  if bash scripts/test-repo-map.sh; then
+    ok "repo-map contract passed"
+  else
+    note "repo-map contract failed (see above)"
+  fi
+else
+  note "scripts/test-repo-map.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# The BUILD phase's tool grants are a permission surface: a prefix grant derived
+# The same defect kept returning in different clothes — a dependency breaks and
+# the generator writes a plausible, silently wrong map at exit 0. This sweeps
+# the class instead of guarding its instances one at a time.
+section "fault injection (silently-wrong-output class)"
+if [[ -f scripts/test-fault-injection.sh ]]; then
+  if bash scripts/test-fault-injection.sh; then
+    ok "fault injection passed"
+  else
+    note "fault injection failed (see above)"
+  fi
+else
+  note "scripts/test-fault-injection.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# from an interpreter ('bash scripts/verify.sh' -> Bash(bash:*)) would hand an
+# unattended run arbitrary shell. Assert the derivation directly.
+section "autopilot verify-command grants"
+if [[ -f skills/autopilot/allowlist.sh ]]; then
+  # shellcheck source=/dev/null
+  . skills/autopilot/allowlist.sh
+  grant_case() { # verify-cmd expected
+    local got; got="$(verify_grants "$1")"
+    [[ "$got" == "$2" ]] && ok "grants for '$1'" || note "grants for '$1': got '$got', want '$2'"
+  }
+  grant_case './scripts/verify.sh'   'Bash(./scripts/verify.sh),Bash(./scripts/verify.sh:*)'
+  grant_case 'bash scripts/verify.sh' 'Bash(bash scripts/verify.sh)'
+  grant_case '/bin/sh ci.sh'          'Bash(/bin/sh ci.sh)'
+  grant_case 'make verify'            'Bash(make verify)'
+  grant_case 'npm run verify'         'Bash(npm run verify)'
+  grant_case '/usr/local/bin/ci --strict' 'Bash(/usr/local/bin/ci --strict),Bash(/usr/local/bin/ci:*)'
+  for c in 'bash x.sh' 'make verify' 'npx foo'; do
+    verify_grants_are_narrow "$c" && ok "narrow-grant detected for '$c'" \
+      || note "'$c' was not reported as a narrow grant"
+  done
+  verify_grants_are_narrow './scripts/verify.sh' \
+    && note "'./scripts/verify.sh' wrongly reported as narrow" \
+    || ok "prefix grant kept for a direct script path"
+else
+  note "skills/autopilot/allowlist.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+section "code-map renders repo-map"
+CODE_MAP_SKILL="skills/code-map/SKILL.md"
+if [[ -f "$CODE_MAP_SKILL" ]]; then
+  if grep -q 'tmp/repo-map\.json' "$CODE_MAP_SKILL"; then
+    ok "$CODE_MAP_SKILL references tmp/repo-map.json"
+  else
+    note "$CODE_MAP_SKILL does not reference tmp/repo-map.json"
+  fi
+
+  if grep -q 'skills/repo-map/build-repo-map\.sh' "$CODE_MAP_SKILL"; then
+    ok "$CODE_MAP_SKILL references the repo-map generator"
+  else
+    note "$CODE_MAP_SKILL does not reference skills/repo-map/build-repo-map.sh"
+  fi
+
+  if grep -qE '^\s*rg ' "$CODE_MAP_SKILL"; then
+    note "$CODE_MAP_SKILL still carries its own rg-based import-scan instructions"
+  else
+    ok "$CODE_MAP_SKILL carries no import-scan instructions of its own"
+  fi
+else
+  note "$CODE_MAP_SKILL is missing"
 fi
 
 # ---------------------------------------------------------------------------
