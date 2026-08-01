@@ -34,6 +34,27 @@ if ! command -v "$AWK" >/dev/null 2>&1; then
   exit 1
 fi
 
+# --- Canaries -------------------------------------------------------------
+# Guarding each way a tool can break, one at a time, is a losing game: this
+# script has already shipped three separate fixes for "dependency broken ->
+# plausible but edgeless map at exit 0" (a PCRE2-less ripgrep, a missing
+# scanner, a scanner that exits non-zero), and each fix left the next variant
+# open. A tool that *succeeds and prints nothing* defeats all of them.
+#
+# So instead of predicting failure modes, run the real thing on a known input
+# and check the known answer. Any breakage — absent, failing, silent, wrong
+# version, wrong locale — produces the wrong answer and dies loudly here,
+# rather than a map that is confidently wrong.
+canary_fail() {
+  echo "repo-map: self-check failed — $1" >&2
+  echo "repo-map: the toolchain is not producing correct output; refusing to write a map" >&2
+  exit 1
+}
+
+if [[ "$(jq -n --arg x 1 '[{key:"a",value:($x|tonumber)}] | from_entries | .a' 2>/dev/null)" != "1" ]]; then
+  canary_fail "jq did not evaluate a known expression correctly"
+fi
+
 ROOT="${1:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT" 2>/dev/null || { echo "repo-map: cannot cd into '$ROOT'" >&2; exit 1; }
 
@@ -57,6 +78,16 @@ worktree_sig() {
   } | cksum 2>/dev/null | tr -d ' \n'
 }
 WORKTREE_SIG="$(worktree_sig)"
+
+# Provenance can legitimately degrade — outside a git repo there is no HEAD to
+# record — but it must never degrade *quietly*: an empty git_head switches
+# staleness checking off in query.sh, and an empty signature switches off
+# dirty-tree detection. Both mean the map silently stops refreshing, which is
+# indistinguishable from a map that is simply always right. Say it out loud.
+[[ -z "$GIT_HEAD" ]] && \
+  echo "repo-map: no git HEAD available — staleness tracking is disabled for this map" >&2
+[[ -z "$WORKTREE_SIG" ]] && \
+  echo "repo-map: could not fingerprint the working tree — uncommitted edits will not trigger a rebuild" >&2
 
 OUT_DIR="tmp"
 OUT="$OUT_DIR/repo-map.json"
@@ -188,6 +219,18 @@ find . -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx'
   | sed 's|^\./||' \
   | grep -vE '(^|/)(node_modules|\.git|tmp)(/|$)' \
   | sort -u > "$FILES_LIST"
+
+# A `find` (or `sort`, or `grep`) that succeeds while producing nothing looks
+# exactly like an empty repo, and the canaries above can't see it — they test
+# the scanners, not the enumeration. git knows the answer independently, so ask
+# it: an empty file list in a repo whose index holds source files is a broken
+# toolchain, not an empty tree. Skipped outside a git repo, where there is no
+# second opinion to be had.
+if [[ ! -s "$FILES_LIST" && -n "$GIT_HEAD" ]]; then
+  TRACKED_SRC="$(git -C "$ROOT" ls-files -- \
+    '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.py' 2>/dev/null | head -1)"
+  [[ -n "$TRACKED_SRC" ]] && canary_fail "enumeration found no source files, but git tracks some (e.g. $TRACKED_SRC)"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Collect tsconfig/jsconfig path aliases as "prefix<TAB>replacement" rows,
@@ -334,6 +377,19 @@ cat > "$WORK/scan-py.awk" <<'AWKPY'
   }
 }
 AWKPY
+
+# Run both scanners on a known input and check the known answer — see the
+# canary rationale near the top.
+CANARY_DIR="$WORK/canary"
+mkdir -p "$CANARY_DIR"
+printf "/* x */ import a from './x.js'; // note\n" > "$CANARY_DIR/c.js"
+printf "from .b import c\n" > "$CANARY_DIR/c.py"
+CANARY_JS="$("$AWK" -f "$WORK/scan-js.awk" "$CANARY_DIR/c.js" 2>/dev/null)"
+[[ "$CANARY_JS" == "$CANARY_DIR/c.js	./x.js" ]] \
+  || canary_fail "the JS scanner returned '$CANARY_JS' for a known import"
+CANARY_PY="$("$AWK" -f "$WORK/scan-py.awk" "$CANARY_DIR/c.py" 2>/dev/null)"
+[[ "$CANARY_PY" == "$CANARY_DIR/c.py	.b	c" ]] \
+  || canary_fail "the Python scanner returned '$CANARY_PY' for a known import"
 
 grep -E '\.py$'  "$FILES_LIST" > "$PY_LIST" 2>/dev/null || : > "$PY_LIST"
 grep -vE '\.py$' "$FILES_LIST" > "$JS_LIST" 2>/dev/null || : > "$JS_LIST"
@@ -495,6 +551,17 @@ FILENAME == ALIAS_F {
   if (to != "" && to != from) print from "\t" to "\timports"
 }
 AWKRES
+
+# Same treatment for the resolver: a known file list plus a known specifier has
+# exactly one right answer.
+printf 'src/x.js\n' > "$CANARY_DIR/files.txt"
+: > "$CANARY_DIR/aliases.tsv"
+printf 'src/a.js\t./x.js\n' > "$CANARY_DIR/raw.tsv"
+CANARY_RES="$("$AWK" -v FILES_F="$CANARY_DIR/files.txt" -v ALIAS_F="$CANARY_DIR/aliases.tsv" \
+  -v PY_F="" -f "$WORK/resolve.awk" \
+  "$CANARY_DIR/files.txt" "$CANARY_DIR/aliases.tsv" "$CANARY_DIR/raw.tsv" 2>/dev/null)"
+[[ "$CANARY_RES" == "src/a.js	src/x.js	imports" ]] \
+  || canary_fail "the resolver returned '$CANARY_RES' for a known relative import"
 
 : > "$EDGES"
 resolve_awk() { # py-raw-file raw-file

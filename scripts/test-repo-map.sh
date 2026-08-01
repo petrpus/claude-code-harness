@@ -567,8 +567,11 @@ BROKEN_EXIT=$?
 [[ "$BROKEN_EXIT" -ne 0 ]] \
   && ok "failing awk: generator exits non-zero" \
   || note "failing awk: exited 0 — an edgeless map would look valid"
-grep -qi "failed while" "$BROKEN_ERR" \
-  && ok "failing awk: stderr says the scan failed" \
+# Either layer may catch it first — the self-check canary runs before the scan,
+# so it usually wins. Assert the property (it said something, and said it
+# failed), not which layer spoke.
+grep -qiE "self-check failed|failed while" "$BROKEN_ERR" \
+  && ok "failing awk: stderr reports the failure" \
   || note "failing awk: stderr did not report it: $(cat "$BROKEN_ERR")"
 [[ "$BROKEN_BEFORE" == "$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)" ]] \
   && ok "failing awk: existing map left untouched" \

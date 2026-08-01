@@ -201,6 +201,21 @@ fi
 
 # ---------------------------------------------------------------------------
 # The BUILD phase's tool grants are a permission surface: a prefix grant derived
+# The same defect kept returning in different clothes — a dependency breaks and
+# the generator writes a plausible, silently wrong map at exit 0. This sweeps
+# the class instead of guarding its instances one at a time.
+section "fault injection (silently-wrong-output class)"
+if [[ -f scripts/test-fault-injection.sh ]]; then
+  if bash scripts/test-fault-injection.sh; then
+    ok "fault injection passed"
+  else
+    note "fault injection failed (see above)"
+  fi
+else
+  note "scripts/test-fault-injection.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
 # from an interpreter ('bash scripts/verify.sh' -> Bash(bash:*)) would hand an
 # unattended run arbitrary shell. Assert the derivation directly.
 section "autopilot verify-command grants"

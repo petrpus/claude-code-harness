@@ -19,6 +19,27 @@ All notable changes to claude-code-harness. Semver via git tags.
   renderer over `tmp/repo-map.json`, so `repo-map` owns the one scan
   implementation and `code-map` just projects it to the render shape.
 
+### Added
+- **`scripts/test-fault-injection.sh` — one invariant swept across every tool
+  the `repo-map` generator shells out to**, replacing the guard-per-failure-mode
+  approach that let the same defect return three times in different clothes (a
+  PCRE2-less ripgrep, a missing scanner, a scanner exiting non-zero — each fix
+  closing only the variant in front of it). For each tool × each fault mode
+  (errors / succeeds silently / emits junk) it asserts: the generator must
+  either exit non-zero or write a map whose **graph** matches the known-good
+  one. Provenance is held to a weaker rule — it may degrade, but the
+  degradation must be announced, since a map that quietly stops refreshing
+  looks exactly like one that is always right. 39 rows; the sweep was validated
+  by neutralising the new self-checks and confirming it fails, including for
+  `find` and `sort`, which no hand-written guard had ever covered.
+- **Runtime self-checks ("canaries") in `build-repo-map.sh`.** Rather than
+  predict how a tool can break, the generator runs its real awk programs and jq
+  expression over a known input and compares against the known answer, and
+  cross-checks its file enumeration against `git ls-files`. Absent, failing,
+  silent, or wrong-version tools all produce a wrong answer and die loudly —
+  including the mode that defeated every previous guard: a tool that **exits 0
+  and prints nothing**.
+
 ### Fixed
 - **A present-but-failing `awk` still produced a confident, edgeless map.** The
   guard proved the binary *existed*, not that it *ran*: every `awk` call
