@@ -236,7 +236,8 @@ cat > "$GJSON" <<EOF
   ],
   "edges": [
     {"from": "src/main.js#main", "to": "src/lib/util.js#funcA", "type": "calls"},
-    {"from": "src/main.js#main", "to": "src/lib/util.js#funcB", "type": "calls"}
+    {"from": "src/main.js#main", "to": "src/lib/util.js#funcB", "type": "calls"},
+    {"from": "src/main.js#main", "to": "src/lib/util.js#funcA", "type": "imports"}
   ]
 }
 EOF
@@ -256,8 +257,25 @@ GJ_NODE_IDS="$(jq -r '[.nodes[].id] | sort | join(",")' "$MAP" 2>/dev/null)"
   && ok "graphify: sub-file nodes collapsed to containing-file ids" \
   || note "graphify: node ids: got '$GJ_NODE_IDS'"
 
-GJ_WEIGHT="$(jq -r '.edges[] | select(.from=="src/main.js" and .to=="src/lib/util.js") | .weight' "$MAP" 2>/dev/null)"
+GJ_WEIGHT="$(jq -r '.edges[] | select(.from=="src/main.js" and .to=="src/lib/util.js" and .type=="calls") | .weight' "$MAP" 2>/dev/null)"
 [[ "$GJ_WEIGHT" == "2" ]] && ok "graphify: weight aggregated to 2" || note "graphify: weight: got '$GJ_WEIGHT'"
+
+# Two relationship types between the same file pair stay two edges — but `deps`
+# answers "which files", so it must still name the target once.
+GJ_PAIR_EDGES="$(jq '[.edges[] | select(.from=="src/main.js" and .to=="src/lib/util.js")] | length' "$MAP" 2>/dev/null)"
+[[ "$GJ_PAIR_EDGES" == "2" ]] \
+  && ok "graphify: calls + imports kept as two typed edges" \
+  || note "graphify: expected 2 typed edges for the pair, got '$GJ_PAIR_EDGES'"
+
+GJ_DEPS="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" deps src/main.js 2>/dev/null | tr '\n' ',')"
+[[ "$GJ_DEPS" == "src/lib/util.js," ]] \
+  && ok "graphify: deps de-duplicates across edge types" \
+  || note "graphify: deps returned '$GJ_DEPS' (expected the target once)"
+
+GJ_RDEPS="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" rdeps src/lib/util.js 2>/dev/null | tr '\n' ',')"
+[[ "$GJ_RDEPS" == "src/main.js," ]] \
+  && ok "graphify: rdeps de-duplicates across edge types" \
+  || note "graphify: rdeps returned '$GJ_RDEPS' (expected the source once)"
 
 GJ_UTIL_FANIN="$(jq -r '.nodes[] | select(.id=="src/lib/util.js") | .fan_in' "$MAP" 2>/dev/null)"
 [[ "$GJ_UTIL_FANIN" == "1" ]] && ok "graphify: src/lib/util.js fan_in == 1" || note "graphify: fan_in: got '$GJ_UTIL_FANIN'"
@@ -287,6 +305,29 @@ else
   note "graphify fallback: stderr did not mention graphify: $(cat "$GJ2_ERR")"
 fi
 rm -f "$GJ2_ERR" "$GJSON"
+
+# ---------------------------------------------------------------------------
+# Missing ripgrep must fail loudly. Without the guard the scan matches nothing
+# and the generator writes a map with every node and no edges at all — valid
+# JSON, exit 0, and completely wrong. REPO_MAP_RG lets us simulate that without
+# touching PATH.
+RG_ERR="$(mktemp)"
+RG_MAP_BEFORE="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
+REPO_MAP_RG="definitely-not-a-real-ripgrep" bash "$GEN" "$FIXTURE" >"$RG_ERR" 2>&1
+RG_EXIT=$?
+[[ "$RG_EXIT" -ne 0 ]] \
+  && ok "missing rg: generator exits non-zero" \
+  || note "missing rg: generator exited 0 — an edgeless map would look valid"
+if grep -qi "ripgrep" "$RG_ERR"; then
+  ok "missing rg: stderr names the missing dependency"
+else
+  note "missing rg: stderr did not name ripgrep: $(cat "$RG_ERR")"
+fi
+RG_MAP_AFTER="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
+[[ "$RG_MAP_BEFORE" == "$RG_MAP_AFTER" ]] \
+  && ok "missing rg: existing map left untouched" \
+  || note "missing rg: the existing map was overwritten"
+rm -f "$RG_ERR"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

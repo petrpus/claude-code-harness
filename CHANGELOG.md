@@ -20,6 +20,20 @@ All notable changes to claude-code-harness. Semver via git tags.
   implementation and `code-map` just projects it to the render shape.
 
 ### Fixed
+- `autopilot/loop.sh` granted BUILD far more than the verify command. The grant
+  was derived from the command's first token plus a wildcard, so
+  `--verify-cmd 'bash scripts/verify.sh'` added `Bash(bash:*)` — arbitrary shell
+  under `acceptEdits`, the opposite of an allowlist. The prefix grant is now
+  skipped when that token is an interpreter (`bash`, `make`, `python3`, …) and
+  only the exact command is granted.
+- `repo-map`'s generator had no `rg` guard, though `jq`'s was there. With
+  ripgrep absent every scan matched nothing and the generator wrote a map with
+  all its nodes and **zero edges** at exit 0 — valid JSON, plausible output,
+  every query silently wrong. It now fails loudly; `REPO_MAP_RG` makes the guard
+  testable.
+- `repo-map`'s `deps`/`rdeps` returned a target once per edge *type*, so the
+  Graphify backend's `imports` + `calls` between one file pair listed it twice.
+  These queries answer "which files", so they de-duplicate.
 - `repo-map`'s grep backend counted specifiers named in **line comments** as
   real edges (`// moved out of './lib/util'` invented a dependency and inflated
   that file's `fan_in` — the metric `hotspots` ranks on). Comments are stripped

@@ -9,14 +9,26 @@
 # Usage: build-repo-map.sh [root-dir]
 #   root-dir defaults to the current git toplevel, or cwd outside a git repo.
 #
-# Requires: bash, jq, git, rg. Fails with a clear message if jq is missing
-# rather than emitting a malformed map. Degrades gracefully outside a git repo
-# (empty git_head, not a crash).
+# Requires: bash, jq, git, rg. Fails with a clear message if jq or rg is
+# missing rather than emitting a malformed or edgeless map. Degrades gracefully
+# outside a git repo (empty git_head, not a crash).
 
 set -uo pipefail
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "repo-map: jq is required to build tmp/repo-map.json" >&2
+  exit 1
+fi
+
+# rg is as load-bearing as jq: without it every scan silently matches nothing
+# and the map comes out with all its nodes and none of its edges — a map that
+# is confidently, undetectably wrong. Fail loudly instead. REPO_MAP_RG exists
+# so the guard itself is testable (and lets a caller point at a non-default
+# ripgrep).
+RG="${REPO_MAP_RG:-rg}"
+if ! command -v "$RG" >/dev/null 2>&1; then
+  echo "repo-map: ripgrep ('$RG') is required to build tmp/repo-map.json" >&2
+  echo "repo-map: refusing to write an edgeless map that would look valid" >&2
   exit 1
 fi
 
@@ -189,13 +201,13 @@ scan_js() {
   local f="$1" src
   src="$(strip_line_comments "$f" '//')"
   # import ... from '...'  /  export ... from '...'
-  printf '%s\n' "$src" | rg -oN "from\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^from[[:space:]]+['\"]//; s/['\"]$//" \
+  printf '%s\n' "$src" | "$RG" -oN "from\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^from[[:space:]]+['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
   # bare side-effect import: import '...'
-  printf '%s\n' "$src" | rg -oN "^\s*import\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+['\"]//; s/['\"]$//" \
+  printf '%s\n' "$src" | "$RG" -oN "^\s*import\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
   # require('...')
-  printf '%s\n' "$src" | rg -oN "require\(\s*['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^require\([[:space:]]*['\"]//; s/['\"]$//" \
+  printf '%s\n' "$src" | "$RG" -oN "require\(\s*['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^require\([[:space:]]*['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
 }
 
@@ -203,10 +215,10 @@ scan_py() {
   local f="$1" src
   src="$(strip_line_comments "$f" '#')"
   # from a.b import x
-  printf '%s\n' "$src" | rg -oN "^\s*from\s+[\w.]+\s+import" 2>/dev/null | sed -E "s/^[[:space:]]*from[[:space:]]+//; s/[[:space:]]+import$//" \
+  printf '%s\n' "$src" | "$RG" -oN "^\s*from\s+[\w.]+\s+import" 2>/dev/null | sed -E "s/^[[:space:]]*from[[:space:]]+//; s/[[:space:]]+import$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "${spec//./\/}"; done >> "$RAW"
   # import a.b (module-only form)
-  printf '%s\n' "$src" | rg -oN "^\s*import\s+[\w.]+\s*$" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+//; s/[[:space:]]+$//" \
+  printf '%s\n' "$src" | "$RG" -oN "^\s*import\s+[\w.]+\s*$" 2>/dev/null | sed -E "s/^[[:space:]]*import[[:space:]]+//; s/[[:space:]]+$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "${spec//./\/}"; done >> "$RAW"
 }
 

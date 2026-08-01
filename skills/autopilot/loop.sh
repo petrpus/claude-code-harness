@@ -107,7 +107,21 @@ fi
 # script (./scripts/verify.sh, make verify, …) would have that call *denied*,
 # leaving BUILD unable to prove a slice before ticking it. Grant exactly the
 # resolved verify command, nothing broader.
-BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},Bash(${VERIFY_CMD}),Bash(${VERIFY_CMD%% *}:*)"
+#
+# "Nothing broader" is the whole point, so the prefix grant is conditional. The
+# first token of a command like 'bash scripts/verify.sh' is an *interpreter*,
+# and `Bash(bash:*)` would hand BUILD arbitrary shell under acceptEdits — the
+# opposite of an allowlist. For those, the exact-match grant stands alone.
+VERIFY_HEAD="${VERIFY_CMD%% *}"
+BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},Bash(${VERIFY_CMD})"
+case "$(basename "$VERIFY_HEAD")" in
+  bash|sh|dash|zsh|ksh|env|python|python3|node|ruby|perl|make|npm|pnpm|yarn|npx|deno|bun)
+    log_err "verify command starts with '$VERIFY_HEAD'; granting only the exact command, not '$VERIFY_HEAD:*'."
+    ;;
+  *)
+    BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},Bash(${VERIFY_HEAD}:*)"
+    ;;
+esac
 [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},${EXTRA_ALLOWED_TOOLS}"
 
 [[ -f "$PROMPT_FILE" ]] || { log_err "missing $PROMPT_FILE. Scaffold it from the autopilot skill first."; exit 1; }

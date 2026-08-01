@@ -151,11 +151,15 @@ if ! jq empty "$MAP" >/dev/null 2>&1; then
 fi
 
 case "$CMD" in
+  # `unique` is load-bearing, not tidiness: edges dedupe on (from, to, type), so
+  # a backend that reports several relationships between the same pair — the
+  # Graphify adapter emitting both `imports` and `calls` — yields one row per
+  # type. These queries answer "which files", not "which relationships".
   deps)
-    jq -r --arg f "$1" '.edges[] | select(.from == $f) | .to' "$MAP"
+    jq -r --arg f "$1" '[.edges[] | select(.from == $f) | .to] | unique | .[]' "$MAP"
     ;;
   rdeps)
-    jq -r --arg f "$1" '.edges[] | select(.to == $f) | .from' "$MAP"
+    jq -r --arg f "$1" '[.edges[] | select(.to == $f) | .from] | unique | .[]' "$MAP"
     ;;
   hotspots)
     N="${1:-10}"
