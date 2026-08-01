@@ -2,6 +2,19 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [Unreleased]
+
+### Fixed
+- **The push-from-main guard blocked pushing a tag**, which is this repo's own
+  documented release step (`v0.x.0` on the merge commit on `main`) — found by
+  hitting it while cutting 0.4.0. A tag doesn't advance a branch, so the rule
+  has nothing to say about it. Tag-only pushes are recognised in their common
+  forms (`origin v1.2.3`, `origin refs/tags/v1.2.3`, `--tags`, `origin tag
+  v1.2.3`) and allowed; anything that could still move a branch is not —
+  `--follow-tags` (which pushes commits too), a mixed branch+tag push, a bare
+  name that resolves to a branch or is ambiguous, and force-pushing a tag all
+  stay blocked.
+
 ## [0.4.0] — 2026-08-01
 
 The repo-map layer (PRD 0001, M-slices M1–M2) plus a round of hardening on the
