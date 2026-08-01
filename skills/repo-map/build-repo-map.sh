@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # skills/repo-map/build-repo-map.sh — grep-backend generator for tmp/repo-map.json.
 #
-# Scans JS/TS/Python import/require edges, resolves relative and
-# tsconfig/jsconfig path-alias specifiers to real files, drops unresolved bare
-# specifiers (external packages, stdlib), and writes tmp/repo-map.json per
-# Schema v1 (see docs/adr/0004-graphify-as-optional-repo-map-backend.md).
+# Scans JS/TS import/require edges, resolves relative and tsconfig/jsconfig
+# path-alias specifiers to real files, drops unresolved bare specifiers
+# (external packages, stdlib), and writes tmp/repo-map.json per Schema v1
+# (see docs/adr/0004-graphify-as-optional-repo-map-backend.md).
+#
+# KNOWN GAP — Python files are scanned but produce NO edges. Every Python
+# specifier form (`from a.b import x`, `import a.b`, `from .b import x`)
+# arrives at resolve_specifier as a bare specifier, and bare specifiers are
+# only resolvable through a tsconfig/jsconfig alias, which no Python project
+# has. A Python repo therefore gets a nodes-only map that claims nothing
+# depends on anything. Tracked separately; do not read the .py scanning below
+# as working support.
 #
 # Usage: build-repo-map.sh [root-dir]
 #   root-dir defaults to the current git toplevel, or cwd outside a git repo.
@@ -187,19 +195,53 @@ done
 # 3. Scan raw import specifiers into RAW as "file<TAB>specifier".
 : > "$RAW"
 
-# A specifier named inside a line comment — `// copied from './legacy/old'` —
-# is prose, not a dependency, but it reads exactly like one to a regex. Left in,
-# it invents an edge and inflates the target's fan_in, which is the very metric
-# `hotspots` ranks on. Strip line comments before matching. A specifier inside a
-# string literal still slips through: that is the accuracy ceiling of a regex
-# backend, and precisely why the Graphify backend exists (see SKILL.md).
-strip_line_comments() { # file comment-marker-regex
-  sed -E "s:${2}.*$::" "$1" 2>/dev/null
+# A specifier named in a comment — `// copied from './legacy/old'`, or a
+# commented-out import inside a JSDoc block — is prose, not a dependency, but it
+# reads exactly like one to a regex. Left in, it invents an edge and inflates the
+# target's fan_in, the very metric `hotspots` ranks on.
+#
+# Both comment forms are stripped in ONE pass, because two passes break on input
+# each would mangle for the other: stripping `//` first turns `/* // */` into an
+# unterminated `/*` that swallows the rest of the file, and stripping `/*` first
+# lets `// /* note` open a block that was only ever a line comment. So walk each
+# line and honour whichever marker opens first.
+#
+# A specifier inside a *string literal* still slips through, as does one in a
+# Python docstring (only `#` is stripped there — a triple-quote state machine
+# risks swallowing real imports, which is worse than the phantom it prevents).
+# That is the accuracy ceiling of a regex backend, and precisely why the
+# Graphify backend exists (see SKILL.md).
+strip_js_comments() { # file
+  awk '
+    BEGIN { inblock = 0 }
+    {
+      line = $0; out = ""
+      while (length(line) > 0) {
+        if (inblock) {
+          p = index(line, "*/")
+          if (p == 0) { line = ""; break }
+          line = substr(line, p + 2); inblock = 0
+          continue
+        }
+        b = index(line, "/*")
+        l = index(line, "//")
+        if (b == 0 && l == 0) { out = out line; break }
+        if (l > 0 && (b == 0 || l < b)) { out = out substr(line, 1, l - 1); break }
+        out = out substr(line, 1, b - 1)
+        line = substr(line, b + 2); inblock = 1
+      }
+      print out
+    }
+  ' "$1" 2>/dev/null
+}
+
+strip_py_comments() { # file
+  sed -E 's:#.*$::' "$1" 2>/dev/null
 }
 
 scan_js() {
   local f="$1" src
-  src="$(strip_line_comments "$f" '//')"
+  src="$(strip_js_comments "$f")"
   # import ... from '...'  /  export ... from '...'
   printf '%s\n' "$src" | "$RG" -oN "from\s+['\"][^'\"]+['\"]" 2>/dev/null | sed -E "s/^from[[:space:]]+['\"]//; s/['\"]$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "$spec"; done >> "$RAW"
@@ -213,7 +255,7 @@ scan_js() {
 
 scan_py() {
   local f="$1" src
-  src="$(strip_line_comments "$f" '#')"
+  src="$(strip_py_comments "$f")"
   # from a.b import x
   printf '%s\n' "$src" | "$RG" -oN "^\s*from\s+[\w.]+\s+import" 2>/dev/null | sed -E "s/^[[:space:]]*from[[:space:]]+//; s/[[:space:]]+import$//" \
     | while IFS= read -r spec; do [[ -n "$spec" ]] && printf '%s\t%s\n' "$f" "${spec//./\/}"; done >> "$RAW"

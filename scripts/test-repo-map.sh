@@ -14,7 +14,8 @@ note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }
 
 FIXTURE="$(mktemp -d)"
-cleanup() { rm -rf "$FIXTURE"; }
+COMMENT_FIXTURE="$(mktemp -d)"
+cleanup() { rm -rf "$FIXTURE" "$COMMENT_FIXTURE"; }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
@@ -305,6 +306,46 @@ else
   note "graphify fallback: stderr did not mention graphify: $(cat "$GJ2_ERR")"
 fi
 rm -f "$GJ2_ERR" "$GJSON"
+
+# ---------------------------------------------------------------------------
+# Comment stripping, on its own fixture so the counts above stay readable.
+# Every specifier here except real1/real2 sits in a comment and must NOT become
+# an edge. The two "tricky" lines are the reason stripping happens in one pass:
+# a `//` inside a block, and a `/*` inside a line comment that must not open a
+# block and swallow the rest of the file.
+mkdir -p "$COMMENT_FIXTURE/src/lib"
+git -C "$COMMENT_FIXTURE" init -q
+cat > "$COMMENT_FIXTURE/src/app.js" <<'EOF'
+/*
+ * Legacy: import gone from './lib/blockmulti.js';
+ */
+/* inline: import x from './lib/blockinline.js'; */
+// line: import y from './lib/linec.js';
+/* tricky: // import z from './lib/nested1.js'; */
+// tricky2: /* import w from './lib/nested2.js';
+import real1 from './lib/real1.js'; /* trailing: import q from './lib/trail.js'; */
+/* opener */ import real2 from './lib/real2.js';
+EOF
+for n in blockmulti blockinline linec nested1 nested2 trail real1 real2; do
+  echo "export const x = 1;" > "$COMMENT_FIXTURE/src/lib/$n.js"
+done
+# No Python case here: no Python specifier form currently resolves to an edge
+# at all (see the "python imports never resolve" issue), so a `#`-stripping
+# assertion would be untestable through the graph. Asserting it via edges would
+# pass for the wrong reason.
+git -C "$COMMENT_FIXTURE" add -A >/dev/null 2>&1
+git -C "$COMMENT_FIXTURE" -c user.email=t@t.est -c user.name=test commit -q -m fixture
+
+if bash "$GEN" "$COMMENT_FIXTURE" >/dev/null 2>&1; then
+  C_TARGETS="$(jq -r '[.edges[] | select(.from=="src/app.js") | .to] | sort | join(",")' \
+    "$COMMENT_FIXTURE/tmp/repo-map.json" 2>/dev/null)"
+  [[ "$C_TARGETS" == "src/lib/real1.js,src/lib/real2.js" ]] \
+    && ok "comments: only real imports survive block/line stripping" \
+    || note "comments: expected real1+real2, got '$C_TARGETS'"
+
+else
+  note "comments: generator failed on the comment fixture"
+fi
 
 # ---------------------------------------------------------------------------
 # Missing ripgrep must fail loudly. Without the guard the scan matches nothing

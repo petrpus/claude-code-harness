@@ -1,6 +1,6 @@
 ---
 name: repo-map
-description: Machine-readable module/dependency map (tmp/repo-map.json, Schema v1) that agents query instead of grepping the tree. Grep backend scans JS/TS/Python import edges; a Graphify graph.json is adapted when one is already on disk. Use to answer "what depends on this file", "what does this file depend on", "what are the hotspots", or "what are the entry points" without a fresh grep sweep.
+description: Machine-readable module/dependency map (tmp/repo-map.json, Schema v1) that agents query instead of grepping the tree. Grep backend scans JS/TS import edges (Python is not yet resolved); a Graphify graph.json is adapted when one is already on disk. Use to answer "what depends on this file", "what does this file depend on", "what are the hotspots", or "what are the entry points" without a fresh grep sweep.
 ---
 
 # Skill: /repo-map
@@ -51,16 +51,24 @@ nothing uses them). The query doesn't try to tell them apart; read the list
 with that in mind.
 
 **Honest caveat on grep-backend accuracy:** the grep backend matches import
-syntax with a regex; it does not parse. Line comments are stripped before
-matching, so `// moved out of './lib/util'` no longer invents an edge, but a
-specifier inside a *string literal* — `const s = "import x from './fake'"` —
-still reads as an import and becomes one. Such phantom edges inflate the
-target's `fan_in`, which is exactly what `hotspots` ranks on, so treat a
-surprising hotspot as a question rather than a fact. Dynamic `import()`,
-re-exports through barrel files, and runtime-computed specifiers are invisible
-to it. This is the accuracy ceiling of a zero-dependency regex scan and the
-reason the Graphify backend exists: when precision matters more than having no
-dependencies, run Graphify and let the adapter pick its AST-derived graph up.
+syntax with a regex; it does not parse. Comments — both `//` lines and `/* … */`
+blocks — are stripped before matching, so a commented-out import or a JSDoc
+example no longer invents an edge. What still slips through is a specifier
+inside a *string literal*: `const s = "import x from './fake'"` reads as an
+import and becomes one. Such phantom edges inflate the target's `fan_in`, which
+is exactly what `hotspots` ranks on, so treat a surprising hotspot as a question
+rather than a fact. Dynamic `import()`, re-exports through barrel files, and
+runtime-computed specifiers are invisible to it. This is the accuracy ceiling of
+a zero-dependency regex scan and the reason the Graphify backend exists: when
+precision matters more than having no dependencies, run Graphify and let the
+adapter pick its AST-derived graph up.
+
+**Python is scanned but not resolved.** `.py` files become nodes, and no Python
+import becomes an edge — every specifier form (`from a.b import x`, `import
+a.b`, `from .b import x`) reaches the resolver as a bare specifier, and bare
+specifiers resolve only through a tsconfig/jsconfig alias that no Python project
+has. A Python-only repo therefore gets a map claiming nothing depends on
+anything. Don't read that as "no coupling"; read it as "not measured".
 
 ## Schema v1
 
@@ -159,7 +167,7 @@ consumer project that doesn't otherwise match the harness's conventions.
 
 ## Bundled files
 
-- `build-repo-map.sh` — the generator. Scans JS/TS/Python import/require
+- `build-repo-map.sh` — the generator. Scans JS/TS import/require
   edges (relative paths and tsconfig/jsconfig `paths` aliases resolved,
   unresolved bare specifiers dropped), or adapts a Graphify `graph.json` when
   one is present and trustworthy, and writes `tmp/repo-map.json` with the

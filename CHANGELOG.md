@@ -7,7 +7,7 @@ All notable changes to claude-code-harness. Semver via git tags.
 ### Added
 - `skills/repo-map/` — a machine-readable module/dependency map
   (`tmp/repo-map.json`, Schema v1) that agents query instead of grepping the
-  tree: `build-repo-map.sh` (grep backend, JS/TS/Python import scan with
+  tree: `build-repo-map.sh` (grep backend, JS/TS import scan with
   tsconfig/jsconfig alias resolution, or an adapter for an existing Graphify
   `graph.json` when one is already on disk — detection only, never a
   dependency) and `query.sh` (`deps`, `rdeps`, `hotspots`, `entry-points`,
@@ -34,11 +34,20 @@ All notable changes to claude-code-harness. Semver via git tags.
 - `repo-map`'s `deps`/`rdeps` returned a target once per edge *type*, so the
   Graphify backend's `imports` + `calls` between one file pair listed it twice.
   These queries answer "which files", so they de-duplicate.
-- `repo-map`'s grep backend counted specifiers named in **line comments** as
-  real edges (`// moved out of './lib/util'` invented a dependency and inflated
-  that file's `fan_in` — the metric `hotspots` ranks on). Comments are stripped
-  before matching, and the residual ceiling (specifiers inside string literals,
-  dynamic `import()`) is documented in the SKILL rather than left implied.
+- `repo-map`'s grep backend counted specifiers named in **comments** as real
+  edges (`// moved out of './lib/util'`, or a commented-out import in a JSDoc
+  block, invented a dependency and inflated that file's `fan_in` — the metric
+  `hotspots` ranks on). Both `//` lines and `/* … */` blocks are now stripped in
+  a single pass, since stripping either form first mangles input the other
+  needs: `//`-first turns `/* // */` into an unterminated block that swallows
+  the file, and `/*`-first lets `// /* note` open a block that was never one.
+  The residual ceiling (specifiers inside string literals, dynamic `import()`)
+  is documented in the SKILL rather than left implied.
+- `repo-map` no longer advertises Python support it does not have. `.py` files
+  are scanned but **no Python import resolves to an edge** — every form arrives
+  at the resolver as a bare specifier, resolvable only via a tsconfig alias no
+  Python project has. The claim is removed from the skill description and the
+  gap documented; fixing it is tracked separately.
 - `repo-map`'s scanner no longer passes `rg -P`. The patterns never needed
   PCRE2, and on a ripgrep built without it every scan would have failed into a
   `2>/dev/null` and produced a silently edgeless map.
