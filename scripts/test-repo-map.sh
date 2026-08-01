@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# scripts/test-repo-map.sh — fixture-based contract tests for skills/repo-map/.
+#
+# Builds a throwaway fixture tree under a temp dir (never against this repo,
+# whose file set changes), runs the generator against it, and asserts the
+# Schema v1 contract. Invoked from scripts/verify.sh's "repo-map contract"
+# section. Cleaned up on exit.
+
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
+
+FAIL=0
+note() { echo "  ✗ $*"; FAIL=1; }
+ok()   { echo "  ✓ $*"; }
+
+FIXTURE="$(mktemp -d)"
+cleanup() { rm -rf "$FIXTURE"; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Build the fixture tree.
+#
+#   src/main.js   -> src/lib/foo.js (relative), 'lodash' (bare, dropped)
+#   src/lib/foo.js -> src/lib/util.js (relative)
+#   src/other.js  -> src/lib/util.js (via tsconfig alias '@/lib/util')
+#   src/third.js  -> src/lib/util.js (relative)
+#   src/lib/util.js -> (nothing)      -- hotspot: fan_in == 3
+#   src/dead.js   -> (nothing)        -- dead file: fan_in == 0, fan_out == 0
+#   node_modules/lodash/index.js      -- must not become a node
+mkdir -p "$FIXTURE/src/lib" "$FIXTURE/node_modules/lodash"
+git -C "$FIXTURE" init -q
+
+cat > "$FIXTURE/tsconfig.json" <<'EOF'
+{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }
+EOF
+
+cat > "$FIXTURE/src/main.js" <<'EOF'
+import foo from './lib/foo.js';
+import _ from 'lodash';
+EOF
+
+cat > "$FIXTURE/src/lib/foo.js" <<'EOF'
+import util from './util.js';
+EOF
+
+cat > "$FIXTURE/src/other.js" <<'EOF'
+import util from '@/lib/util';
+EOF
+
+cat > "$FIXTURE/src/third.js" <<'EOF'
+import util from './lib/util.js';
+EOF
+
+: > "$FIXTURE/src/lib/util.js"
+: > "$FIXTURE/src/dead.js"
+cat > "$FIXTURE/node_modules/lodash/index.js" <<'EOF'
+module.exports = {};
+EOF
+
+git -C "$FIXTURE" add -A >/dev/null 2>&1
+git -C "$FIXTURE" -c user.email=t@t.est -c user.name=test commit -q -m fixture
+
+# ---------------------------------------------------------------------------
+GEN="skills/repo-map/build-repo-map.sh"
+if [[ ! -f "$GEN" ]]; then
+  note "$GEN does not exist yet"
+  echo
+  echo "test-repo-map: $FAIL failure(s)"
+  exit 1
+fi
+
+GEN_ERR="$(mktemp)"
+bash "$GEN" "$FIXTURE" >"$GEN_ERR" 2>&1
+GEN_EXIT=$?
+MAP="$FIXTURE/tmp/repo-map.json"
+
+[[ "$GEN_EXIT" -eq 0 ]] && ok "generator exits 0" || note "generator exited $GEN_EXIT: $(cat "$GEN_ERR")"
+
+if [[ ! -f "$MAP" ]]; then
+  note "$MAP was not written"
+  echo
+  echo "test-repo-map: $FAIL failure(s)"
+  rm -f "$GEN_ERR"
+  exit 1
+fi
+rm -f "$GEN_ERR"
+
+jq empty "$MAP" >/dev/null 2>&1 && ok "valid JSON" || note "invalid JSON"
+
+for key in schema_version generated_at git_head backend backend_version nodes edges; do
+  jq -e "has(\"$key\")" "$MAP" >/dev/null 2>&1 && ok "provenance key '$key' present" || note "provenance key '$key' missing"
+done
+
+[[ "$(jq -r '.schema_version' "$MAP" 2>/dev/null)" == "1" ]] && ok "schema_version == 1" || note "schema_version != 1"
+[[ "$(jq -r '.backend' "$MAP" 2>/dev/null)" == "grep" ]] && ok "backend == grep" || note "backend != grep"
+
+FIXTURE_HEAD="$(git -C "$FIXTURE" rev-parse --short HEAD)"
+[[ "$(jq -r '.git_head' "$MAP" 2>/dev/null)" == "$FIXTURE_HEAD" ]] \
+  && ok "git_head matches fixture HEAD" || note "git_head mismatch (want $FIXTURE_HEAD, got $(jq -r '.git_head' "$MAP" 2>/dev/null))"
+
+BAD_NODES="$(jq '[.nodes[] | select((has("id") and has("label") and has("kind") and has("fan_in") and has("fan_out"))|not)] | length' "$MAP" 2>/dev/null)"
+[[ "$BAD_NODES" == "0" ]] && ok "every node carries id/label/kind/fan_in/fan_out" || note "$BAD_NODES node(s) missing required fields"
+
+BAD_EDGES="$(jq '[.edges[] | select((has("from") and has("to") and has("type"))|not)] | length' "$MAP" 2>/dev/null)"
+[[ "$BAD_EDGES" == "0" ]] && ok "every edge carries from/to/type" || note "$BAD_EDGES edge(s) missing required fields"
+
+DANGLING="$(jq '([.nodes[].id]) as $ids | [.edges[] | select(([.from,.to] - $ids) | length > 0)] | length' "$MAP" 2>/dev/null)"
+[[ "$DANGLING" == "0" ]] && ok "all edge endpoints resolve to node ids" || note "$DANGLING edge(s) reference an unknown node id"
+
+if jq -e '[.nodes[].id] | any(test("node_modules"))' "$MAP" >/dev/null 2>&1; then
+  note "a node_modules path leaked into nodes"
+else
+  ok "node_modules excluded from nodes"
+fi
+
+if jq -e '[.edges[] | select(.to | test("lodash"))] | length == 0' "$MAP" >/dev/null 2>&1; then
+  ok "bare 'lodash' import dropped (no edge)"
+else
+  note "an edge targeting 'lodash' survived — bare specifiers must be dropped"
+fi
+
+fan_in_of()  { jq -r --arg id "$1" '.nodes[] | select(.id==$id) | .fan_in'  "$MAP" 2>/dev/null; }
+fan_out_of() { jq -r --arg id "$1" '.nodes[] | select(.id==$id) | .fan_out' "$MAP" 2>/dev/null; }
+
+check_fan() {
+  local id="$1" which="$2" want="$3" got
+  if [[ "$which" == "fan_in" ]]; then got="$(fan_in_of "$id")"; else got="$(fan_out_of "$id")"; fi
+  [[ "$got" == "$want" ]] && ok "$id $which == $want" || note "$id $which: want $want, got $got"
+}
+
+check_fan "src/lib/util.js" fan_in  3   # hotspot
+check_fan "src/lib/util.js" fan_out 0
+check_fan "src/main.js"     fan_in  0   # entry point
+check_fan "src/main.js"     fan_out 1   # lodash dropped
+check_fan "src/other.js"    fan_in  0
+check_fan "src/other.js"    fan_out 1   # alias import resolved
+check_fan "src/dead.js"     fan_in  0   # dead file
+check_fan "src/dead.js"     fan_out 0
+
+ALIAS_TARGET="$(jq -r '.edges[] | select(.from=="src/other.js") | .to' "$MAP" 2>/dev/null)"
+[[ "$ALIAS_TARGET" == "src/lib/util.js" ]] \
+  && ok "alias import '@/lib/util' resolves to src/lib/util.js" \
+  || note "alias import resolved to '$ALIAS_TARGET', expected src/lib/util.js"
+
+echo
+if [[ "$FAIL" -eq 0 ]]; then
+  echo "test-repo-map: PASS"
+else
+  echo "test-repo-map: $FAIL failure(s)"
+fi
+exit "$FAIL"

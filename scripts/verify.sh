@@ -3,16 +3,18 @@
 #
 # The harness demands an objective Verify gate from consumer projects; this is
 # ours. The autopilot loop and any contributor run it before opening a PR.
-# Four offline layers:
+# Five offline layers:
 #   1. scripts/check-consistency.sh — structural invariants (skills, sync-log,
 #      version==changelog, hooks.json resolves, …).
 #   2. Hook test matrix — each guard hook is fed representative stdin-JSON and
 #      its exit code asserted (block cases exit 2, allow cases exit 0), per the
 #      stdin-JSON / exit-2 contract in docs/architecture.md § Hook contract.
-#   3. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
-#      that stands even if check-consistency's own walk regresses.
-#   4. docs cross-references — every relative markdown link inside docs/adr/*.md
+#   3. docs cross-references — every relative markdown link inside docs/adr/*.md
 #      must resolve to a file that actually exists.
+#   4. repo-map contract — scripts/test-repo-map.sh builds a fixture tree and
+#      asserts skills/repo-map/build-repo-map.sh's output against Schema v1.
+#   5. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
+#      that stands even if check-consistency's own walk regresses.
 #
 # On success writes tmp/.last-verify-status ("ok") in the format the freshness
 # hooks read (hooks/pre-commit-gate.sh, hooks/on-stop.sh), so their staleness
@@ -180,6 +182,18 @@ if [[ -d docs/adr ]]; then
   fi
 else
   echo "  (docs/adr absent — skipping)"
+fi
+
+# ---------------------------------------------------------------------------
+section "repo-map contract"
+if [[ -f scripts/test-repo-map.sh ]]; then
+  if bash scripts/test-repo-map.sh; then
+    ok "repo-map contract passed"
+  else
+    note "repo-map contract failed (see above)"
+  fi
+else
+  note "scripts/test-repo-map.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------
