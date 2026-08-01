@@ -2,173 +2,88 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
-## [Unreleased]
+## [0.4.0] — 2026-08-01
 
-### Fixed
-- **Guard hooks stopped guarding, silently, whenever a tool they use broke.**
-  Failing open without `jq` is deliberate — failing open *quietly* was not.
-  Worse, `jq` was never the only way in: `pre-bash.sh` split its input with
-  `tr | sed`, so a broken `sed` produced no segments, nothing matched, and
-  `rm -rf /` was allowed at exit 0 with no warning. The segmenter is pure bash
-  now (no tool, no fault), and any remaining fall-open path announces itself on
-  stderr, naming the missing dependency.
-- **A broken `git` disabled the push-from-main guard with no trace.** That
-  guard is the one rule `settings.json` deny cannot express, because it needs
-  the current branch — and a `git` printing nonsense returned a branch name
-  that merely *looked* valid, making "not main" indistinguishable from "safe".
-  The hook now asks git a question with a known answer before trusting its
-  answer to the one that matters, and says so when it can't.
-- **`pre-commit-gate.sh` could exit non-zero**, which an advisory hook must
-  never do. A `stat` or `date` that exits 0 while printing nothing fed a bare
-  word into `$(( ))`; the arithmetic error left `AGE_SEC` unset and `set -u`
-  killed the hook. `mtime_of` and the new `now_epoch` in `hooks/lib.sh` always
-  return an integer, and a meaningless age is now reported as nothing rather
-  than as a nonsense number.
+The repo-map layer (PRD 0001, M-slices M1–M2) plus a round of hardening on the
+autopilot loop and the guard hooks.
+
+Note on scope: `skills/repo-map/` ships here for the first time, so the defects
+found and fixed while building it are not listed as fixes — no released version
+ever had them. Its accuracy limits are documented in the skill itself. The
+Fixed section below is regressions against 0.3.0 only.
 
 ### Added
-- `scripts/test-hook-faults.sh` — fault injection for the hooks, the inverted
-  companion to `test-fault-injection.sh`. Guard hooks must either still block
-  or announce that guarding is degraded; advisory hooks must exit 0 under every
-  fault, never hang, and never emit reserved harness tags on stdout (which is
-  model context). 8 tools × 3 fault modes × every blocked case. Found all three
-  bugs above on its first run, and validated by regression: reverting the fixes
-  fails 15 rows.
+- **`skills/repo-map/`** — a machine-readable file-level import graph on disk
+  (`tmp/repo-map.json`, Schema v1) that agents query instead of grepping the
+  tree: `deps`, `rdeps`, `hotspots`, `entry-points`, `stats`, all jq-expressible.
+  Two backends under one schema — a zero-dependency scan of our own (JS/TS and
+  Python, tsconfig/jsconfig alias resolution, comment-aware), and an adapter
+  over an existing [Graphify](https://graphify.net) `graph.json` when a project
+  already has one. Detection only, never an install; Graphify's MCP server stays
+  out of scope per ADR-0001. Staleness is a provenance stamp plus lazy
+  regeneration — including a `worktree_sig` so uncommitted edits, the state an
+  agent queries from for most of a task, don't serve a stale map. Scanning and
+  resolution run in batched `awk`: 6,000 files in about a second, which is what
+  makes "regenerate on any drift" affordable. See
+  `docs/adr/0004-graphify-as-optional-repo-map-backend.md`.
+- **Three test harnesses**, each for a class the repo had no coverage for:
+  - `scripts/test-fault-injection.sh` — every tool the repo-map generator shells
+    out to, times three fault modes, asserting it can never produce a wrong
+    graph at exit 0. Written after the same "broken dependency → plausible,
+    silently wrong output" defect recurred three times in different clothes.
+  - `scripts/test-hook-faults.sh` — the same sweep with the contract inverted,
+    since hooks fail open by design: guards must block or announce, advisory
+    hooks must always exit 0, never hang, and never write to stdout.
+  - `scripts/test-autopilot-loop.sh` — drives `loop.sh` end-to-end against a
+    stub `claude`, so the runner's gating decisions are exercised without cost.
+    The loop previously had no test at all.
+- **Runtime self-checks in `build-repo-map.sh`** — rather than predict how a
+  tool can break, it runs its real awk programs and jq expression over a known
+  input and compares the known answer, and cross-checks enumeration against
+  `git ls-files`. Catches the mode that defeats every dependency guard: a tool
+  that exits 0 and prints nothing.
+- `skills/autopilot/allowlist.sh` — the BUILD phase's tool-grant derivation,
+  extracted so `verify.sh` can assert it directly. It is a permission surface
+  and had no test.
+
+### Changed
+- `skills/code-map/` stops running its own import scan and becomes a renderer
+  over `tmp/repo-map.json`, so there is one scan implementation and two outputs.
+- `scripts/verify.sh` grows the three sweeps above plus a grants assertion.
 
 ### Fixed
 - **autopilot could not finish a plan of more than three slices.** BUILD does
   exactly one plan item per iteration, so `STATUS: done` is false by
-  construction until the last one — and the loop treated that as a gate failure.
-  Every intermediate iteration therefore looked identical to a real failure,
-  carried the same `sentinel` fingerprint, and tripped the stuck detector after
-  three of them. The loop rewarded doing everything in a single iteration,
-  precisely inverting the slice-by-slice discipline it exists to enforce.
-  Progress is now **measured** — ticked checkboxes counted before and after
-  BUILD — and `STATUS: done` means only "the run is over". Nothing ticked and
-  not done is the real no-progress signal, and that is what the stuck detector
-  counts.
-- **Intermediate iterations were never verified by the runner.** The completion
-  check short-circuited gates (b) verify, (c) secret scan and (d) semantic
+  construction until the last one — and the loop counted that as a gate failure.
+  Every intermediate iteration looked identical to a real failure, carried the
+  same fingerprint, and tripped the stuck detector after three. The loop
+  rewarded doing everything at once, inverting the slice-by-slice discipline it
+  exists to enforce. Progress is measured from ticked checkboxes now, and
+  `STATUS: done` only ends the run.
+- **Intermediate autopilot iterations were never verified.** The completion
+  check short-circuited machine verify, the secret scan and the semantic
   verifier, so incremental work was committed as "wip" with none of them having
-  run. All three now run every iteration.
-
-### Added
-- `scripts/test-autopilot-loop.sh` — end-to-end control-flow tests for
-  `loop.sh`, driven by a stub `claude` on PATH so the runner's decisions
-  (progress vs. failure, when to abort, which exit code) are exercised without
-  spending anything. The loop previously had **no test at all**, which is how
-  the gating flaw above shipped. Validated by regression: restoring the old
-  behaviour makes the suite fail with the exact symptoms seen in the first real
-  run — exit 4, zero progressed iterations, `gate=sentinel` checkpoints.
-
-### Added
-- `skills/repo-map/` — a machine-readable module/dependency map
-  (`tmp/repo-map.json`, Schema v1) that agents query instead of grepping the
-  tree: `build-repo-map.sh` (grep backend, JS/TS + Python import scan with
-  tsconfig/jsconfig alias resolution, or an adapter for an existing Graphify
-  `graph.json` when one is already on disk — detection only, never a
-  dependency) and `query.sh` (`deps`, `rdeps`, `hotspots`, `entry-points`,
-  `stats`, with provenance-stamp staleness and lazy regeneration at read
-  time). See `docs/adr/0004-graphify-as-optional-repo-map-backend.md`.
-
-### Changed
-- `skills/code-map/`: stops running its own import scan and becomes a
-  renderer over `tmp/repo-map.json`, so `repo-map` owns the one scan
-  implementation and `code-map` just projects it to the render shape.
-
-### Added
-- **`scripts/test-fault-injection.sh` — one invariant swept across every tool
-  the `repo-map` generator shells out to**, replacing the guard-per-failure-mode
-  approach that let the same defect return three times in different clothes (a
-  PCRE2-less ripgrep, a missing scanner, a scanner exiting non-zero — each fix
-  closing only the variant in front of it). For each tool × each fault mode
-  (errors / succeeds silently / emits junk) it asserts: the generator must
-  either exit non-zero or write a map whose **graph** matches the known-good
-  one. Provenance is held to a weaker rule — it may degrade, but the
-  degradation must be announced, since a map that quietly stops refreshing
-  looks exactly like one that is always right. 39 rows; the sweep was validated
-  by neutralising the new self-checks and confirming it fails, including for
-  `find` and `sort`, which no hand-written guard had ever covered.
-- **Runtime self-checks ("canaries") in `build-repo-map.sh`.** Rather than
-  predict how a tool can break, the generator runs its real awk programs and jq
-  expression over a known input and compares against the known answer, and
-  cross-checks its file enumeration against `git ls-files`. Absent, failing,
-  silent, or wrong-version tools all produce a wrong answer and die loudly —
-  including the mode that defeated every previous guard: a tool that **exits 0
-  and prints nothing**.
-
-### Fixed
-- **A present-but-failing `awk` still produced a confident, edgeless map.** The
-  guard proved the binary *existed*, not that it *ran*: every `awk` call
-  discarded stderr and ignored its exit status, so a broken install wrote all
-  nodes, no edges, and exited 0 — the same failure the missing-scanner guard was
-  added to close, reached through a different door. Every `awk` invocation is
-  now status-checked and its stderr surfaced.
-- **`worktree_sig` never converged once the map was tracked.** The map's own
-  path was excluded from `git status` but not from `git diff HEAD`, so as soon
-  as `tmp/repo-map.json` was staged or committed, each regeneration's new
-  `generated_at` changed the signature that triggered it — regenerating on every
-  single query, forever. Both streams now exclude it.
-- **A `//` inside a string literal truncated the line.** `const u =
-  "http://x"; import z from "./y"` silently lost the import, because the URL's
-  `//` read as a comment opener. The comment scanner is string-aware now; a
-  specifier *inside* a string literal is still harvested, which remains the
-  documented ceiling.
-- **`from . import sibling` pointed at the wrong file.** The imported names were
-  discarded, so a submodule import was attributed to the package's
-  `__init__.py` and the real module kept `fan_in == 0` — looking dead while
-  being imported. Names are now resolved as modules first, with the package as
-  fallback. `from ..x` deeper than the file's own directory no longer clamps at
-  the repo root and matches something unrelated.
-- **`repo-map`'s generator was subprocess-bound**: three `rg` calls plus three
-  `sed` calls per file, then a forked `grep` against the file list per candidate
-  suffix per specifier. 6,000 files took **3m03s**, which made the "regeneration
-  is cheap" premise the staleness policy rests on simply false — and since
-  `query.sh` regenerates lazily and synchronously, the first query after any
-  commit blocked the caller for minutes. Scanning and resolution now happen in
-  `awk` (batched, and using awk's associative arrays for candidate lookup):
-  **6,000 files in ~0.9s**, roughly 200× faster. Ripgrep is no longer a dependency at
-  all; `awk` is guarded in its place.
-- **Python imports never resolved.** Every form — `from a.b import x`,
-  `import a.b`, `from .b import x` — reached the resolver as a bare specifier,
-  and bare specifiers resolve only through a tsconfig alias no Python project
-  has, so a Python repo got a nodes-only map asserting nothing depends on
-  anything. Leading dots are now level markers (`from .b` is sibling-relative),
-  absolute modules resolve from the repo root or the importing file's top-level
-  directory, and stdlib still resolves to nothing.
-- **A dirty working tree was invisible to staleness.** Freshness compared
-  `git_head` only, so uncommitted edits — the state an agent is in for most of a
-  task — were never picked up. Maps now carry a `worktree_sig` covering tracked
-  edits by content and untracked paths, excluding the map itself so a project
-  that doesn't gitignore `tmp/` can't invalidate it by writing it.
-- `autopilot/loop.sh` granted BUILD far more than the verify command. The grant
-  was derived from the command's first token plus a wildcard, so
-  `--verify-cmd 'bash scripts/verify.sh'` added `Bash(bash:*)` — arbitrary shell
-  under `acceptEdits`, the opposite of an allowlist. The prefix grant is now
-  skipped when that token is an interpreter (`bash`, `make`, `python3`, …) and
-  only the exact command is granted.
-- `repo-map`'s generator had no guard on its scanner, though `jq`'s was there.
-  With the scanner absent every scan matched nothing and the generator wrote a
-  map with all its nodes and **zero edges** at exit 0 — valid JSON, plausible
-  output, every query silently wrong. It now fails loudly; `REPO_MAP_AWK` makes
-  the guard testable.
-- `repo-map`'s `deps`/`rdeps` returned a target once per edge *type*, so the
-  Graphify backend's `imports` + `calls` between one file pair listed it twice.
-  These queries answer "which files", so they de-duplicate.
-- `repo-map`'s grep backend counted specifiers named in **comments** as real
-  edges (`// moved out of './lib/util'`, or a commented-out import in a JSDoc
-  block, invented a dependency and inflated that file's `fan_in` — the metric
-  `hotspots` ranks on). Both `//` lines and `/* … */` blocks are now stripped in
-  a single pass, since stripping either form first mangles input the other
-  needs: `//`-first turns `/* // */` into an unterminated block that swallows
-  the file, and `/*`-first lets `// /* note` open a block that was never one.
-  The residual ceiling (specifiers inside string literals, dynamic `import()`)
-  is documented in the SKILL rather than left implied.
-- `autopilot/loop.sh`: BUILD's `--allowedTools` allowlist mirrored a JS project
-  template, so a repo whose verify is its own script (`./scripts/verify.sh`) had
-  that call **denied** — the BUILD prompt told the model to run verify and the
-  permission layer refused, leaving every slice unprovable before the runner's
-  own gate. The resolved verify command is now granted explicitly, plus a new
-  `--extra-allowed-tools` flag for run-specific grants.
+  run. All three run every iteration.
+- **autopilot's BUILD allowlist named only a JS toolchain**, so in a repo whose
+  verify is its own script the call the BUILD prompt tells the model to make was
+  denied outright, leaving every slice unprovable. The resolved verify command
+  is granted explicitly — and narrowly: an interpreter-prefixed command
+  (`bash scripts/verify.sh`) no longer widens the grant into arbitrary shell.
+  New `--extra-allowed-tools` for run-specific grants.
+- **Guard hooks stopped guarding, silently, when a tool they use broke.**
+  Failing open without `jq` is deliberate; failing open quietly was not. And
+  `jq` was never the only way in — `pre-bash.sh` split its input with
+  `tr | sed`, so a broken `sed` produced no segments, nothing matched, and
+  `rm -rf /` was allowed at exit 0 without a word. The segmenter is pure bash
+  now, and any remaining fall-open path announces itself on stderr.
+- **A broken `git` disabled the push-from-main guard with no trace** — the one
+  rule `settings.json` deny cannot express, since it needs the branch. A `git`
+  printing nonsense returned a branch name that merely looked valid, making
+  "not main" indistinguishable from "safe".
+- **`pre-commit-gate.sh` could exit non-zero**, which an advisory hook must never
+  do: a `stat` or `date` exiting 0 while printing nothing fed a bare word into
+  `$(( ))`, and `set -u` killed the hook on the unset result. `mtime_of` and the
+  new `now_epoch` always return an integer.
 
 ## [0.3.0] — 2026-07-24
 
