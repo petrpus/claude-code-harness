@@ -1,6 +1,6 @@
 ---
 name: repo-map
-description: Machine-readable module/dependency map (tmp/repo-map.json, Schema v1) that agents query instead of grepping the tree. Grep backend scans JS/TS import edges (Python is not yet resolved); a Graphify graph.json is adapted when one is already on disk. Use to answer "what depends on this file", "what does this file depend on", "what are the hotspots", or "what are the entry points" without a fresh grep sweep.
+description: Machine-readable module/dependency map (tmp/repo-map.json, Schema v1) that agents query instead of grepping the tree. Grep backend scans JS/TS and Python import edges; a Graphify graph.json is adapted when one is already on disk. Use to answer "what depends on this file", "what does this file depend on", "what are the hotspots", or "what are the entry points" without a fresh grep sweep.
 ---
 
 # Skill: /repo-map
@@ -63,13 +63,6 @@ a zero-dependency regex scan and the reason the Graphify backend exists: when
 precision matters more than having no dependencies, run Graphify and let the
 adapter pick its AST-derived graph up.
 
-**Python is scanned but not resolved.** `.py` files become nodes, and no Python
-import becomes an edge — every specifier form (`from a.b import x`, `import
-a.b`, `from .b import x`) reaches the resolver as a bare specifier, and bare
-specifiers resolve only through a tsconfig/jsconfig alias that no Python project
-has. A Python-only repo therefore gets a map claiming nothing depends on
-anything. Don't read that as "no coupling"; read it as "not measured".
-
 ## Schema v1
 
 ```json
@@ -77,6 +70,7 @@ anything. Don't read that as "no coupling"; read it as "not measured".
   "schema_version": 1,
   "generated_at": "2026-08-01T10:00:00Z",
   "git_head": "0b14690",
+  "worktree_sig": "184727361",
   "backend": "grep",
   "backend_version": null,
   "nodes": [
@@ -94,6 +88,17 @@ anything. Don't read that as "no coupling"; read it as "not measured".
 - `fan_in` = distinct incoming edges (how load-bearing a file is); `fan_out`
   = distinct outgoing.
 - `backend` is `"grep"` or `"graphify"`.
+- `worktree_sig` fingerprints uncommitted work — see Staleness.
+
+**How specifiers resolve.** JS/TS: relative (`./`, `../`), root-absolute, and
+bare specifiers matched against `tsconfig.json`/`jsconfig.json` `paths` aliases;
+anything left unresolved is an external package and is dropped. Python: leading
+dots are *level* markers, not path separators, so `from .b import x` is
+sibling-relative and `from ..pkg.c import y` walks one package up; an absolute
+module is tried from the repo root and from the importing file's top-level
+directory (what a `src/`-rooted layout needs). A module that resolves to neither
+is stdlib or site-packages and is dropped, exactly as an unresolved bare JS
+specifier is.
 
 **Mandatory minimum** a consumer may rely on regardless of backend:
 `nodes[] {id, label, kind, fan_in, fan_out}` and `edges[] {from, to, type}`.
@@ -105,14 +110,22 @@ backend produced them.
 
 ## Staleness
 
-Every map carries a provenance stamp: `{generated_at, git_head, backend,
-schema_version}`. There is no git hook — regeneration is lazy, at read time,
+Every map carries a provenance stamp: `{generated_at, git_head, worktree_sig,
+backend, schema_version}`. There is no git hook — regeneration is lazy, at read time,
 inside `query.sh`:
 
 - Map absent, or `schema_version` doesn't match this doc → regenerate. Never
   guess at an old shape.
-- `backend: "grep"` and `git_head` != current HEAD → regenerate. It's cheap
-  and fully local, so there's no reason to serve stale grep data.
+- `backend: "grep"` and `git_head` != current HEAD → regenerate. It is cheap
+  and fully local — a 6,000-file tree rebuilds in well under a second — so
+  there's no reason to serve stale grep data.
+- **`worktree_sig` != the current working tree** → regenerate (grep backend), or
+  warn that only Graphify can re-read the tree (graphify backend). HEAD does not
+  move when you edit a file, and an uncommitted edit is the state an agent
+  queries from for most of a task, so a map keyed on HEAD alone would go quietly
+  wrong exactly when it is used most. The signature covers tracked edits by
+  content and untracked paths, and excludes `tmp/repo-map.json` itself so a
+  project that doesn't gitignore `tmp/` can't invalidate the map by writing it.
 - `backend: "graphify"` and `git_head` != current HEAD → we can't re-run
   Graphify ourselves, so a small amount of drift is tolerated:
   `REPO_MAP_DRIFT_TOLERANCE` commits (default 20, override via env var).
@@ -160,14 +173,17 @@ and falls straight through to the grep backend, exiting 0.
 
 ## Requirements
 
-`jq` is required. `build-repo-map.sh` fails with a clear message rather than
-emitting a malformed map if `jq` is missing. Both scripts degrade gracefully
-outside a git repo (empty `git_head`, no crash) and never hard-fail a
-consumer project that doesn't otherwise match the harness's conventions.
+`jq` and `awk` are required — `awk` does the scanning and the resolution, `jq`
+assembles the JSON. `build-repo-map.sh` fails with a clear message if either is
+missing, rather than writing a map with every node and no edges: valid JSON,
+plausible output, and every answer silently wrong. No ripgrep, no Python, no
+package manager. Both scripts degrade gracefully outside a git repo (empty
+`git_head`, no crash) and never hard-fail a consumer project that doesn't
+otherwise match the harness's conventions.
 
 ## Bundled files
 
-- `build-repo-map.sh` — the generator. Scans JS/TS import/require
+- `build-repo-map.sh` — the generator. Scans JS/TS and Python import/require
   edges (relative paths and tsconfig/jsconfig `paths` aliases resolved,
   unresolved bare specifiers dropped), or adapts a Graphify `graph.json` when
   one is present and trustworthy, and writes `tmp/repo-map.json` with the

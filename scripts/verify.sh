@@ -200,6 +200,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# The BUILD phase's tool grants are a permission surface: a prefix grant derived
+# from an interpreter ('bash scripts/verify.sh' -> Bash(bash:*)) would hand an
+# unattended run arbitrary shell. Assert the derivation directly.
+section "autopilot verify-command grants"
+if [[ -f skills/autopilot/allowlist.sh ]]; then
+  # shellcheck source=/dev/null
+  . skills/autopilot/allowlist.sh
+  grant_case() { # verify-cmd expected
+    local got; got="$(verify_grants "$1")"
+    [[ "$got" == "$2" ]] && ok "grants for '$1'" || note "grants for '$1': got '$got', want '$2'"
+  }
+  grant_case './scripts/verify.sh'   'Bash(./scripts/verify.sh),Bash(./scripts/verify.sh:*)'
+  grant_case 'bash scripts/verify.sh' 'Bash(bash scripts/verify.sh)'
+  grant_case '/bin/sh ci.sh'          'Bash(/bin/sh ci.sh)'
+  grant_case 'make verify'            'Bash(make verify)'
+  grant_case 'npm run verify'         'Bash(npm run verify)'
+  grant_case '/usr/local/bin/ci --strict' 'Bash(/usr/local/bin/ci --strict),Bash(/usr/local/bin/ci:*)'
+  for c in 'bash x.sh' 'make verify' 'npx foo'; do
+    verify_grants_are_narrow "$c" && ok "narrow-grant detected for '$c'" \
+      || note "'$c' was not reported as a narrow grant"
+  done
+  verify_grants_are_narrow './scripts/verify.sh' \
+    && note "'./scripts/verify.sh' wrongly reported as narrow" \
+    || ok "prefix grant kept for a direct script path"
+else
+  note "skills/autopilot/allowlist.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
 section "code-map renders repo-map"
 CODE_MAP_SKILL="skills/code-map/SKILL.md"
 if [[ -f "$CODE_MAP_SKILL" ]]; then

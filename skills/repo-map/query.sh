@@ -83,6 +83,16 @@ current_head() {
   git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo ""
 }
 
+# Must match build-repo-map.sh's worktree_sig() exactly — same inputs, same
+# exclusion of the map itself, or the two disagree forever and every query
+# regenerates.
+current_worktree_sig() {
+  {
+    git -C "$ROOT" status --porcelain 2>/dev/null | grep -v 'tmp/repo-map\.json'
+    git -C "$ROOT" diff HEAD 2>/dev/null
+  } | cksum 2>/dev/null | tr -d ' \n'
+}
+
 regenerate() {
   if [[ ! -f "$GEN" ]]; then
     echo "repo-map: generator not found at $GEN" >&2
@@ -114,9 +124,27 @@ ensure_fresh() {
   [[ -z "$head" ]] && return   # not a git repo — serve whatever is on disk
 
   map_head="$(jq -r '.git_head // ""' "$MAP" 2>/dev/null)"
-  [[ "$head" == "$map_head" ]] && return   # fresh
-
   backend="$(jq -r '.backend // "grep"' "$MAP" 2>/dev/null)"
+
+  if [[ "$head" == "$map_head" ]]; then
+    # HEAD matches, but uncommitted work doesn't move HEAD — and that is the
+    # state an agent queries from for most of a task. Compare the worktree
+    # signature too.
+    local map_sig cur_sig
+    map_sig="$(jq -r '.worktree_sig // ""' "$MAP" 2>/dev/null)"
+    cur_sig="$(current_worktree_sig)"
+    [[ "$map_sig" == "$cur_sig" ]] && return   # fresh
+
+    if [[ "$backend" == "grep" ]]; then
+      regenerate
+    else
+      # Nothing we can do for a graphify map: only Graphify itself can re-read
+      # the working tree. Say so rather than serving silently.
+      echo "repo-map: graphify map predates uncommitted changes — re-run Graphify to pick them up" >&2
+    fi
+    return
+  fi
+
   if [[ "$backend" == "grep" ]]; then
     regenerate
     return

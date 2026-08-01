@@ -348,27 +348,189 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Missing ripgrep must fail loudly. Without the guard the scan matches nothing
-# and the generator writes a map with every node and no edges at all — valid
-# JSON, exit 0, and completely wrong. REPO_MAP_RG lets us simulate that without
-# touching PATH.
-RG_ERR="$(mktemp)"
-RG_MAP_BEFORE="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
-REPO_MAP_RG="definitely-not-a-real-ripgrep" bash "$GEN" "$FIXTURE" >"$RG_ERR" 2>&1
-RG_EXIT=$?
-[[ "$RG_EXIT" -ne 0 ]] \
-  && ok "missing rg: generator exits non-zero" \
-  || note "missing rg: generator exited 0 — an edgeless map would look valid"
-if grep -qi "ripgrep" "$RG_ERR"; then
-  ok "missing rg: stderr names the missing dependency"
+# query.sh's own graphify drift branch — the one piece of staleness logic that
+# lives in query.sh rather than the generator, and the adapter tests above only
+# ever call the generator directly.
+DRIFTF="$(mktemp -d)"
+mkdir -p "$DRIFTF/src"
+git -C "$DRIFTF" init -q
+printf "export const a = 1;\n" > "$DRIFTF/src/a.js"
+printf "export const b = 1;\n" > "$DRIFTF/src/b.js"
+git -C "$DRIFTF" add -A >/dev/null 2>&1
+git -C "$DRIFTF" -c user.email=t@t.est -c user.name=test commit -q -m one
+DRIFT_HEAD="$(git -C "$DRIFTF" rev-parse --short HEAD)"
+cat > "$DRIFTF/graph.json" <<EOF
+{
+  "git_head": "$DRIFT_HEAD",
+  "nodes": [{"id": "n1", "file": "src/a.js"}, {"id": "n2", "file": "src/b.js"}],
+  "edges": [{"from": "n1", "to": "n2", "type": "imports"}]
+}
+EOF
+bash "$GEN" "$DRIFTF" >/dev/null 2>&1
+# Move HEAD on so the map is one commit behind, without touching graph.json.
+printf "export const c = 1;\n" > "$DRIFTF/src/c.js"
+git -C "$DRIFTF" add -A >/dev/null 2>&1
+git -C "$DRIFTF" -c user.email=t@t.est -c user.name=test commit -q -m two
+
+DRIFT_ERR="$(mktemp)"
+REPO_MAP_ROOT="$DRIFTF" bash "$QUERY" stats >/dev/null 2>"$DRIFT_ERR"
+if grep -q "behind HEAD" "$DRIFT_ERR" && grep -q "serving as-is" "$DRIFT_ERR"; then
+  ok "drift: under tolerance, graphify map served with a staleness note"
 else
-  note "missing rg: stderr did not name ripgrep: $(cat "$RG_ERR")"
+  note "drift: expected an under-tolerance note, got: $(cat "$DRIFT_ERR")"
 fi
-RG_MAP_AFTER="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
-[[ "$RG_MAP_BEFORE" == "$RG_MAP_AFTER" ]] \
-  && ok "missing rg: existing map left untouched" \
-  || note "missing rg: the existing map was overwritten"
-rm -f "$RG_ERR"
+[[ "$(jq -r '.backend' "$DRIFTF/tmp/repo-map.json" 2>/dev/null)" == "graphify" ]] \
+  && ok "drift: under tolerance the graphify map is kept" \
+  || note "drift: map was regenerated despite being under tolerance"
+
+REPO_MAP_DRIFT_TOLERANCE=0 REPO_MAP_ROOT="$DRIFTF" bash "$QUERY" stats >/dev/null 2>&1
+[[ "$(jq -r '.backend' "$DRIFTF/tmp/repo-map.json" 2>/dev/null)" == "grep" ]] \
+  && ok "drift: past tolerance query.sh regenerates and falls back to grep" \
+  || note "drift: past tolerance the stale graphify map was still served"
+rm -f "$DRIFT_ERR"
+
+# ---------------------------------------------------------------------------
+# An uncommitted edit doesn't move HEAD, so a map keyed only on HEAD would serve
+# a stale answer for most of an agent's task.
+DIRTYF="$(mktemp -d)"
+mkdir -p "$DIRTYF/src"
+git -C "$DIRTYF" init -q
+printf "export const a = 1;\n" > "$DIRTYF/src/a.js"
+: > "$DIRTYF/src/u.js"
+git -C "$DIRTYF" add -A >/dev/null 2>&1
+git -C "$DIRTYF" -c user.email=t@t.est -c user.name=test commit -q -m one
+DIRTY_BEFORE="$(REPO_MAP_ROOT="$DIRTYF" bash "$QUERY" deps src/a.js 2>/dev/null)"
+[[ -z "$DIRTY_BEFORE" ]] && ok "dirty: clean tree has no edge yet" \
+  || note "dirty: unexpected initial edge '$DIRTY_BEFORE'"
+
+# Add an import WITHOUT committing — HEAD is unchanged.
+printf "import u from './u.js';\n" >> "$DIRTYF/src/a.js"
+DIRTY_AFTER="$(REPO_MAP_ROOT="$DIRTYF" bash "$QUERY" deps src/a.js 2>/dev/null)"
+[[ "$DIRTY_AFTER" == "src/u.js" ]] \
+  && ok "dirty: uncommitted import is picked up at the same HEAD" \
+  || note "dirty: uncommitted edit was invisible (got '$DIRTY_AFTER')"
+
+# And an untracked new file must register too.
+printf "import u from './u.js';\n" > "$DIRTYF/src/new.js"
+DIRTY_NEW="$(REPO_MAP_ROOT="$DIRTYF" bash "$QUERY" rdeps src/u.js 2>/dev/null | sort | tr '\n' ',')"
+[[ "$DIRTY_NEW" == "src/a.js,src/new.js," ]] \
+  && ok "dirty: untracked file registers as staleness" \
+  || note "dirty: untracked file missed (got '$DIRTY_NEW')"
+rm -rf "$DIRTYF"
+
+# ---------------------------------------------------------------------------
+# Python resolution. Leading dots are level markers, not path separators, so
+# `from .b import other` must land on the sibling and not a root-level b.py.
+# stdlib must resolve to nothing, exactly as an unresolved bare JS specifier.
+PYF="$(mktemp -d)"
+mkdir -p "$PYF/src/lib"
+git -C "$PYF" init -q
+cat > "$PYF/src/mod.py" <<'EOF'
+# commented: from src.lib.ghost import thing
+from src.lib.a import thing
+from .b import other
+from lib.c import third
+import src.lib.d
+import os
+from typing import Optional
+EOF
+for n in a b c d ghost; do : > "$PYF/src/lib/$n.py"; done
+: > "$PYF/src/b.py"
+git -C "$PYF" add -A >/dev/null 2>&1
+git -C "$PYF" -c user.email=t@t.est -c user.name=test commit -q -m fixture
+
+if bash "$GEN" "$PYF" >/dev/null 2>&1; then
+  PY_EDGES="$(jq -r '[.edges[] | select(.from=="src/mod.py") | .to] | sort | join(",")' \
+    "$PYF/tmp/repo-map.json" 2>/dev/null)"
+  [[ "$PY_EDGES" == "src/b.py,src/lib/a.py,src/lib/c.py,src/lib/d.py" ]] \
+    && ok "python: all four import forms resolve" \
+    || note "python: got '$PY_EDGES'"
+
+  PY_SIBLING="$(jq -r '[.edges[] | select(.from=="src/mod.py" and .to=="src/b.py")] | length' \
+    "$PYF/tmp/repo-map.json" 2>/dev/null)"
+  [[ "$PY_SIBLING" == "1" ]] \
+    && ok "python: 'from .b' resolves to the sibling, not the repo root" \
+    || note "python: relative import did not resolve to src/b.py"
+
+  PY_GHOST="$(jq -r '[.edges[] | select(.to=="src/lib/ghost.py")] | length' \
+    "$PYF/tmp/repo-map.json" 2>/dev/null)"
+  [[ "$PY_GHOST" == "0" ]] && ok "python: '#' comment ignored" \
+    || note "python: commented import became an edge"
+else
+  note "python: generator failed on the python fixture"
+fi
+rm -rf "$PYF"
+
+# ---------------------------------------------------------------------------
+# Scale. The first implementation forked a grep per candidate suffix per
+# specifier and took over three minutes on 6,000 files, which made the "cheap
+# regeneration" premise the staleness policy rests on false. A bound here is
+# what would catch a regression back to that shape; the small fixtures above
+# cannot.
+SCALEF="$(mktemp -d)"
+mkdir -p "$SCALEF/src"
+git -C "$SCALEF" init -q
+i=1
+while [[ "$i" -le 800 ]]; do
+  printf "import x from './m%s.js';\n" "$(( (i % 800) + 1 ))" > "$SCALEF/src/m$i.js"
+  i=$(( i + 1 ))
+done
+git -C "$SCALEF" add -A >/dev/null 2>&1
+git -C "$SCALEF" -c user.email=t@t.est -c user.name=test commit -q -m fixture
+SCALE_START="$(date +%s)"
+bash "$GEN" "$SCALEF" >/dev/null 2>&1
+SCALE_SECS=$(( $(date +%s) - SCALE_START ))
+SCALE_EDGES="$(jq -r '.edges | length' "$SCALEF/tmp/repo-map.json" 2>/dev/null)"
+[[ "$SCALE_EDGES" == "800" ]] \
+  && ok "scale: 800 files resolve to 800 edges" \
+  || note "scale: expected 800 edges, got '$SCALE_EDGES'"
+[[ "$SCALE_SECS" -le 10 ]] \
+  && ok "scale: 800 files in ${SCALE_SECS}s (bound 10s)" \
+  || note "scale: 800 files took ${SCALE_SECS}s — the per-candidate fork regressed"
+rm -rf "$SCALEF"
+
+# ---------------------------------------------------------------------------
+# Outside a git repo both scripts claim to degrade gracefully rather than crash.
+NOGIT="$(mktemp -d)"
+mkdir -p "$NOGIT/src"
+printf "import u from './u.js';\n" > "$NOGIT/src/a.js"
+: > "$NOGIT/src/u.js"
+if bash "$GEN" "$NOGIT" >/dev/null 2>&1; then
+  ok "no-git: generator exits 0 outside a git repo"
+  [[ "$(jq -r '.git_head' "$NOGIT/tmp/repo-map.json" 2>/dev/null)" == "" ]] \
+    && ok "no-git: git_head is empty, not a crash" \
+    || note "no-git: unexpected git_head"
+  NOGIT_DEPS="$(REPO_MAP_ROOT="$NOGIT" bash "$QUERY" deps src/a.js 2>/dev/null)"
+  [[ "$NOGIT_DEPS" == "src/u.js" ]] \
+    && ok "no-git: query still answers" \
+    || note "no-git: query returned '$NOGIT_DEPS'"
+else
+  note "no-git: generator failed outside a git repo"
+fi
+rm -rf "$NOGIT"
+
+# ---------------------------------------------------------------------------
+# A missing scanner must fail loudly. Without the guard the scan matches nothing
+# and the generator writes a map with every node and no edges at all — valid
+# JSON, exit 0, and completely wrong. REPO_MAP_AWK lets us simulate that without
+# touching PATH.
+AWK_ERR="$(mktemp)"
+AWK_MAP_BEFORE="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
+REPO_MAP_AWK="definitely-not-a-real-awk" bash "$GEN" "$FIXTURE" >"$AWK_ERR" 2>&1
+AWK_EXIT=$?
+[[ "$AWK_EXIT" -ne 0 ]] \
+  && ok "missing awk: generator exits non-zero" \
+  || note "missing awk: generator exited 0 — an edgeless map would look valid"
+if grep -qi "awk" "$AWK_ERR"; then
+  ok "missing awk: stderr names the missing dependency"
+else
+  note "missing awk: stderr did not name awk: $(cat "$AWK_ERR")"
+fi
+AWK_MAP_AFTER="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
+[[ "$AWK_MAP_BEFORE" == "$AWK_MAP_AFTER" ]] \
+  && ok "missing awk: existing map left untouched" \
+  || note "missing awk: the existing map was overwritten"
+rm -f "$AWK_ERR"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

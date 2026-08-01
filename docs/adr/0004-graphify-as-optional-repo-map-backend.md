@@ -26,7 +26,12 @@ per ADR-0001's file-not-MCP stance.
 4. **Staleness is a provenance stamp plus lazy regeneration at read time** —
    no git hook. A pre-commit hook was considered and rejected: it adds commit
    latency, `.git/hooks` management, and collides with projects already using
-   husky or similar.
+   husky or similar. The stamp covers `git_head` **and** a `worktree_sig`
+   fingerprint of uncommitted work: HEAD does not move when a file is edited,
+   and an uncommitted edit is the state an agent queries from for most of a
+   task, so a stamp keyed on HEAD alone is stale precisely when the map is used
+   most. This only works because regeneration is genuinely cheap — see
+   Consequences.
 5. **The query surface is five jq-expressible queries**: `deps`, `rdeps`,
    `hotspots`, `entry-points`, `stats`. Anything needing graph traversal
    (transitive impact, path between two files) is explicitly deferred.
@@ -46,6 +51,15 @@ per ADR-0001's file-not-MCP stance.
 Two backends must stay comparable under the same schema, so any future field
 added to the grep backend's output has to make sense for (or be omittable by)
 the Graphify adapter too — the schema, not either scanner, is the contract.
+
+"Regeneration is cheap" is load-bearing, not a throwaway remark: the whole
+staleness policy — regenerate on any drift, rather than tolerate stale data —
+depends on it, and so does regenerating on every uncommitted edit. The first
+implementation did not hold up (three minutes on 6,000 files), and the policy
+was quietly false until scanning and resolution moved into a batched `awk` pass
+that does the same tree in under half a second. Any future change that puts a
+fork back inside the per-specifier loop breaks the policy, not just the clock;
+`scripts/test-repo-map.sh` bounds it so that regression fails the gate.
 
 The two backends also differ in accuracy, and that difference is the point. A
 regex scan cannot distinguish an import from a specifier quoted inside a string

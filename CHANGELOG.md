@@ -7,7 +7,7 @@ All notable changes to claude-code-harness. Semver via git tags.
 ### Added
 - `skills/repo-map/` — a machine-readable module/dependency map
   (`tmp/repo-map.json`, Schema v1) that agents query instead of grepping the
-  tree: `build-repo-map.sh` (grep backend, JS/TS import scan with
+  tree: `build-repo-map.sh` (grep backend, JS/TS + Python import scan with
   tsconfig/jsconfig alias resolution, or an adapter for an existing Graphify
   `graph.json` when one is already on disk — detection only, never a
   dependency) and `query.sh` (`deps`, `rdeps`, `hotspots`, `entry-points`,
@@ -20,17 +20,38 @@ All notable changes to claude-code-harness. Semver via git tags.
   implementation and `code-map` just projects it to the render shape.
 
 ### Fixed
+- **`repo-map`'s generator was subprocess-bound**: three `rg` calls plus three
+  `sed` calls per file, then a forked `grep` against the file list per candidate
+  suffix per specifier. 6,000 files took **3m03s**, which made the "regeneration
+  is cheap" premise the staleness policy rests on simply false — and since
+  `query.sh` regenerates lazily and synchronously, the first query after any
+  commit blocked the caller for minutes. Scanning and resolution now happen in
+  `awk` (batched, and using awk's associative arrays for candidate lookup):
+  **6,000 files in 398ms**, ~460× faster. Ripgrep is no longer a dependency at
+  all; `awk` is guarded in its place.
+- **Python imports never resolved.** Every form — `from a.b import x`,
+  `import a.b`, `from .b import x` — reached the resolver as a bare specifier,
+  and bare specifiers resolve only through a tsconfig alias no Python project
+  has, so a Python repo got a nodes-only map asserting nothing depends on
+  anything. Leading dots are now level markers (`from .b` is sibling-relative),
+  absolute modules resolve from the repo root or the importing file's top-level
+  directory, and stdlib still resolves to nothing.
+- **A dirty working tree was invisible to staleness.** Freshness compared
+  `git_head` only, so uncommitted edits — the state an agent is in for most of a
+  task — were never picked up. Maps now carry a `worktree_sig` covering tracked
+  edits by content and untracked paths, excluding the map itself so a project
+  that doesn't gitignore `tmp/` can't invalidate it by writing it.
 - `autopilot/loop.sh` granted BUILD far more than the verify command. The grant
   was derived from the command's first token plus a wildcard, so
   `--verify-cmd 'bash scripts/verify.sh'` added `Bash(bash:*)` — arbitrary shell
   under `acceptEdits`, the opposite of an allowlist. The prefix grant is now
   skipped when that token is an interpreter (`bash`, `make`, `python3`, …) and
   only the exact command is granted.
-- `repo-map`'s generator had no `rg` guard, though `jq`'s was there. With
-  ripgrep absent every scan matched nothing and the generator wrote a map with
-  all its nodes and **zero edges** at exit 0 — valid JSON, plausible output,
-  every query silently wrong. It now fails loudly; `REPO_MAP_RG` makes the guard
-  testable.
+- `repo-map`'s generator had no guard on its scanner, though `jq`'s was there.
+  With the scanner absent every scan matched nothing and the generator wrote a
+  map with all its nodes and **zero edges** at exit 0 — valid JSON, plausible
+  output, every query silently wrong. It now fails loudly; `REPO_MAP_AWK` makes
+  the guard testable.
 - `repo-map`'s `deps`/`rdeps` returned a target once per edge *type*, so the
   Graphify backend's `imports` + `calls` between one file pair listed it twice.
   These queries answer "which files", so they de-duplicate.
@@ -43,14 +64,6 @@ All notable changes to claude-code-harness. Semver via git tags.
   the file, and `/*`-first lets `// /* note` open a block that was never one.
   The residual ceiling (specifiers inside string literals, dynamic `import()`)
   is documented in the SKILL rather than left implied.
-- `repo-map` no longer advertises Python support it does not have. `.py` files
-  are scanned but **no Python import resolves to an edge** — every form arrives
-  at the resolver as a bare specifier, resolvable only via a tsconfig alias no
-  Python project has. The claim is removed from the skill description and the
-  gap documented; fixing it is tracked separately.
-- `repo-map`'s scanner no longer passes `rg -P`. The patterns never needed
-  PCRE2, and on a ripgrep built without it every scan would have failed into a
-  `2>/dev/null` and produced a silently edgeless map.
 - `autopilot/loop.sh`: BUILD's `--allowedTools` allowlist mirrored a JS project
   template, so a repo whose verify is its own script (`./scripts/verify.sh`) had
   that call **denied** — the BUILD prompt told the model to run verify and the
