@@ -3,7 +3,7 @@
 #
 # The harness demands an objective Verify gate from consumer projects; this is
 # ours. The autopilot loop and any contributor run it before opening a PR.
-# Five offline layers:
+# Six offline layers:
 #   1. scripts/check-consistency.sh — structural invariants (skills, sync-log,
 #      version==changelog, hooks.json resolves, …).
 #   2. Hook test matrix — each guard hook is fed representative stdin-JSON and
@@ -12,8 +12,11 @@
 #   3. docs cross-references — every relative markdown link inside docs/adr/*.md
 #      must resolve to a file that actually exists.
 #   4. repo-map contract — scripts/test-repo-map.sh builds a fixture tree and
-#      asserts skills/repo-map/build-repo-map.sh's output against Schema v1.
-#   5. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
+#      asserts skills/repo-map/build-repo-map.sh + query.sh's output against
+#      Schema v1, the five queries, staleness, and the Graphify adapter.
+#   5. code-map renders repo-map — skills/code-map/SKILL.md must point at
+#      tmp/repo-map.json + the repo-map generator, not run its own import scan.
+#   6. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
 # On success writes tmp/.last-verify-status ("ok") in the format the freshness
@@ -194,6 +197,31 @@ if [[ -f scripts/test-repo-map.sh ]]; then
   fi
 else
   note "scripts/test-repo-map.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+section "code-map renders repo-map"
+CODE_MAP_SKILL="skills/code-map/SKILL.md"
+if [[ -f "$CODE_MAP_SKILL" ]]; then
+  if grep -q 'tmp/repo-map\.json' "$CODE_MAP_SKILL"; then
+    ok "$CODE_MAP_SKILL references tmp/repo-map.json"
+  else
+    note "$CODE_MAP_SKILL does not reference tmp/repo-map.json"
+  fi
+
+  if grep -q 'skills/repo-map/build-repo-map\.sh' "$CODE_MAP_SKILL"; then
+    ok "$CODE_MAP_SKILL references the repo-map generator"
+  else
+    note "$CODE_MAP_SKILL does not reference skills/repo-map/build-repo-map.sh"
+  fi
+
+  if grep -qE '^\s*rg ' "$CODE_MAP_SKILL"; then
+    note "$CODE_MAP_SKILL still carries its own rg-based import-scan instructions"
+  else
+    ok "$CODE_MAP_SKILL carries no import-scan instructions of its own"
+  fi
+else
+  note "$CODE_MAP_SKILL is missing"
 fi
 
 # ---------------------------------------------------------------------------

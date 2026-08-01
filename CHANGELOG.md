@@ -4,6 +4,21 @@ All notable changes to claude-code-harness. Semver via git tags.
 
 ## [Unreleased]
 
+### Added
+- `skills/repo-map/` — a machine-readable module/dependency map
+  (`tmp/repo-map.json`, Schema v1) that agents query instead of grepping the
+  tree: `build-repo-map.sh` (grep backend, JS/TS/Python import scan with
+  tsconfig/jsconfig alias resolution, or an adapter for an existing Graphify
+  `graph.json` when one is already on disk — detection only, never a
+  dependency) and `query.sh` (`deps`, `rdeps`, `hotspots`, `entry-points`,
+  `stats`, with provenance-stamp staleness and lazy regeneration at read
+  time). See `docs/adr/0004-graphify-as-optional-repo-map-backend.md`.
+
+### Changed
+- `skills/code-map/`: stops running its own import scan and becomes a
+  renderer over `tmp/repo-map.json`, so `repo-map` owns the one scan
+  implementation and `code-map` just projects it to the render shape.
+
 ### Fixed
 - `autopilot/loop.sh`: BUILD's `--allowedTools` allowlist mirrored a JS project
   template, so a repo whose verify is its own script (`./scripts/verify.sh`) had

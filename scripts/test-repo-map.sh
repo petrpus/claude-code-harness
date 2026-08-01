@@ -142,6 +142,137 @@ ALIAS_TARGET="$(jq -r '.edges[] | select(.from=="src/other.js") | .to' "$MAP" 2>
   && ok "alias import '@/lib/util' resolves to src/lib/util.js" \
   || note "alias import resolved to '$ALIAS_TARGET', expected src/lib/util.js"
 
+# ---------------------------------------------------------------------------
+# query.sh — the five queries, against the fixture built above.
+QUERY="skills/repo-map/query.sh"
+if [[ ! -f "$QUERY" ]]; then
+  note "$QUERY does not exist yet"
+else
+  DEPS_OUT="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" deps src/lib/foo.js 2>/dev/null)"
+  [[ "$DEPS_OUT" == "src/lib/util.js" ]] \
+    && ok "query deps src/lib/foo.js == src/lib/util.js" \
+    || note "query deps src/lib/foo.js: got '$DEPS_OUT'"
+
+  RDEPS_OUT="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" rdeps src/lib/util.js 2>/dev/null | sort | tr '\n' ',')"
+  [[ "$RDEPS_OUT" == "src/lib/foo.js,src/other.js,src/third.js," ]] \
+    && ok "query rdeps src/lib/util.js == foo.js,other.js,third.js" \
+    || note "query rdeps src/lib/util.js: got '$RDEPS_OUT'"
+
+  HOTSPOT_TOP="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" hotspots 2>/dev/null | head -1 | cut -f1)"
+  [[ "$HOTSPOT_TOP" == "src/lib/util.js" ]] \
+    && ok "query hotspots top == src/lib/util.js" \
+    || note "query hotspots top: got '$HOTSPOT_TOP'"
+
+  ENTRY_OUT="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" entry-points 2>/dev/null)"
+  if grep -qxF "src/dead.js" <<< "$ENTRY_OUT"; then
+    ok "query entry-points includes src/dead.js"
+  else
+    note "query entry-points does not include src/dead.js (got: $ENTRY_OUT)"
+  fi
+
+  STATS_OUT="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" stats 2>/dev/null)"
+  STATS_NODES="$(jq -r '.nodes' <<< "$STATS_OUT" 2>/dev/null)"
+  STATS_EDGES="$(jq -r '.edges' <<< "$STATS_OUT" 2>/dev/null)"
+  [[ "$STATS_NODES" == "6" ]] && ok "query stats nodes == 6" || note "query stats nodes: got '$STATS_NODES'"
+  [[ "$STATS_EDGES" == "4" ]] && ok "query stats edges == 4" || note "query stats edges: got '$STATS_EDGES'"
+
+  bash "$QUERY" bogus-subcommand >/dev/null 2>&1
+  [[ "$?" -ne 0 ]] && ok "query unknown subcommand exits non-zero" || note "query unknown subcommand exited 0"
+
+  bash "$QUERY" deps >/dev/null 2>&1
+  [[ "$?" -ne 0 ]] && ok "query deps with missing file arg exits non-zero" || note "query deps with missing file arg exited 0"
+
+  # -------------------------------------------------------------------------
+  # Staleness — provenance comparison + lazy regeneration at read time.
+  jq '.git_head = "deadbeef"' "$MAP" > "$MAP.tmp" && mv "$MAP.tmp" "$MAP"
+  REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" stats >/dev/null 2>&1
+  RESTAMPED_HEAD="$(jq -r '.git_head' "$MAP" 2>/dev/null)"
+  [[ "$RESTAMPED_HEAD" == "$FIXTURE_HEAD" ]] \
+    && ok "bogus git_head re-stamped to real HEAD on next query" \
+    || note "git_head after stale query: got '$RESTAMPED_HEAD', want '$FIXTURE_HEAD'"
+
+  jq '.schema_version = 0' "$MAP" > "$MAP.tmp" && mv "$MAP.tmp" "$MAP"
+  REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" stats >/dev/null 2>&1
+  RESTAMPED_SCHEMA="$(jq -r '.schema_version' "$MAP" 2>/dev/null)"
+  [[ "$RESTAMPED_SCHEMA" == "1" ]] \
+    && ok "schema_version 0 regenerates to 1" \
+    || note "schema_version after stale query: got '$RESTAMPED_SCHEMA'"
+
+  rm -f "$MAP"
+  DELETED_STATS_OUT="$(REPO_MAP_ROOT="$FIXTURE" bash "$QUERY" stats 2>/dev/null)"
+  if [[ -f "$MAP" ]] && jq -e '.nodes' <<< "$DELETED_STATS_OUT" >/dev/null 2>&1; then
+    ok "deleted map regenerates and still answers"
+  else
+    note "deleted map did not regenerate/answer correctly"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Graphify adapter — consume a valid graph.json, fall back loudly on a
+# malformed one. Reuses the fixture tree above.
+GJSON="$FIXTURE/graph.json"
+cat > "$GJSON" <<EOF
+{
+  "git_head": "$FIXTURE_HEAD",
+  "nodes": [
+    {"id": "src/lib/util.js#funcA", "file": "src/lib/util.js", "kind": "function"},
+    {"id": "src/lib/util.js#funcB", "file": "src/lib/util.js", "kind": "function"},
+    {"id": "src/main.js#main", "file": "src/main.js", "kind": "function"}
+  ],
+  "edges": [
+    {"from": "src/main.js#main", "to": "src/lib/util.js#funcA", "type": "calls"},
+    {"from": "src/main.js#main", "to": "src/lib/util.js#funcB", "type": "calls"}
+  ]
+}
+EOF
+
+GJ_ERR="$(mktemp)"
+bash "$GEN" "$FIXTURE" >"$GJ_ERR" 2>&1
+GJ_EXIT=$?
+[[ "$GJ_EXIT" -eq 0 ]] && ok "graphify: generator exits 0" || note "graphify: generator exited $GJ_EXIT: $(cat "$GJ_ERR")"
+rm -f "$GJ_ERR"
+
+[[ "$(jq -r '.backend' "$MAP" 2>/dev/null)" == "graphify" ]] \
+  && ok "graphify: backend == graphify" \
+  || note "graphify: backend != graphify (got $(jq -r '.backend' "$MAP" 2>/dev/null))"
+
+GJ_NODE_IDS="$(jq -r '[.nodes[].id] | sort | join(",")' "$MAP" 2>/dev/null)"
+[[ "$GJ_NODE_IDS" == "src/lib/util.js,src/main.js" ]] \
+  && ok "graphify: sub-file nodes collapsed to containing-file ids" \
+  || note "graphify: node ids: got '$GJ_NODE_IDS'"
+
+GJ_WEIGHT="$(jq -r '.edges[] | select(.from=="src/main.js" and .to=="src/lib/util.js") | .weight' "$MAP" 2>/dev/null)"
+[[ "$GJ_WEIGHT" == "2" ]] && ok "graphify: weight aggregated to 2" || note "graphify: weight: got '$GJ_WEIGHT'"
+
+GJ_UTIL_FANIN="$(jq -r '.nodes[] | select(.id=="src/lib/util.js") | .fan_in' "$MAP" 2>/dev/null)"
+[[ "$GJ_UTIL_FANIN" == "1" ]] && ok "graphify: src/lib/util.js fan_in == 1" || note "graphify: fan_in: got '$GJ_UTIL_FANIN'"
+
+GJ_BAD_NODES="$(jq '[.nodes[] | select((has("id") and has("label") and has("kind") and has("fan_in") and has("fan_out"))|not)] | length' "$MAP" 2>/dev/null)"
+[[ "$GJ_BAD_NODES" == "0" ]] && ok "graphify: nodes carry mandatory-minimum fields" || note "graphify: $GJ_BAD_NODES node(s) missing mandatory fields"
+
+GJ_BAD_EDGES="$(jq '[.edges[] | select((has("from") and has("to") and has("type"))|not)] | length' "$MAP" 2>/dev/null)"
+[[ "$GJ_BAD_EDGES" == "0" ]] && ok "graphify: edges carry mandatory-minimum fields" || note "graphify: $GJ_BAD_EDGES edge(s) missing mandatory fields"
+
+# Corrupt graph.json in place -> must fall back to grep, warn, exit 0. The
+# same fallback branch also covers the drift-past-tolerance case (charter),
+# so its stderr advice string is asserted here rather than in a third fixture.
+echo 'not valid json {{{' > "$GJSON"
+GJ2_ERR="$(mktemp)"
+bash "$GEN" "$FIXTURE" >/dev/null 2>"$GJ2_ERR"
+GJ2_EXIT=$?
+[[ "$GJ2_EXIT" -eq 0 ]] \
+  && ok "graphify fallback: generator still exits 0 on malformed graph.json" \
+  || note "graphify fallback: exited $GJ2_EXIT"
+[[ "$(jq -r '.backend' "$MAP" 2>/dev/null)" == "grep" ]] \
+  && ok "graphify fallback: backend reverts to grep" \
+  || note "graphify fallback: backend is $(jq -r '.backend' "$MAP" 2>/dev/null)"
+if grep -qi "graphify" "$GJ2_ERR"; then
+  ok "graphify fallback: stderr names graphify / advises re-running it"
+else
+  note "graphify fallback: stderr did not mention graphify: $(cat "$GJ2_ERR")"
+fi
+rm -f "$GJ2_ERR" "$GJSON"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "test-repo-map: PASS"

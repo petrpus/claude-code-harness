@@ -33,6 +33,111 @@ OUT_DIR="tmp"
 OUT="$OUT_DIR/repo-map.json"
 mkdir -p "$OUT_DIR"
 
+# ---------------------------------------------------------------------------
+# Graphify adapter (optional, detection-only — see
+# docs/adr/0004-graphify-as-optional-repo-map-backend.md). If a graph.json is
+# already on disk, validate its shape defensively and, when trustworthy and
+# not too stale, adapt it instead of running the grep scan below. Any
+# rejection (absent is silent; malformed or too-stale warns) falls straight
+# through to the grep backend — never a hard error, always exit 0.
+DRIFT_TOLERANCE="${REPO_MAP_DRIFT_TOLERANCE:-20}"
+GRAPH_JSON="$ROOT/graph.json"
+
+fallback_notice() {
+  echo "repo-map: $1 — falling back to grep backend; re-run Graphify and refresh graph.json for the richer map" >&2
+}
+
+try_graphify() {
+  [[ -f "$GRAPH_JSON" ]] || return 1
+
+  if ! jq empty "$GRAPH_JSON" >/dev/null 2>&1; then
+    fallback_notice "graph.json is not valid JSON"
+    return 1
+  fi
+
+  if ! jq -e '(.nodes | type) == "array" and (.edges | type) == "array"' "$GRAPH_JSON" >/dev/null 2>&1; then
+    fallback_notice "graph.json is missing nodes[]/edges[] arrays"
+    return 1
+  fi
+
+  if ! jq -e '.nodes | all(has("id") and has("file") and (.id | type) == "string" and (.file | type) == "string")' \
+       "$GRAPH_JSON" >/dev/null 2>&1; then
+    fallback_notice "graph.json nodes are missing id/file"
+    return 1
+  fi
+
+  if ! jq -e '
+        (.nodes | map(.id)) as $ids |
+        .edges | all(has("from") and has("to") and has("type") and (([.from, .to] - $ids) | length == 0))
+      ' "$GRAPH_JSON" >/dev/null 2>&1; then
+    fallback_notice "graph.json edges reference unknown node ids"
+    return 1
+  fi
+
+  local gj_head drift=""
+  gj_head="$(jq -r '.git_head // empty' "$GRAPH_JSON" 2>/dev/null)"
+  if [[ -n "$gj_head" && -n "$GIT_HEAD" ]]; then
+    drift="$(git -C "$ROOT" rev-list --count "${gj_head}..${GIT_HEAD}" 2>/dev/null)" || drift=""
+    if [[ -z "$drift" ]]; then
+      fallback_notice "graph.json git_head '$gj_head' is not a known ancestor of HEAD"
+      return 1
+    fi
+    if (( drift > DRIFT_TOLERANCE )); then
+      fallback_notice "graph.json is $drift commit(s) behind HEAD (tolerance $DRIFT_TOLERANCE)"
+      return 1
+    fi
+    if (( drift > 0 )); then
+      echo "repo-map: using graphify backend, $drift commit(s) behind HEAD (tolerance $DRIFT_TOLERANCE)" >&2
+    fi
+  fi
+
+  local out_head="${gj_head:-$GIT_HEAD}"
+  local backend_version_raw
+  backend_version_raw="$(jq -r '(.backend_version // .version // empty)' "$GRAPH_JSON" 2>/dev/null)"
+
+  jq -n \
+    --arg schema_version "1" \
+    --arg generated_at "$GENERATED_AT" \
+    --arg git_head "$out_head" \
+    --arg backend_version_raw "$backend_version_raw" \
+    --slurpfile gj "$GRAPH_JSON" \
+    '
+    ($gj[0]) as $g |
+    ($g.nodes | reduce .[] as $n ({}; .[$n.id] = $n.file)) as $id2file |
+    ($g.nodes | map(.file) | unique) as $files |
+    ( $g.edges
+      | map({from: $id2file[.from], to: $id2file[.to], type: .type})
+      | map(select(.from != .to))
+      | group_by([.from, .to, .type])
+      | map({from: .[0].from, to: .[0].to, type: .[0].type, weight: length})
+    ) as $edges |
+    ($edges | group_by(.to)   | map({key: .[0].to,   value: (map(.from) | unique | length)}) | from_entries) as $fan_in |
+    ($edges | group_by(.from) | map({key: .[0].from, value: (map(.to)   | unique | length)}) | from_entries) as $fan_out |
+    {
+      schema_version: ($schema_version | tonumber),
+      generated_at: $generated_at,
+      git_head: $git_head,
+      backend: "graphify",
+      backend_version: (if $backend_version_raw == "" then null else $backend_version_raw end),
+      nodes: [ $files[] | {
+        id: .,
+        label: (split("/") | last),
+        kind: "file",
+        fan_in: ($fan_in[.] // 0),
+        fan_out: ($fan_out[.] // 0)
+      } ],
+      edges: $edges
+    }
+    ' > "$OUT" || return 1
+
+  echo "repo-map: wrote $OUT via graphify backend ($(jq '.nodes | length' "$OUT") nodes, $(jq '.edges | length' "$OUT") edges)" >&2
+  return 0
+}
+
+if try_graphify; then
+  exit 0
+fi
+
 WORK="$(mktemp -d)"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
