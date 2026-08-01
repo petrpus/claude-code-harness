@@ -88,8 +88,8 @@ current_head() {
 # regenerates.
 current_worktree_sig() {
   {
-    git -C "$ROOT" status --porcelain 2>/dev/null | grep -v 'tmp/repo-map\.json'
-    git -C "$ROOT" diff HEAD 2>/dev/null
+    git -C "$ROOT" status --porcelain 2>/dev/null | grep -vE '[[:space:]]tmp/(repo-map\.json)?$'
+    git -C "$ROOT" diff HEAD -- . ':(exclude)tmp/repo-map.json' 2>/dev/null
   } | cksum 2>/dev/null | tr -d ' \n'
 }
 

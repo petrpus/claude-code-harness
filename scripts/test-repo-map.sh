@@ -316,6 +316,7 @@ rm -f "$GJ2_ERR" "$GJSON"
 mkdir -p "$COMMENT_FIXTURE/src/lib"
 git -C "$COMMENT_FIXTURE" init -q
 cat > "$COMMENT_FIXTURE/src/app.js" <<'EOF'
+const u = "http://example.test"; import real3 from './lib/real3.js';
 /*
  * Legacy: import gone from './lib/blockmulti.js';
  */
@@ -326,7 +327,7 @@ cat > "$COMMENT_FIXTURE/src/app.js" <<'EOF'
 import real1 from './lib/real1.js'; /* trailing: import q from './lib/trail.js'; */
 /* opener */ import real2 from './lib/real2.js';
 EOF
-for n in blockmulti blockinline linec nested1 nested2 trail real1 real2; do
+for n in blockmulti blockinline linec nested1 nested2 trail real1 real2 real3; do
   echo "export const x = 1;" > "$COMMENT_FIXTURE/src/lib/$n.js"
 done
 # No Python case here: no Python specifier form currently resolves to an edge
@@ -339,9 +340,16 @@ git -C "$COMMENT_FIXTURE" -c user.email=t@t.est -c user.name=test commit -q -m f
 if bash "$GEN" "$COMMENT_FIXTURE" >/dev/null 2>&1; then
   C_TARGETS="$(jq -r '[.edges[] | select(.from=="src/app.js") | .to] | sort | join(",")' \
     "$COMMENT_FIXTURE/tmp/repo-map.json" 2>/dev/null)"
-  [[ "$C_TARGETS" == "src/lib/real1.js,src/lib/real2.js" ]] \
+  [[ "$C_TARGETS" == "src/lib/real1.js,src/lib/real2.js,src/lib/real3.js" ]] \
     && ok "comments: only real imports survive block/line stripping" \
-    || note "comments: expected real1+real2, got '$C_TARGETS'"
+    || note "comments: expected real1..real3, got '$C_TARGETS'"
+
+  # real3 shares its line with a URL: the // in "http://" must not be read as a
+  # comment opener and swallow the import that follows it.
+  case ",$C_TARGETS," in
+    *,src/lib/real3.js,*) ok "comments: '//' inside a string literal is not a comment" ;;
+    *) note "comments: import after a URL on the same line was dropped" ;;
+  esac
 
 else
   note "comments: generator failed on the comment fixture"
@@ -430,11 +438,13 @@ cat > "$PYF/src/mod.py" <<'EOF'
 from src.lib.a import thing
 from .b import other
 from lib.c import third
-import src.lib.d
+from . import sibling
+from src.lib import d
 import os
 from typing import Optional
 EOF
 for n in a b c d ghost; do : > "$PYF/src/lib/$n.py"; done
+: > "$PYF/src/sibling.py"
 : > "$PYF/src/b.py"
 git -C "$PYF" add -A >/dev/null 2>&1
 git -C "$PYF" -c user.email=t@t.est -c user.name=test commit -q -m fixture
@@ -442,9 +452,21 @@ git -C "$PYF" -c user.email=t@t.est -c user.name=test commit -q -m fixture
 if bash "$GEN" "$PYF" >/dev/null 2>&1; then
   PY_EDGES="$(jq -r '[.edges[] | select(.from=="src/mod.py") | .to] | sort | join(",")' \
     "$PYF/tmp/repo-map.json" 2>/dev/null)"
-  [[ "$PY_EDGES" == "src/b.py,src/lib/a.py,src/lib/c.py,src/lib/d.py" ]] \
-    && ok "python: all four import forms resolve" \
+  [[ "$PY_EDGES" == "src/b.py,src/lib/a.py,src/lib/c.py,src/lib/d.py,src/sibling.py" ]] \
+    && ok "python: every import form resolves" \
     || note "python: got '$PY_EDGES'"
+
+  # `from . import sibling` and `from src.lib import d` name a *module* as the
+  # imported symbol. Attributing those to the package __init__.py instead would
+  # leave the real file with fan_in 0 — looking dead while being imported.
+  case ",$PY_EDGES," in
+    *,src/sibling.py,*) ok "python: 'from . import x' resolves to the module, not __init__.py" ;;
+    *) note "python: bare-dot import did not reach src/sibling.py" ;;
+  esac
+  case ",$PY_EDGES," in
+    *,src/lib/d.py,*) ok "python: 'from pkg import submodule' resolves to the submodule" ;;
+    *) note "python: submodule-as-imported-name did not resolve" ;;
+  esac
 
   PY_SIBLING="$(jq -r '[.edges[] | select(.from=="src/mod.py" and .to=="src/b.py")] | length' \
     "$PYF/tmp/repo-map.json" 2>/dev/null)"
@@ -531,6 +553,51 @@ AWK_MAP_AFTER="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
   && ok "missing awk: existing map left untouched" \
   || note "missing awk: the existing map was overwritten"
 rm -f "$AWK_ERR"
+
+# Present-but-failing is a different door into the same room: the guard above
+# only proves the binary exists. An awk that errors at runtime must not leave a
+# valid-JSON, all-nodes-no-edges map behind at exit 0.
+STUB_DIR="$(mktemp -d)"
+printf '#!/bin/sh\nexit 3\n' > "$STUB_DIR/awk"
+chmod +x "$STUB_DIR/awk"
+BROKEN_ERR="$(mktemp)"
+BROKEN_BEFORE="$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)"
+REPO_MAP_AWK="$STUB_DIR/awk" bash "$GEN" "$FIXTURE" >"$BROKEN_ERR" 2>&1
+BROKEN_EXIT=$?
+[[ "$BROKEN_EXIT" -ne 0 ]] \
+  && ok "failing awk: generator exits non-zero" \
+  || note "failing awk: exited 0 — an edgeless map would look valid"
+grep -qi "failed while" "$BROKEN_ERR" \
+  && ok "failing awk: stderr says the scan failed" \
+  || note "failing awk: stderr did not report it: $(cat "$BROKEN_ERR")"
+[[ "$BROKEN_BEFORE" == "$(md5sum "$MAP" 2>/dev/null | cut -d' ' -f1)" ]] \
+  && ok "failing awk: existing map left untouched" \
+  || note "failing awk: the existing map was overwritten"
+rm -rf "$STUB_DIR" "$BROKEN_ERR"
+
+# ---------------------------------------------------------------------------
+# The worktree signature must be idempotent with respect to the file it writes.
+# When the map is a *tracked* file, `git diff HEAD` sees its own rewritten
+# generated_at, so an exclusion applied only to `git status` leaves the
+# signature changing on every regeneration — regenerating forever.
+TRACKF="$(mktemp -d)"
+mkdir -p "$TRACKF/src"
+git -C "$TRACKF" init -q
+printf "import u from './u.js';\n" > "$TRACKF/src/a.js"
+: > "$TRACKF/src/u.js"
+git -C "$TRACKF" add -A >/dev/null 2>&1
+git -C "$TRACKF" -c user.email=t@t.est -c user.name=test commit -q -m one
+REPO_MAP_ROOT="$TRACKF" bash "$QUERY" stats >/dev/null 2>&1
+git -C "$TRACKF" add -f tmp/repo-map.json >/dev/null 2>&1
+REPO_MAP_ROOT="$TRACKF" bash "$QUERY" stats >/dev/null 2>&1   # let it settle
+TRACK_ERR="$(mktemp)"
+REPO_MAP_ROOT="$TRACKF" bash "$QUERY" stats >/dev/null 2>"$TRACK_ERR"
+if grep -q "wrote" "$TRACK_ERR"; then
+  note "tracked map: still regenerating on every query (signature never converges)"
+else
+  ok "tracked map: signature converges when the map itself is tracked"
+fi
+rm -rf "$TRACKF" "$TRACK_ERR"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

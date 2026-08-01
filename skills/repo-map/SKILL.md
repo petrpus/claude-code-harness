@@ -98,7 +98,11 @@ sibling-relative and `from ..pkg.c import y` walks one package up; an absolute
 module is tried from the repo root and from the importing file's top-level
 directory (what a `src/`-rooted layout needs). A module that resolves to neither
 is stdlib or site-packages and is dropped, exactly as an unresolved bare JS
-specifier is.
+specifier is. The imported *names* count too: in `from . import sibling` and
+`from pkg.sub import helper`, the name is the module being depended on, so the
+edge points at `sibling.py` / `helper.py` when those files exist, and falls back
+to the package's `__init__.py` only when the names are ordinary symbols defined
+there.
 
 **Mandatory minimum** a consumer may rely on regardless of backend:
 `nodes[] {id, label, kind, fan_in, fan_out}` and `edges[] {from, to, type}`.
@@ -172,6 +176,10 @@ and falls straight through to the grep backend, exiting 0.
   belongs under `docs/maps/` (that's what `code-map` writes).
 
 ## Requirements
+
+`REPO_MAP_AWK` overrides which awk is used; it must name a **single
+executable** (a path or a command name), not a multi-word invocation like
+`"busybox awk"` — the guard resolves it with `command -v`.
 
 `jq` and `awk` are required — `awk` does the scanning and the resolution, `jq`
 assembles the JSON. `build-repo-map.sh` fails with a clear message if either is

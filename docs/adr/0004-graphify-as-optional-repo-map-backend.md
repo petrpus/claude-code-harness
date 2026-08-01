@@ -57,7 +57,7 @@ staleness policy â€” regenerate on any drift, rather than tolerate stale data â€
 depends on it, and so does regenerating on every uncommitted edit. The first
 implementation did not hold up (three minutes on 6,000 files), and the policy
 was quietly false until scanning and resolution moved into a batched `awk` pass
-that does the same tree in under half a second. Any future change that puts a
+that does the same tree in about a second. Any future change that puts a
 fork back inside the per-specifier loop breaks the policy, not just the clock;
 `scripts/test-repo-map.sh` bounds it so that regression fails the gate.
 

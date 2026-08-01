@@ -20,6 +20,28 @@ All notable changes to claude-code-harness. Semver via git tags.
   implementation and `code-map` just projects it to the render shape.
 
 ### Fixed
+- **A present-but-failing `awk` still produced a confident, edgeless map.** The
+  guard proved the binary *existed*, not that it *ran*: every `awk` call
+  discarded stderr and ignored its exit status, so a broken install wrote all
+  nodes, no edges, and exited 0 — the same failure the missing-scanner guard was
+  added to close, reached through a different door. Every `awk` invocation is
+  now status-checked and its stderr surfaced.
+- **`worktree_sig` never converged once the map was tracked.** The map's own
+  path was excluded from `git status` but not from `git diff HEAD`, so as soon
+  as `tmp/repo-map.json` was staged or committed, each regeneration's new
+  `generated_at` changed the signature that triggered it — regenerating on every
+  single query, forever. Both streams now exclude it.
+- **A `//` inside a string literal truncated the line.** `const u =
+  "http://x"; import z from "./y"` silently lost the import, because the URL's
+  `//` read as a comment opener. The comment scanner is string-aware now; a
+  specifier *inside* a string literal is still harvested, which remains the
+  documented ceiling.
+- **`from . import sibling` pointed at the wrong file.** The imported names were
+  discarded, so a submodule import was attributed to the package's
+  `__init__.py` and the real module kept `fan_in == 0` — looking dead while
+  being imported. Names are now resolved as modules first, with the package as
+  fallback. `from ..x` deeper than the file's own directory no longer clamps at
+  the repo root and matches something unrelated.
 - **`repo-map`'s generator was subprocess-bound**: three `rg` calls plus three
   `sed` calls per file, then a forked `grep` against the file list per candidate
   suffix per specifier. 6,000 files took **3m03s**, which made the "regeneration
@@ -27,7 +49,7 @@ All notable changes to claude-code-harness. Semver via git tags.
   `query.sh` regenerates lazily and synchronously, the first query after any
   commit blocked the caller for minutes. Scanning and resolution now happen in
   `awk` (batched, and using awk's associative arrays for candidate lookup):
-  **6,000 files in 398ms**, ~460× faster. Ripgrep is no longer a dependency at
+  **6,000 files in ~0.9s**, roughly 200× faster. Ripgrep is no longer a dependency at
   all; `awk` is guarded in its place.
 - **Python imports never resolved.** Every form — `from a.b import x`,
   `import a.b`, `from .b import x` — reached the resolver as a bare specifier,

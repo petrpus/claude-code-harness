@@ -52,8 +52,8 @@ GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # query would regenerate forever.
 worktree_sig() {
   {
-    git -C "$ROOT" status --porcelain 2>/dev/null | grep -v 'tmp/repo-map\.json'
-    git -C "$ROOT" diff HEAD 2>/dev/null
+    git -C "$ROOT" status --porcelain 2>/dev/null | grep -vE '[[:space:]]tmp/(repo-map\.json)?$'
+    git -C "$ROOT" diff HEAD -- . ':(exclude)tmp/repo-map.json' 2>/dev/null
   } | cksum 2>/dev/null | tr -d ' \n'
 }
 WORKTREE_SIG="$(worktree_sig)"
@@ -251,6 +251,27 @@ function harvest(s, pat,   rest, spec) {
     rest = substr(rest, RSTART + RLENGTH)
   }
 }
+function firstquote(s,   i, best) {
+  best = 0
+  i = index(s, "\""); if (i > 0 && (best == 0 || i < best)) best = i
+  i = index(s, "'");  if (i > 0 && (best == 0 || i < best)) best = i
+  i = index(s, "`");  if (i > 0 && (best == 0 || i < best)) best = i
+  return best
+}
+# Index of the quote closing the literal that opens at `start`; end of line if
+# it never closes (a template literal spanning lines, say).
+function strend(s, start,   q, i, c, n) {
+  q = substr(s, start, 1)
+  i = start + 1
+  n = length(s)
+  while (i <= n) {
+    c = substr(s, i, 1)
+    if (c == "\\") { i += 2; continue }
+    if (c == q) return i
+    i++
+  }
+  return n
+}
 FNR == 1 { inblock = 0 }
 {
   line = $0; out = ""
@@ -264,6 +285,16 @@ FNR == 1 { inblock = 0 }
     b = index(line, "/*")
     l = index(line, "//")
     if (b == 0 && l == 0) { out = out line; break }
+    # A comment marker inside a string literal is text, not a comment. Without
+    # this, `const u = "http://x"; import z from "./y"` loses the import: the
+    # // in the URL truncates the line and takes the real import with it.
+    q = firstquote(line)
+    if (q > 0 && (b == 0 || q < b) && (l == 0 || q < l)) {
+      e = strend(line, q)
+      out = out substr(line, 1, e)
+      line = substr(line, e + 1)
+      continue
+    }
     if (l > 0 && (b == 0 || l < b)) { out = out substr(line, 1, l - 1); break }
     out = out substr(line, 1, b - 1)
     line = substr(line, b + 2); inblock = 1
@@ -282,16 +313,24 @@ cat > "$WORK/scan-py.awk" <<'AWKPY'
   line = $0
   p = index(line, "#")
   if (p > 0) line = substr(line, 1, p - 1)
-  if (match(line, "^[ \t]*from[ \t]+[.A-Za-z0-9_]+[ \t]+import")) {
+  # The imported names matter, not just the module: in `from . import sibling`
+  # and `from pkg.sub import helper`, the name IS the module being depended on.
+  # Dropping it attributes the edge to the package's __init__.py and leaves the
+  # real file with fan_in 0 — looking dead while being imported.
+  if (match(line, "^[ \t]*from[ \t]+[.A-Za-z0-9_]+[ \t]+import[ \t]+")) {
     m = substr(line, RSTART, RLENGTH)
+    names = substr(line, RSTART + RLENGTH)
     sub("^[ \t]*from[ \t]+", "", m)
-    sub("[ \t]+import$", "", m)
-    if (m != "") print FILENAME "\t" m
+    sub("[ \t]+import[ \t]+$", "", m)
+    gsub(/[ \t]+as[ \t]+[A-Za-z0-9_]+/, "", names)
+    gsub(/[()\\]/, "", names)
+    gsub(/[ \t]/, "", names)
+    if (m != "") print FILENAME "\t" m "\t" names
   } else if (match(line, "^[ \t]*import[ \t]+[.A-Za-z0-9_]+[ \t]*$")) {
     m = substr(line, RSTART, RLENGTH)
     sub("^[ \t]*import[ \t]+", "", m)
     sub("[ \t]*$", "", m)
-    if (m != "") print FILENAME "\t" m
+    if (m != "") print FILENAME "\t" m "\t"
   }
 }
 AWKPY
@@ -301,6 +340,21 @@ grep -vE '\.py$' "$FILES_LIST" > "$JS_LIST" 2>/dev/null || : > "$JS_LIST"
 
 # Batch so the argument list can't overflow on a large repo, and so a 10k-file
 # tree costs ~20 awk processes rather than ~60,000.
+# Existing-but-failing is a different failure from missing, and it lands in the
+# same place: a map with every node and no edges, written at exit 0. Check the
+# status of every awk run and surface what it said.
+AWK_ERR="$WORK/awk-stderr.log"
+: > "$AWK_ERR"
+
+run_awk() { # out-file prog files...
+  local out="$1" prog="$2"; shift 2
+  if ! "$AWK" -f "$prog" "$@" >> "$out" 2>>"$AWK_ERR"; then
+    echo "repo-map: '$AWK' failed while scanning — refusing to write a map with no edges" >&2
+    [[ -s "$AWK_ERR" ]] && head -3 "$AWK_ERR" >&2
+    exit 1
+  fi
+}
+
 scan_batched() { # list-file awk-program out-file
   local list="$1" prog="$2" out="$3"
   local -a batch=()
@@ -308,11 +362,11 @@ scan_batched() { # list-file awk-program out-file
     [[ -z "$f" ]] && continue
     batch+=("$f")
     if [[ "${#batch[@]}" -ge 500 ]]; then
-      "$AWK" -f "$prog" "${batch[@]}" >> "$out" 2>/dev/null
+      run_awk "$out" "$prog" "${batch[@]}"
       batch=()
     fi
   done < "$list"
-  [[ "${#batch[@]}" -gt 0 ]] && "$AWK" -f "$prog" "${batch[@]}" >> "$out" 2>/dev/null
+  [[ "${#batch[@]}" -gt 0 ]] && run_awk "$out" "$prog" "${batch[@]}"
   return 0
 }
 
@@ -375,21 +429,48 @@ function resolve_js(from, spec,   base, i) {
 # top-level directory, which is what a `src/`-rooted layout needs. Anything that
 # resolves to neither is stdlib or site-packages and is dropped, exactly as an
 # unresolved bare JS specifier is.
-function resolve_py(from, mod,   level, base, i, top, got) {
+function depthof(p,   n, parts) {
+  if (p == "" || p == ".") return 0
+  return split(p, parts, "/")
+}
+# Emits every edge this import implies. An imported name that is itself a module
+# wins over the package it lives in; when no name resolves (the names are
+# ordinary symbols defined in __init__.py, or it's a plain `import a.b`), the
+# module itself is the dependency.
+function emit_py(from, mod, names,   level, base, i, k, n, arr, cb, ncb, cands, got, found) {
   level = 0
   while (substr(mod, 1, 1) == ".") { level++; mod = substr(mod, 2) }
   gsub(/\./, "/", mod)
+  ncb = 0
   if (level > 0) {
     base = dirof(from)
+    # `from ..x` in a file one directory deep can't resolve — Python wouldn't
+    # run it either. Don't clamp at the root and match something unrelated.
+    if (level - 1 > depthof(base) - (base == "." ? 0 : 1)) return
     for (i = 1; i < level; i++) base = dirof(base)
-    return hit(normalize(base (mod == "" ? "" : "/" mod)), ".py|/__init__.py")
+    cands[++ncb] = normalize(base (mod == "" ? "" : "/" mod))
+  } else {
+    cands[++ncb] = normalize(mod)
+    base = from
+    if (index(base, "/") > 0) { sub(/\/.*$/, "", base); cands[++ncb] = normalize(base "/" mod) }
   }
-  got = hit(normalize(mod), ".py|/__init__.py")
-  if (got != "") return got
-  top = from
-  if (index(top, "/") == 0) return ""
-  sub(/\/.*$/, "", top)
-  return hit(normalize(top "/" mod), ".py|/__init__.py")
+
+  for (k = 1; k <= ncb; k++) {
+    cb = cands[k]
+    if (cb == "") continue
+    found = 0
+    if (names != "") {
+      n = split(names, arr, ",")
+      for (i = 1; i <= n; i++) {
+        if (arr[i] == "" || arr[i] == "*") continue
+        got = hit(normalize(cb "/" arr[i]), ".py|/__init__.py")
+        if (got != "" && got != from) { print from "\t" got "\timports"; found = 1 }
+      }
+    }
+    if (found) return
+    got = hit(cb, ".py|/__init__.py")
+    if (got != "" && got != from) { print from "\t" got "\timports"; return }
+  }
 }
 FILENAME == FILES_F { files[$0] = 1; next }
 FILENAME == ALIAS_F {
@@ -403,16 +484,29 @@ FILENAME == ALIAS_F {
   from = substr($0, 1, t - 1)
   spec = substr($0, t + 1)
   if (from == "" || spec == "") next
-  to = (FILENAME == PY_F) ? resolve_py(from, spec) : resolve_js(from, spec)
+  if (FILENAME == PY_F) {
+    # python rows carry a third field: the imported names
+    t = index(spec, "\t")
+    if (t > 0) { names = substr(spec, t + 1); spec = substr(spec, 1, t - 1) } else names = ""
+    if (spec != "") emit_py(from, spec, names)
+    next
+  }
+  to = resolve_js(from, spec)
   if (to != "" && to != from) print from "\t" to "\timports"
 }
 AWKRES
 
 : > "$EDGES"
-[[ -s "$RAW" ]] && "$AWK" -v FILES_F="$FILES_LIST" -v ALIAS_F="$ALIASES" -v PY_F="" -f "$WORK/resolve.awk" \
-  "$FILES_LIST" "$ALIASES" "$RAW" >> "$EDGES" 2>/dev/null
-[[ -s "$RAW_PY" ]] && "$AWK" -v FILES_F="$FILES_LIST" -v ALIAS_F="$ALIASES" -v PY_F="$RAW_PY" -f "$WORK/resolve.awk" \
-  "$FILES_LIST" "$ALIASES" "$RAW_PY" >> "$EDGES" 2>/dev/null
+resolve_awk() { # py-raw-file raw-file
+  if ! "$AWK" -v FILES_F="$FILES_LIST" -v ALIAS_F="$ALIASES" -v PY_F="$1" \
+       -f "$WORK/resolve.awk" "$FILES_LIST" "$ALIASES" "$2" >> "$EDGES" 2>>"$AWK_ERR"; then
+    echo "repo-map: '$AWK' failed while resolving — refusing to write a map with no edges" >&2
+    [[ -s "$AWK_ERR" ]] && head -3 "$AWK_ERR" >&2
+    exit 1
+  fi
+}
+[[ -s "$RAW" ]]    && resolve_awk ""         "$RAW"
+[[ -s "$RAW_PY" ]] && resolve_awk "$RAW_PY"  "$RAW_PY"
 
 # De-duplicate edges, aggregating a weight = number of raw specifier lines
 # between the same (from,to) pair.
