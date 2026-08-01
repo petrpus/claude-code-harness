@@ -29,11 +29,14 @@ if [[ ! -f "$STATUS_FILE" ]]; then
   exit 0
 fi
 
-NOW="$(date +%s 2>/dev/null || echo 0)"
-AGE_SEC=$(( NOW - $(mtime_of "$STATUS_FILE") ))
+NOW="$(now_epoch)"
+MTIME="$(mtime_of "$STATUS_FILE")"
+AGE_SEC=$(( NOW - MTIME ))
 STATUS="$(cat "$STATUS_FILE" 2>/dev/null || echo 'unknown')"
 
-if [[ "$AGE_SEC" -gt 1800 ]]; then
+# Either clock unknown → the age is meaningless; say nothing about staleness
+# rather than reporting a nonsense number.
+if [[ "$NOW" -gt 0 && "$MTIME" -gt 0 && "$AGE_SEC" -gt 1800 ]]; then
   echo "Last verify was $((AGE_SEC / 60)) min ago. Consider re-running before commit." >&2
 fi
 

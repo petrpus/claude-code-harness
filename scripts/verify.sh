@@ -3,7 +3,8 @@
 #
 # The harness demands an objective Verify gate from consumer projects; this is
 # ours. The autopilot loop and any contributor run it before opening a PR.
-# Six offline layers:
+# Offline layers, in the order they run (see the `section` headings below for
+# the current list — the ones worth calling out here):
 #   1. scripts/check-consistency.sh — structural invariants (skills, sync-log,
 #      version==changelog, hooks.json resolves, …).
 #   2. Hook test matrix — each guard hook is fed representative stdin-JSON and
@@ -16,7 +17,14 @@
 #      Schema v1, the five queries, staleness, and the Graphify adapter.
 #   5. code-map renders repo-map — skills/code-map/SKILL.md must point at
 #      tmp/repo-map.json + the repo-map generator, not run its own import scan.
-#   6. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
+#   6. Fault injection, two contracts. scripts/test-fault-injection.sh sweeps
+#      the repo-map generator: a broken tool must never yield a wrong graph at
+#      exit 0. scripts/test-hook-faults.sh sweeps the hooks, where the contract
+#      is inverted — they fail OPEN by design, so what must never happen is
+#      failing open *silently*.
+#   7. scripts/test-autopilot-loop.sh — drives loop.sh end-to-end against a
+#      stub `claude`, so the runner's gating decisions are exercised for free.
+#   8. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
 # On success writes tmp/.last-verify-status ("ok") in the format the freshness
@@ -197,6 +205,20 @@ if [[ -f scripts/test-repo-map.sh ]]; then
   fi
 else
   note "scripts/test-repo-map.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# Same failure class as the generator sweep, inverted contract: hooks fail OPEN
+# by design, so what must never happen is failing open *silently*.
+section "hook fault injection"
+if [[ -f scripts/test-hook-faults.sh ]]; then
+  if bash scripts/test-hook-faults.sh; then
+    ok "hook fault injection passed"
+  else
+    note "hook fault injection failed (see above)"
+  fi
+else
+  note "scripts/test-hook-faults.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------
