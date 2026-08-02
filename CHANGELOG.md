@@ -2,19 +2,6 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
-## [Unreleased]
-
-### Fixed
-- **The push-from-main guard blocked pushing a tag**, which is this repo's own
-  documented release step (`v0.x.0` on the merge commit on `main`) — found by
-  hitting it while cutting 0.4.0. A tag doesn't advance a branch, so the rule
-  has nothing to say about it. Tag-only pushes are recognised in their common
-  forms (`origin v1.2.3`, `origin refs/tags/v1.2.3`, `--tags`, `origin tag
-  v1.2.3`) and allowed; anything that could still move a branch is not —
-  `--follow-tags` (which pushes commits too), a mixed branch+tag push, a bare
-  name that resolves to a branch or is ambiguous, and force-pushing a tag all
-  stay blocked.
-
 ## [0.4.0] — 2026-08-01
 
 The repo-map layer (PRD 0001, M-slices M1–M2) plus a round of hardening on the
@@ -63,6 +50,13 @@ Fixed section below is regressions against 0.3.0 only.
 - `skills/code-map/` stops running its own import scan and becomes a renderer
   over `tmp/repo-map.json`, so there is one scan implementation and two outputs.
 - `scripts/verify.sh` grows the three sweeps above plus a grants assertion.
+- README and `docs/guide.html` refreshed for 0.4.0 — they still described 0.3.0
+  and made no mention of `repo-map`, which is the release's headline addition.
+  The guide's autopilot pipeline was worse than stale: it still showed the
+  four-gate shape with the completion sentinel as GATE A, which #21 removed.
+  It now describes three gates plus a progress check, and the terminal mockup
+  shows a `progressed` iteration rather than implying every iteration is
+  pass/fail.
 
 ### Fixed
 - **autopilot could not finish a plan of more than three slices.** BUILD does
@@ -97,6 +91,16 @@ Fixed section below is regressions against 0.3.0 only.
   do: a `stat` or `date` exiting 0 while printing nothing fed a bare word into
   `$(( ))`, and `set -u` killed the hook on the unset result. `mtime_of` and the
   new `now_epoch` always return an integer.
+
+- **The push-from-main guard blocked pushing a tag**, which is this repo's own
+  documented release step (`v0.x.0` on the merge commit on `main`) — found by
+  hitting it while cutting 0.4.0. A tag doesn't advance a branch, so the rule
+  has nothing to say about it. Tag-only pushes are recognised in their common
+  forms (`origin v1.2.3`, `origin refs/tags/v1.2.3`, `--tags`, `origin tag
+  v1.2.3`) and allowed; anything that could still move a branch is not —
+  `--follow-tags` (which pushes commits too), a mixed branch+tag push, a bare
+  name that resolves to a branch or is ambiguous, and force-pushing a tag all
+  stay blocked.
 
 ## [0.3.0] — 2026-07-24
 
