@@ -39,6 +39,7 @@ STUB_DIR="$WORK/bin"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
+[[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
 prompt="$*"
 plan="tmp/autopilot/IMPLEMENTATION_PLAN.md"
 emit() { printf '{"result":%s,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1"; }
@@ -99,6 +100,7 @@ EOF
 run_loop() { # dir mode verify-cmd extra...
   local dir="$1" mode="$2" vcmd="$3"; shift 3
   ( cd "$dir" && PATH="$STUB_DIR:$PATH" STUB_MODE="$mode" \
+      STUB_CALL_LOG="$WORK/$(basename "$dir").calls" \
       bash "$LOOP_ABS" --verify-cmd "$vcmd" --max-iterations 12 --max-minutes 30 --budget-usd 5 "$@" \
       >"$WORK/$(basename "$dir").out" 2>"$WORK/$(basename "$dir").err" )
 }
@@ -138,6 +140,17 @@ case "$R1_LOG" in
   *"gate=sentinel"*) note "still producing 'gate=sentinel' wip commits on good iterations" ;;
   *)                 ok "no sentinel gate failures on good iterations" ;;
 esac
+
+# Claude Code's --permission-mode plan is the interactive planning mode: it
+# blocks non-read-only tool calls outright and can only be left via
+# ExitPlanMode/AskUserQuestion, neither of which exists in a `claude -p`
+# subprocess. Handed to verify_agent it can't run even its own read-only
+# allowlist (Bash git diff/log/status) and can never produce a real verdict.
+# Regression for the run that shipped this: verify_agent's own transcript
+# refused to verdict because "bash scripts/verify.sh was concretely denied".
+grep -q -- '--permission-mode plan' "$WORK/r1.calls" 2>/dev/null \
+  && note "a phase is invoked with --permission-mode plan (blocks it from running its own allowlisted tools)" \
+  || ok "no phase is invoked under Claude Code's interactive plan mode"
 
 # --- 2. no progress is still a failure, and still aborts -------------------
 R2="$WORK/r2"; new_repo "$R2"

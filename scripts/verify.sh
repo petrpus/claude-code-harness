@@ -313,6 +313,120 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# select_next_slice() is pure parsing over a checklist file — no `claude`
+# call needed, so it's exercised directly here rather than via the stub-
+# driven scripts/test-autopilot-loop.sh (loop.sh doesn't call it yet; that's
+# S1B). Six shapes: a 0.4.0-era unannotated plan, a diamond DAG walked to
+# completion, a cycle, an unknown blocker id, a parked slice whose dependent
+# becomes unreachable, and the malformed-line corner cases from the S1A spec.
+section "autopilot plan DAG (plan.sh)"
+if [[ -f skills/autopilot/plan.sh ]]; then
+  # shellcheck source=/dev/null
+  . skills/autopilot/plan.sh
+  PLAN_TEST_DIR="$(mktemp -d)"; TMP_GATE_DIRS+=("$PLAN_TEST_DIR")
+
+  # -- linear unannotated plan: degrades to "first unchecked box" -----------
+  cat > "$PLAN_TEST_DIR/linear.md" <<'EOF'
+- [x] alpha task one
+- [x] beta task two
+- [ ] gamma task three
+EOF
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/linear.md")"; RC=$?
+  [[ "$RC" -eq 0 && "$GOT" == "gamma" ]] \
+    && ok "unannotated plan selects the first unchecked box" \
+    || note "unannotated plan: got rc=$RC id='$GOT', want rc=0 id=gamma"
+
+  # -- diamond: S1 -> {S2,S3} -> S4, walked to completion --------------------
+  cat > "$PLAN_TEST_DIR/diamond.md" <<'EOF'
+- [ ] S1 — root (after: —)
+- [ ] S2 — left (after: S1)
+- [ ] S3 — right (after: S1)
+- [ ] S4 — join (after: S2, S3)
+EOF
+  tick_id() { # file id
+    sed -i "s/^- \[ \] $2 /- [x] $2 /" "$1"
+  }
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S1" ]] && ok "diamond: root selected first" \
+    || note "diamond: got '$GOT', want S1"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S1
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S2" ]] && ok "diamond: S2 selected once S1 is ticked (S3 not yet ready to run)" \
+    || note "diamond: got '$GOT', want S2"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S2
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S3" ]] && ok "diamond: S4 stays blocked until S3 also ticks" \
+    || note "diamond: got '$GOT', want S3"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S3
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S4" ]] && ok "diamond: S4 selected only after both S2 and S3" \
+    || note "diamond: got '$GOT', want S4"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S4
+  select_next_slice "$PLAN_TEST_DIR/diamond.md" >/dev/null; RC=$?
+  [[ "$RC" -eq 1 ]] && ok "diamond: nothing left once every id is ticked (rc=1)" \
+    || note "diamond: expected rc=1 once complete, got $RC"
+
+  # -- cycle: A <-> B --------------------------------------------------------
+  cat > "$PLAN_TEST_DIR/cycle.md" <<'EOF'
+- [ ] A — (after: B)
+- [ ] B — (after: A)
+EOF
+  MSG="$(select_next_slice "$PLAN_TEST_DIR/cycle.md")"; RC=$?
+  [[ "$RC" -eq 2 && "$MSG" == plan_dag:*cycle* ]] \
+    && ok "cycle: plan_dag failure (rc=2), bypassing the stuck ladder" \
+    || note "cycle: got rc=$RC msg='$MSG', want rc=2 and a plan_dag/cycle message"
+
+  # -- unknown blocker id -----------------------------------------------------
+  cat > "$PLAN_TEST_DIR/unknown.md" <<'EOF'
+- [ ] X — (after: GHOST)
+EOF
+  MSG="$(select_next_slice "$PLAN_TEST_DIR/unknown.md")"; RC=$?
+  [[ "$RC" -eq 2 && "$MSG" == plan_dag:*GHOST* ]] \
+    && ok "unknown blocker id: plan_dag failure (rc=2), names the bad id" \
+    || note "unknown blocker: got rc=$RC msg='$MSG', want rc=2 naming GHOST"
+
+  # -- parked slice: skipped, its dependent becomes unreachable --------------
+  cat > "$PLAN_TEST_DIR/parked.md" <<'EOF'
+- [x] S1 — root (after: —)
+- [ ] S2 — parked sibling (after: S1)
+- [ ] S3 — ready sibling (after: S1)
+- [ ] S4 — join (after: S2, S3)
+EOF
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/parked.md" S2)"; RC=$?
+  [[ "$RC" -eq 0 && "$GOT" == "S3" ]] \
+    && ok "parked slice is skipped; its unblocked sibling still runs" \
+    || note "parked: got rc=$RC id='$GOT', want rc=0 id=S3"
+  tick_id "$PLAN_TEST_DIR/parked.md" S3
+  select_next_slice "$PLAN_TEST_DIR/parked.md" S2 >/dev/null; RC=$?
+  [[ "$RC" -eq 3 ]] \
+    && ok "parked slice's dependent is unreachable: replan signal (rc=3)" \
+    || note "parked: expected rc=3 once only the parked chain remains, got $RC"
+
+  # -- malformed lines: never crash, never falsely select ---------------------
+  NOID="$(plan_parse_line '- [ ]')"
+  [[ "$(printf '%s' "$NOID" | cut -f1)" == "" ]] \
+    && ok "malformed: id-less checkbox parses to an empty (unselectable) id" \
+    || note "malformed: '- [ ]' should parse to an empty id, got '$NOID'"
+
+  EMPTYAFTER="$(plan_parse_line '- [ ] T1 (after:)')"
+  [[ "$(printf '%s' "$EMPTYAFTER" | cut -f3)" == "" ]] \
+    && ok "malformed: empty after: clause parses as unblocked" \
+    || note "malformed: '(after:)' should leave no blockers, got '$EMPTYAFTER'"
+
+  WHITESPACE="$(plan_parse_line '-   [ ]   T2   (after:   T1 )')"
+  [[ "$(printf '%s' "$WHITESPACE" | cut -f1)" == "T2" && "$(printf '%s' "$WHITESPACE" | cut -f3)" == "T1" ]] \
+    && ok "malformed: stray whitespace around id/after: is trimmed" \
+    || note "malformed: stray whitespace not trimmed, got '$WHITESPACE'"
+
+  TICKEDAFTER="$(plan_parse_line '- [x] T3 (after: T1)')"
+  [[ "$(printf '%s' "$TICKEDAFTER" | cut -f2)" == "1" ]] \
+    && ok "malformed: after: on an already-ticked line parses without error" \
+    || note "malformed: ticked line with after: mis-parsed, got '$TICKEDAFTER'"
+else
+  note "skills/autopilot/plan.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
 section "code-map renders repo-map"
 CODE_MAP_SKILL="skills/code-map/SKILL.md"
 if [[ -f "$CODE_MAP_SKILL" ]]; then

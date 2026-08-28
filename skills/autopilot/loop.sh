@@ -367,9 +367,16 @@ while :; do
     fi
   fi
 
-  # GATE d: semantic verifier (haiku, adversarial)
+  # GATE d: semantic verifier (haiku, adversarial). Permission mode is
+  # "acceptEdits", same as PLAN/BUILD — NOT Claude Code's interactive "plan"
+  # mode. That mode blocks every non-read-only tool call and can only be left
+  # via ExitPlanMode/AskUserQuestion, neither of which exists in a `claude -p`
+  # subprocess; handed to the verifier it can't even run its own read-only
+  # allowlist (Bash git diff/log/status) and can never produce a real
+  # verdict. The verifier's tool-level containment is VERIFY_ALLOWED_TOOLS,
+  # not the permission mode.
   if [[ -z "$FAIL_REASON" ]]; then
-    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "plan" "$(verify_prompt)")"
+    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$(verify_prompt)")"
     VERDICT="$(parse_verdict "$VOUT")"
     logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT"
     if [[ "$VERDICT" != "pass" ]]; then
