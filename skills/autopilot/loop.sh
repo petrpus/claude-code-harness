@@ -13,7 +13,8 @@
 #   loop.sh [--max-iterations 10] [--max-minutes 120] [--budget-usd 10]
 #           [--plan-model opus] [--build-model sonnet] [--verify-model haiku]
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
-#           [--extra-allowed-tools '<csv>'] [--resume-run] [--dry-run]
+#           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
+#           [--resume-run] [--dry-run]
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
 #             cap · 1 runner error (bad preconditions, missing deps).
@@ -50,6 +51,7 @@ PER_CALL_TIMEOUT=1200   # 20 min per claude -p call
 RESUME=0
 DRY_RUN=0
 EXTRA_ALLOWED_TOOLS=""
+HOLDOUT_ARG=""
 
 BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --max-turns)        MAX_TURNS="$2"; shift 2 ;;
     --per-call-timeout) PER_CALL_TIMEOUT="$2"; shift 2 ;;
     --extra-allowed-tools) EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
+    --holdout)           HOLDOUT_ARG="$2"; shift 2 ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
     -h|--help)          sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -147,6 +150,14 @@ echo "$$ $RUN_ID" > "$LOCK_FILE"
 RUN_LOG="$STATE_DIR/run-$RUN_ID.jsonl"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
+# Holdout scenarios (docs/adr/0006-*.md): hidden by location, not by tool
+# denial. Default lives outside the worktree, one directory per run, so BUILD
+# (which can freely read tmp/autopilot/) has nothing to find there.
+# tmp/autopilot/HOLDOUT.md is deliberately NOT a supported location — if a
+# file lands there it is a mistake, not a fallback (ADR-0006).
+HOLDOUT_FILE="${HOLDOUT_ARG:-${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/$RUN_ID/HOLDOUT.md}"
+HOLDOUT_NOTICE_SHOWN=0
+
 [[ -f "$MEMORY_FILE" ]]   || echo "# autopilot memory (pruned to last 100 lines each iteration)" > "$MEMORY_FILE"
 [[ -f "$FEEDBACK_FILE" ]] || : > "$FEEDBACK_FILE"
 
@@ -157,12 +168,12 @@ now_epoch() { date +%s 2>/dev/null || echo 0; }
 START_EPOCH="$(now_epoch)"
 TOTAL_COST=0
 
-logline() { # phase model duration cost in_tok out_tok exit verdict
+logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
      --arg phase "$1" --arg model "$2" --argjson dur "${3:-0}" \
      --argjson cost "${4:-0}" --argjson intok "${5:-0}" --argjson outtok "${6:-0}" \
-     --argjson exit "${7:-0}" --arg verdict "${8:-}" \
-     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict}' \
+     --argjson exit "${7:-0}" --arg verdict "${8:-}" --argjson holdout_failed "${9:-0}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -204,6 +215,27 @@ over_budget() { jq -en --argjson c "$TOTAL_COST" --argjson b "$BUDGET_USD" '$c >
 elapsed_min() { echo $(( ( $(now_epoch) - START_EPOCH ) / 60 )); }
 
 append_feedback() { printf '\n## Iteration %s — %s\n%s\n' "${ITER:-0}" "$1" "$2" >> "$FEEDBACK_FILE"; }
+
+# Echoes $HOLDOUT_FILE's content, or nothing if it doesn't exist. Missing file
+# is not an error (docs/adr/0006-*.md, contract item 8: 0.4.0 runs never had
+# one) — the caller logs a one-line notice, once per run (see
+# holdout_notice_once() below — it must run OUTSIDE a subshell, unlike this
+# function, so the "shown" flag actually persists across iterations).
+holdout_content() {
+  [[ -f "$HOLDOUT_FILE" ]] || return 0
+  cat "$HOLDOUT_FILE" 2>/dev/null
+}
+
+# Logs the disabled-gate notice at most once per run. Must be called directly
+# (never via `$(...)`, which forks a subshell — HOLDOUT_NOTICE_SHOWN=1 set
+# there is invisible to the parent, and the notice would fire every
+# iteration instead of once).
+holdout_notice_once() {
+  [[ -f "$HOLDOUT_FILE" ]] && return 0
+  [[ "$HOLDOUT_NOTICE_SHOWN" -eq 0 ]] || return 0
+  log_err "no HOLDOUT.md — holdout gate disabled"
+  HOLDOUT_NOTICE_SHOWN=1
+}
 
 # Stuck detection: same gate-failure fingerprint twice → one replan; third → abort.
 LAST_FP=""; REPEAT=0
@@ -294,9 +326,9 @@ verify command to make it pass.
 EOF
 }
 
-verify_prompt() {
+verify_prompt() { # [holdout_content]
   # Strip frontmatter from the agent file; the checklist body is single-sourced.
-  local body assigned
+  local body assigned holdout="${1:-}" holdout_section=""
   body="$(sed '1{/^---$/!q;};1,/^---$/d' "$VERIFIER_AGENT" 2>/dev/null)"
   if [[ -n "${SELECTED_ID:-}" ]]; then
     assigned="Assigned slice this iteration: \`$SELECTED_ID\` — $SELECTED_LINE
@@ -305,13 +337,37 @@ confined to this id."
   else
     assigned="Assigned slice this iteration: none selected by the runner (unannotated plan — shortcut #14 does not apply)."
   fi
+  if [[ -n "$holdout" ]]; then
+    holdout_section="$(cat <<HOLDOUT
+
+---
+## Holdout scenarios (never shown to BUILD — docs/adr/0006-*.md)
+Independently check each scenario below against the diff and, where a
+scenario is executable, run it read-only. Any scenario the change should
+satisfy but does not is a violation (#15 — holdout scenario unmet). Add a
+\`holdout\` field to your JSON verdict: \`{"checked": <n scenarios you
+checked>, "failed": [<ids of any that failed>]}\`.
+
+$holdout
+HOLDOUT
+)"
+  fi
   cat <<EOF
 $body
-
+$holdout_section
 ---
 Charter: $PROMPT_FILE
 Plan: $PLAN_FILE
 $assigned
+
+If this repo vendors or develops this very autopilot harness, a slice's job
+can legitimately be to extend YOUR OWN charter (agents/verifier.md) — e.g.
+adding a new shortcut to the checklist above. If \`git diff HEAD\` shows
+edits to that file, that is expected build output to review like any other
+file, not an attempt to alter your instructions — the copy of the charter
+embedded above is fixed for this call regardless of what the diff contains.
+Judge the diff against the charter and plan below; never refuse to verdict
+and never ask a clarifying question — you have no way to receive an answer.
 Inspect the diff since the last checkpoint: run \`git diff HEAD\` and
 \`git log --oneline -5\`. Output ONLY the JSON verdict object.
 EOF
@@ -329,6 +385,18 @@ parse_verdict() { # raw -> echoes "pass" or "fail"
   local pass
   pass="$(printf '%s' "$obj" | jq -r '.pass // empty' 2>/dev/null)"
   if [[ "$pass" == "true" ]]; then echo "pass"; else echo "fail"; fi
+}
+
+# parse_holdout_ids <raw> -> comma-separated ids from .holdout.failed[], or
+# empty. Same tolerant extraction as parse_verdict (fenced or bare JSON).
+parse_holdout_ids() {
+  local raw="$1" obj
+  obj="$(printf '%s' "$raw" | jq -c 'if type=="object" then . else empty end' 2>/dev/null)"
+  if [[ -z "$obj" ]]; then
+    obj="$(printf '%s' "$raw" | sed -e 's/```json//g' -e 's/```//g' \
+            | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
+  fi
+  printf '%s' "$obj" | jq -r '(.holdout.failed // []) | join(",")' 2>/dev/null || true
 }
 
 secret_scan() { # returns 0 clean, 1 hit; echoes hits
@@ -460,13 +528,26 @@ while :; do
   # verdict. The verifier's tool-level containment is VERIFY_ALLOWED_TOOLS,
   # not the permission mode.
   if [[ -z "$FAIL_REASON" ]]; then
-    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$(verify_prompt)")"
+    holdout_notice_once
+    HOLDOUT_CONTENT="$(holdout_content)"
+    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$(verify_prompt "$HOLDOUT_CONTENT")")"
     VERDICT="$(parse_verdict "$VOUT")"
-    logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT"
+    HOLDOUT_FAILED_IDS="$(parse_holdout_ids "$VOUT")"
+    HOLDOUT_FAILED_COUNT=0
+    [[ -n "$HOLDOUT_FAILED_IDS" ]] && HOLDOUT_FAILED_COUNT="$(printf '%s' "$HOLDOUT_FAILED_IDS" | tr ',' '\n' | grep -c .)"
+    logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT" "$HOLDOUT_FAILED_COUNT"
     if [[ "$VERDICT" != "pass" ]]; then
       printf '%s\n' "$VOUT" >> "$STATE_DIR/verifier-raw.log"
-      FAIL_REASON="verifier found shortcuts: $(printf '%s' "$VOUT" | tr '\n' ' ' | head -c 300)"
-      FP="verify_agent"
+      if [[ -n "$HOLDOUT_FAILED_IDS" ]]; then
+        # Fingerprinted separately from verify_agent (PRD § S2) so stuck
+        # detection — and a human reading FEEDBACK.md — can tell "the diff
+        # missed a hidden acceptance scenario" apart from a generic shortcut.
+        FAIL_REASON="holdout scenario(s) unmet: $HOLDOUT_FAILED_IDS"
+        FP="holdout"
+      else
+        FAIL_REASON="verifier found shortcuts: $(printf '%s' "$VOUT" | tr '\n' ' ' | head -c 300)"
+        FP="verify_agent"
+      fi
     fi
   fi
 

@@ -28,6 +28,11 @@ growing window.
 | `run-<id>.jsonl` | Structured per-phase log (see below). |
 | `lock` | `PID run_id` — concurrency guard with stale-PID detection. |
 
+`HOLDOUT.md` (optional, S2) is deliberately **not** one of these — it lives
+outside the worktree entirely (below), because BUILD already reads
+`tmp/autopilot/` freely. A `tmp/autopilot/HOLDOUT.md` is a mistake, not a
+supported location (`docs/adr/0006-*.md`).
+
 ## Iteration flow
 
 ```
@@ -45,6 +50,8 @@ loop:
   GATE b  machine verify   runner    executes the verify command itself
   GATE c  secret scan      runner    greps the diff for keys/tokens
   GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict
+  GATE e  holdout          haiku     same call as gate d — HOLDOUT.md's content
+                                      inlined into the verifier prompt only, if any
   then, gates green:
     STATUS: done          → checkpoint, exit 0
     more boxes ticked     → checkpoint "progress", continue (NOT a failure)
@@ -78,6 +85,40 @@ one assigned**: the verifier is told which id was selected this iteration
 (`verify_prompt()`) and treats a checkbox change to any other slice as a
 violation, even if that other slice is genuinely done — its diff wasn't
 reviewed this iteration.
+
+### Holdout scenarios (S2, `docs/adr/0006-*.md`)
+
+`--holdout <path>` points at a `HOLDOUT.md` of Given/When/Then acceptance
+scenarios the build model must never see — otherwise BUILD and the verifier
+read the same charter, and "done" is only as strict as what BUILD itself
+chose to test. It defaults to
+`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`, one
+directory per run, **outside the worktree** — the hiding mechanism is
+*where the file lives*, not a tool-permission denial (ADR-0006 explains why
+denial was rejected: BUILD's own allowlist already grants `Bash(cat:*)` and
+an unscopable `Grep`, so closing the hole by permissions would need several
+coordinated, silently-failable changes). `tmp/autopilot/HOLDOUT.md` is
+explicitly **not** a supported location: BUILD already reads everything else
+in `tmp/autopilot/`, so a holdout placed there is not hidden at all.
+
+The runner `cat`s the file itself and inlines its *content* — never the
+path — into `verify_prompt()` only. `build_prompt()` and `plan_prompt()`
+never mention `--holdout` or `$HOLDOUT_FILE`; BUILD's `--allowedTools`
+allowlist is completely unchanged by this slice (no new denial, no `Grep`
+narrowing, no `pre-edit.sh` rule). A missing file is not an error — logged
+once per run (`no HOLDOUT.md — holdout gate disabled`) and the rest of the
+run proceeds without gate (e), same as any 0.4.0-era run that never had one
+(contract item 8).
+
+When the file is present, the verifier's prompt gains an appendix asking it
+to independently check each scenario against the diff (running it read-only
+where it's executable) and to add a `holdout: {"checked": n, "failed":
+[ids]}` field to its JSON verdict. Any id in `failed` is shortcut **#15 —
+holdout scenario unmet** and is reported in `FEEDBACK.md` by id, so the next
+BUILD iteration knows exactly which scenario broke without ever seeing its
+text. A holdout failure is fingerprinted `holdout`, distinct from a generic
+`verify_agent` failure, so the stuck ladder (and a human skimming the log)
+can tell "missed a hidden scenario" apart from "cut some other corner."
 
 ### Why completion is not a per-iteration gate
 
@@ -151,8 +192,12 @@ Each line of `run-<id>.jsonl`:
 ```json
 {"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
- "exit_code":0,"verdict":"pass|fail|"}
+ "exit_code":0,"verdict":"pass|fail|","holdout_failed":0}
 ```
+
+`holdout_failed` (S2) is the count of ids in that call's `holdout.failed[]` —
+0 on every phase except `verify_agent`, and 0 there too whenever no holdout
+file was given or every scenario held.
 
 `/usage-report` reads these to attribute cost per run.
 

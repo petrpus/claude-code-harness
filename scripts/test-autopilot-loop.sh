@@ -56,6 +56,13 @@ case "$prompt" in
     emit '"planned"'
     ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    # S2 (holdout scenarios): if this run is checking that holdout content
+    # never reaches BUILD, flag it — the outer test asserts the file this
+    # writes to stays empty.
+    if [[ -n "${STUB_HOLDOUT_SENTINEL:-}" ]] \
+       && printf '%s' "$prompt" | grep -qF "$STUB_HOLDOUT_SENTINEL"; then
+      printf 'LEAK: holdout sentinel reached the BUILD prompt\n' >> "${STUB_LEAK_FILE:-/dev/null}"
+    fi
     if [[ "${STUB_MODE:-progress}" == "progress" ]]; then
       # touch a tracked file so the iteration has something to checkpoint
       mkdir -p src && date +%s%N >> src/work.txt
@@ -80,7 +87,11 @@ case "$prompt" in
     emit '"built"'
     ;;
   *"verdict"*|*"shortcut"*|*"Verdict"*)
-    emit '"{\"pass\": true}"'
+    if [[ "${STUB_HOLDOUT_FAIL:-0}" == "1" ]]; then
+      emit '"{\"pass\": false, \"violations\": [], \"holdout\": {\"checked\": 1, \"failed\": [\"H1\"]}}"'
+    else
+      emit '"{\"pass\": true}"'
+    fi
     ;;
   *)
     emit '"ok"'
@@ -165,6 +176,19 @@ esac
 grep -q -- '--permission-mode plan' "$WORK/r1.calls" 2>/dev/null \
   && note "a phase is invoked with --permission-mode plan (blocks it from running its own allowlisted tools)" \
   || ok "no phase is invoked under Claude Code's interactive plan mode"
+
+# This repo IS the autopilot runner's own source, so a slice can legitimately
+# edit agents/verifier.md (e.g. S1B added shortcut #14, S2 added #15-#17) —
+# the verifier then sees its own charter file inside `git diff HEAD`. Without
+# an explicit reassurance, a real verifier model reads that as its
+# instructions being tampered with and refuses to verdict at all (the run
+# that shipped this: iteration 3's FEEDBACK.md was the verifier asking a
+# clarifying question instead of reviewing the diff). Regression: the
+# reassurance text must be present in every verify_agent call, not just when
+# agents/verifier.md happens to be in the diff — it's static prompt text.
+grep -q "not an attempt to alter" "$WORK/r1.calls" 2>/dev/null \
+  && ok "the verifier prompt reassures it against self-referential charter edits" \
+  || note "verify_prompt() is missing the self-edit reassurance text (regression: iteration-3 verifier confusion)"
 
 # --- 2. no progress is still a failure, and still aborts -------------------
 R2="$WORK/r2"; new_repo "$R2"
@@ -272,6 +296,53 @@ RC7=$?
 grep -q "plan_dag" "$WORK/r7.err" 2>/dev/null \
   && ok "the unknown blocker id is fingerprinted as plan_dag" \
   || note "unknown-blocker-id failure was not fingerprinted as plan_dag"
+
+# --- 8. Holdout scenarios (S2): hidden from BUILD, seen by the verifier ----
+# docs/adr/0006-holdout-scenarios-hidden-by-location.md
+R8="$WORK/r8"; new_repo "$R8"
+HOLDOUT_R8="$WORK/r8-holdout.md"
+cat > "$HOLDOUT_R8" <<'EOF'
+## H1: sentinel scenario
+- Given: TOPSECRET-SCENARIO-H1
+- When: the change lands
+- Then: this text must never reach the BUILD prompt
+EOF
+( cd "$R8" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_HOLDOUT_FAIL=1 \
+    STUB_HOLDOUT_SENTINEL="TOPSECRET-SCENARIO-H1" STUB_LEAK_FILE="$WORK/r8.leak" \
+    STUB_CALL_LOG="$WORK/r8.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --holdout "$HOLDOUT_R8" \
+      --max-iterations 5 --max-minutes 30 --budget-usd 5 \
+      >"$WORK/r8.out" 2>"$WORK/r8.err" )
+RC8=$?
+
+[[ "$RC8" -eq 4 ]] \
+  && ok "a holdout failure that keeps recurring aborts like any stuck gate (exit 4)" \
+  || note "holdout-failing run exited $RC8 — expected 4 (stuck on repeated 'holdout')"
+
+grep -q "stuck on 'holdout'" "$WORK/r8.err" 2>/dev/null \
+  && ok "the holdout failure is fingerprinted 'holdout', distinct from verify_agent" \
+  || note "holdout failure was not fingerprinted as 'holdout' in the runner's log"
+
+grep -q "H1" "$R8/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "FEEDBACK.md names the failing holdout scenario id" \
+  || note "FEEDBACK.md doesn't mention the failing scenario id H1"
+
+[[ ! -s "$WORK/r8.leak" ]] \
+  && ok "the holdout path/content never reached the BUILD prompt" \
+  || note "the BUILD prompt leaked holdout content: $(cat "$WORK/r8.leak" 2>/dev/null)"
+
+# --- 9. Holdout scenarios (S2): a missing file is a notice, not an error ---
+R9="$WORK/r9"; new_repo "$R9"
+run_loop "$R9" progress true --holdout "$WORK/does-not-exist-$$.md"
+RC9=$?
+[[ "$RC9" -eq 0 ]] \
+  && ok "a missing --holdout file still lets the run complete (exit 0)" \
+  || note "missing-holdout-file run exited $RC9 — expected 0"
+
+NOTICE_COUNT="$(grep -c "no HOLDOUT.md — holdout gate disabled" "$WORK/r9.err" 2>/dev/null)" || NOTICE_COUNT=0
+[[ "${NOTICE_COUNT:-0}" -eq 1 ]] \
+  && ok "the missing-holdout notice logs exactly once per run, not every iteration" \
+  || note "missing-holdout notice logged ${NOTICE_COUNT:-0} times, expected exactly 1"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

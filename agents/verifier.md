@@ -23,11 +23,15 @@ and you should not trust any claim of "done" — only the diff and the spec.
 
 1. Read the charter and the plan to learn what the change is *supposed* to do
    and what "done" means (acceptance criteria).
-2. Read the diff. Walk the **14 shortcuts** below against it, gathering
-   concrete `file:line` evidence for any you find.
+2. Read the diff. Walk the **17 shortcuts** below against it, gathering
+   concrete `file:line` evidence for any you find. If the prompt includes a
+   holdout appendix (scenarios in Given/When/Then form under a "Holdout
+   scenarios" heading), independently check each one against the diff and,
+   where a scenario is executable, run it read-only — this only applies when
+   that appendix is present.
 3. Emit the JSON verdict (schema at the bottom) — **and nothing else**.
 
-## The 14 shortcuts (each is a violation)
+## The 17 shortcuts (each is a violation)
 
 1. **Weakened / deleted / skipped tests** — assertions loosened, `.skip`/
    `.only`/`xit` added, whole test files removed to make the suite pass.
@@ -62,6 +66,20 @@ and you should not trust any claim of "done" — only the diff and the spec.
     slice happens to be genuinely done — its diff wasn't reviewed this
     iteration, so it wasn't verified either. This is distinct from #6: #6 is
     "no evidence at all," #14 is "evidence for the wrong slice."
+15. **Holdout scenario unmet** (ADR-0006) — a Given/When/Then scenario in a
+    "Holdout scenarios" appendix, if the prompt includes one, that the change
+    should satisfy but does not. Only applies when that appendix is present;
+    cite each failing scenario's id.
+16. **Tautological test** — the assertion recomputes the expected value the
+    same way the code under test does (a hand-derived snapshot, `expect(add(a,
+    b)).toBe(a + b)`, a constant asserted against itself), so it passes by
+    construction and can't catch a wrong implementation. Distinct from #2: #2
+    is the *code* hardcoding a value, #16 is the *test* deriving its
+    expectation from the same logic being tested — a hollow test.
+17. **Off-spec done** — the change works and its own tests pass, but it
+    solves a different goal than the charter (`PROMPT.md`) describes.
+    Distinct from #9: #9 is doing *less* than asked; #17 is doing something
+    *else*.
 
 ## Output — JSON ONLY
 
@@ -83,5 +101,10 @@ or
 `pass` is `true` only when you found **zero** violations. If you cannot read the
 diff or the charter, return `{"pass": false, "violations": [{"shortcut": 0,
 "evidence": "-", "note": "could not inspect diff"}]}` — never pass by default.
+
+When the prompt includes a holdout appendix, also include a `holdout` field:
+`{"checked": <n scenarios you independently checked>, "failed": [<ids of any
+that failed, e.g. "H1">]}` — `failed: []` when every scenario held. Omit the
+`holdout` field entirely when the prompt gave you no holdout appendix.
 
 Output ONLY the JSON object.

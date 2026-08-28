@@ -37,6 +37,10 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    link and acceptance criteria (these are mandatory; they're what the verifier
    checks against). Leave `IMPLEMENTATION_PLAN.md` absent — the PLAN phase writes
    it — or seed it from `PLAN.template.md`.
+   Optionally, write acceptance scenarios the build model must never see from
+   `HOLDOUT.template.md`, saved **outside the worktree** (default location
+   below, or point `--holdout <path>` at your own) — never under
+   `tmp/autopilot/`, which BUILD already reads freely.
 3. **Be on a feature branch with a clean tree.**
 4. **Start the run:**
 
@@ -48,7 +52,9 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    Defaults: plan=opus, build=sonnet, verify=haiku (override with
    `--plan-model` / `--build-model` / `--verify-model`). `--dry-run` prints the
    plan of calls without spending. `--resume-run` continues an interrupted run
-   from disk state.
+   from disk state. `--holdout <path>` overrides the default holdout location
+   (`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`);
+   omit it and a missing file just disables gate (e).
 
 ## What you get
 
@@ -61,14 +67,21 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 ## Gates (all must pass to finish)
 
 1. `STATUS: done` sentinel in the plan.
-2. **Machine verify** — the runner executes the verify command itself.
-3. **Secret scan** — the iteration diff is grepped for keys/tokens/private keys.
-4. **Semantic verify** — haiku runs `agents/verifier.md` adversarially against
-   the diff (the 14-shortcuts checklist).
+2. **Machine verify** (gate b) — the runner executes the verify command itself.
+3. **Secret scan** (gate c) — the iteration diff is grepped for keys/tokens/private keys.
+4. **Semantic verify** (gate d) — haiku runs `agents/verifier.md` adversarially
+   against the diff (the 17-shortcuts checklist).
+5. **Holdout** (gate e) — when `--holdout <path>` (or its default location) points
+   at a `HOLDOUT.md`, the runner inlines its content into the verifier prompt
+   only (never into BUILD's) and the verifier independently checks each
+   Given/When/Then scenario against the diff. A missing file disables this
+   gate with a one-line notice, not an error — see `docs/adr/0006-*.md`.
 
 Any failure appends to `FEEDBACK.md`, resets the sentinel, checkpoints WIP, and
-feeds the next iteration. Same failure twice → one automatic replan; three times
-→ abort. Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
+feeds the next iteration. A holdout failure is fingerprinted `holdout`, distinct
+from a generic semantic-verify failure (`verify_agent`), so stuck detection can
+tell them apart. Same failure twice → one automatic replan; three times → abort.
+Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
 
 Each iteration, the runner first picks which plan item to build:
 `select_next_slice()` (`plan.sh`) walks `IMPLEMENTATION_PLAN.md` as a **Plan

@@ -10,7 +10,7 @@ Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code
 | **Skills (Vercel Labs)** | `find-skills` |
 | **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
 | **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `repo-map` (queryable import graph), `code-map` |
-| **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 11-shortcuts gate, haiku) |
+| **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 17-shortcuts gate, haiku) |
 | **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` + `session-log` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks); all parse stdin JSON via `hooks/lib.sh` |
 | **Own verify** | `scripts/verify.sh` — the harness's own gate: check-consistency, a stdin-JSON hook test matrix, fault-injection sweeps for the repo-map generator and the hooks, an end-to-end autopilot loop test, and a `bash -n` floor. Run before every PR. |
 | **Templates** | `project-settings.template.json` (baseline permissions/deny) + `require-verify-before-stop.sh` (opt-in Stop-hook gate for unattended runs — never wired by default; ADR-0002) |
