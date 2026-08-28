@@ -65,6 +65,15 @@ emit() { printf '{"result":%s,"total_cost_usd":%s,"usage":{"input_tokens":0,"out
 
 case "$prompt" in
   *"PLAN phase"*|*"autonomous run is stuck"*)
+    # S4A: some fixtures hand-craft a plan whose STRUCTURE (ids, after:
+    # edges) is the whole point of the test — a rung-4 replan overwriting it
+    # with the generic 5-slice-word plan would destroy the very DAG being
+    # exercised. STUB_REPLAN_KEEP_PLAN leaves the on-disk plan untouched;
+    # loop.sh's own slices_clear() still does the real unparking, the model
+    # call here is only ever cosmetic to that mechanism.
+    if [[ -n "${STUB_REPLAN_KEEP_PLAN:-}" && "$prompt" == *"autonomous run is stuck"* ]]; then
+      emit '"planned"'; exit 0
+    fi
     if [[ ! -f "$plan" || "$prompt" == *"autonomous run is stuck"* ]]; then
       { echo "# plan"
         for i in 1 2 3 4 5; do echo "- [ ] slice $i"; done
@@ -99,7 +108,14 @@ case "$prompt" in
       # id-less plans (no annotations at all) carry no such phrase, so fall
       # back to "first unticked box", which is 0.4.0 behaviour.
       sel_id="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
-      if [[ -n "$sel_id" ]]; then
+      # S4A: STUB_FAIL_ID names an id that BUILD never manages to finish —
+      # gates still run and pass, but the checkbox stays unticked, producing
+      # a genuine "no progress" per-slice failure so the ladder (retry →
+      # park) has something real to count for that one id while its siblings
+      # complete normally.
+      if [[ -n "${STUB_FAIL_ID:-}" && "$sel_id" == "$STUB_FAIL_ID" ]]; then
+        :
+      elif [[ -n "$sel_id" ]]; then
         awk -v id="$sel_id" 'BEGIN{done=0} { if (!done && $0 ~ ("^- \\[ \\] " id "([[:space:]]|$)")) { sub(/^- \[ \]/, "- [x]"); done=1 } print }' \
           "$plan" > "$plan.tmp" && mv "$plan.tmp" "$plan"
       else
@@ -718,6 +734,88 @@ DIGEST_LINES="$(printf '%s\n' "$DIGEST_OUT" | grep -c '.')" || DIGEST_LINES=0
 [[ "${DIGEST_LINES:-0}" -le 40 ]] \
   && ok "digest.sh caps its output at <= 40 lines even with many file hints ($DIGEST_LINES)" \
   || note "digest.sh emitted ${DIGEST_LINES:-0} lines with 15 file hints, want <= 40"
+
+# --- 18. S4A: the stuck ladder — retry, park, sibling, replan, abort -------
+# docs/adr/0005-*.md decision 6 / PRD § S4. A single scenario exercises the
+# required loop tests (b)-(e) together: A fails every time it's picked, B is
+# an independent sibling, C depends on A.
+#   (b) A parks after its 3rd failure and B (the sibling) runs next
+#   (c) C, blocked on the never-ticking A, is never selected
+#   (d) once A is parked and C is unreachable, exactly one replan fires and
+#       unparks everything (slices.json no longer marks A parked afterwards)
+#   (e) the next failure — A, retried fresh post-replan — aborts (exit 4)
+#       rather than replanning a second time
+R18="$WORK/r18"; new_repo "$R18"
+cat > "$R18/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] A — flaky, always fails (after: —)
+- [ ] B — independent sibling (after: —)
+- [ ] C — depends on the flaky one (after: A)
+
+STATUS: in-progress
+EOF
+( cd "$R18" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_FAIL_ID=A \
+    STUB_REPLAN_KEEP_PLAN=1 STUB_CALL_LOG="$WORK/r18.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 10 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r18.out" 2>"$WORK/r18.err" )
+RC18=$?
+[[ "$RC18" -eq 4 ]] \
+  && ok "a slice that keeps failing past a park-exhaustion replan aborts (exit 4)" \
+  || note "S4A ladder run exited $RC18 — expected 4"
+
+SELECTED_SEQ_18="$(grep -oE 'plan item `[^`]+`' "$WORK/r18.calls" 2>/dev/null \
+  | sed -E 's/plan item `([^`]+)`/\1/' | tr '\n' ',')"
+[[ "$SELECTED_SEQ_18" == "A,A,A,B,A," ]] \
+  && ok "A parks after 3 failures, B (sibling) runs next, A retried once more after the replan ($SELECTED_SEQ_18)" \
+  || note "selection order was '$SELECTED_SEQ_18', want A,A,A,B,A,"
+
+case "$SELECTED_SEQ_18" in
+  *C*) note "C was selected even though its blocker A never ticked" ;;
+  *)   ok "C (blocked on the never-ticking A) is never selected" ;;
+esac
+
+REPLAN_CALLS_18="$(cat "$R18"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="replan")' 2>/dev/null | grep -c . )" || REPLAN_CALLS_18=0
+[[ "${REPLAN_CALLS_18:-0}" -ge 1 ]] \
+  && ok "exactly one park-exhaustion replan fired" \
+  || note "expected a replan call, saw ${REPLAN_CALLS_18:-0}"
+
+PARKED_AFTER_18="$(jq -r '.slices.A.parked // false' "$R18/tmp/autopilot/slices.json" 2>/dev/null)"
+[[ "$PARKED_AFTER_18" == "false" ]] \
+  && ok "slices.json no longer marks A parked — the replan unparked it" \
+  || note "slices.json still shows A parked after the replan: $(cat "$R18/tmp/autopilot/slices.json" 2>/dev/null)"
+
+grep -q "failed again after the park-exhaustion replan" "$WORK/r18.err" 2>/dev/null \
+  && ok "the abort explains it happened after the replan (rung 5), not a fresh 3-strikes count" \
+  || note "no rung-5 explanation found in stderr"
+
+# --- 19. S4A: per-slice fails counters survive --resume-run ----------------
+# PRD § S4: "an interrupted run must not pay for the same --escalate-model
+# call twice" — the counters must NOT reset to zero on a resumed process.
+R19="$WORK/r19"; new_repo "$R19"
+cat > "$R19/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] A — flaky, always fails (after: —)
+
+STATUS: in-progress
+EOF
+cat > "$R19/tmp/autopilot/slices.json" <<'EOF'
+{"plan_sig":"","slices":{"A":{"fails":2,"escalated":false,"parked":false}}}
+EOF
+( cd "$R19" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_FAIL_ID=A \
+    STUB_REPLAN_KEEP_PLAN=1 STUB_CALL_LOG="$WORK/r19.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --resume-run --max-iterations 10 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r19.out" 2>"$WORK/r19.err" )
+RC19=$?
+[[ "$RC19" -eq 4 ]] \
+  && ok "a resumed run with a pre-seeded fails count still runs the ladder to abort (exit 4)" \
+  || note "resumed S4A run exited $RC19 — expected 4"
+
+# A fresh run needs 3 failures to park A; seeded at fails=2, resuming must
+# park it after exactly 1. If the seed had been silently reset to 0 instead
+# (the bug this test guards against), parking (and everything after it)
+# would take 2 iterations longer, so the total iteration count is the tell.
+ITER_COUNT_19="$(cat "$R19"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="iteration") | .iter' 2>/dev/null | sort -un | tail -1)"
+[[ "${ITER_COUNT_19:-0}" -eq 3 ]] \
+  && ok "the pre-seeded fails=2 was honoured (parked after 1 more failure, abort at iteration 3)" \
+  || note "run took ${ITER_COUNT_19:-0} iterations to abort, want exactly 3 (fails counter looks reset on resume)"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

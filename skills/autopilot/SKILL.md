@@ -62,7 +62,7 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    navigational hint, not ground truth; `--no-repo-map` turns it off.
 
    If this repo *is* the autopilot harness's own source, a slice can
-   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh` — the runner
+   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — the runner
    notices its own sourced files changed on disk and re-execs itself under the
    same run id before the next iteration (R1), so a live run picks up the fix
    without a human restart. See `LOOP-PROTOCOL.md` § Runner self-reload.
@@ -91,7 +91,12 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 Any failure appends to `FEEDBACK.md`, resets the sentinel, checkpoints WIP, and
 feeds the next iteration. A holdout failure is fingerprinted `holdout`, distinct
 from a generic semantic-verify failure (`verify_agent`), so stuck detection can
-tell them apart. Same failure twice → one automatic replan; three times → abort.
+tell them apart. Stuck detection is the five-rung ladder (S4A, `slices.sh`,
+`docs/adr/0005-*.md`): a slice retries on its 1st failure, is parked on its
+3rd (a sibling runs instead), and once every remaining slice is parked or
+blocked a single replan unparks everything — a second failure after that
+replan aborts. A plan with no real slice ids falls back to the pre-S4A rule
+verbatim (same fingerprint twice → replan, third time → abort).
 Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
 
 Gate (d) parses the verifier's output three ways, not just pass/fail: a reply

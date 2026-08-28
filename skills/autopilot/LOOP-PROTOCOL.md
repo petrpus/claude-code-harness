@@ -20,7 +20,7 @@ disk, not from a growing window.
 
 ### Runner self-reload (R1)
 
-Bash parses `loop.sh`'s (and `plan.sh`'s/`allowlist.sh`'s) function bodies
+Bash parses `loop.sh`'s (and `plan.sh`'s/`allowlist.sh`'s/`slices.sh`'s) function bodies
 once, at process startup. If this repo *is* the autopilot harness's own
 source, a slice's job can legitimately be to fix the runner itself — but a
 fix a BUILD phase just committed to disk never changes the behaviour of the
@@ -49,6 +49,7 @@ so an unchanged file can never spin.
 | `status.json` | Live run state, iterations done, accumulated cost, HEAD sha. |
 | `run-<id>.jsonl` | Structured per-phase log (see below). |
 | `lock` | `PID run_id` — concurrency guard with stale-PID detection. |
+| `slices.json` | Per-slice retry/park ladder state (S4A, `slices.sh`). Runner-owned; never named in any prompt. Missing = nothing has failed yet. |
 
 `HOLDOUT.md` (optional, S2) is deliberately **not** one of these — it lives
 outside the worktree entirely (below), because BUILD already reads
@@ -98,9 +99,10 @@ straight to a replan pass every time it recurs, never through the
 retry/park/abort ladder — a broken DAG is a defect in the plan the PLAN phase
 wrote, and no amount of retrying or escalating the BUILD call can fix it.
 "Every remaining candidate is parked, or blocked by a parked one" (return 3)
-is handled the same way — replan, which also unparks everything (S4A); this
-path is unreachable until S4A's per-slice state exists, since nothing calls
-`select_next_slice()` with any parked ids yet.
+is rung 4 of the stuck ladder (below) — the first time it happens this run,
+replan once and unpark everything; the second time, abort (rung 5). It needs
+`slices.json` to have parked anything first, so on a run where nothing is
+ever parked this path is simply never taken.
 
 `agents/verifier.md` gained shortcut **#14 — ticked a slice other than the
 one assigned**: the verifier is told which id was selected this iteration
@@ -141,6 +143,59 @@ BUILD iteration knows exactly which scenario broke without ever seeing its
 text. A holdout failure is fingerprinted `holdout`, distinct from a generic
 `verify_agent` failure, so the stuck ladder (and a human skimming the log)
 can tell "missed a hidden scenario" apart from "cut some other corner."
+
+### The stuck ladder (S4A, `docs/adr/0005-*.md` decision 6)
+
+Counting changed from **fingerprint repetition** to **per-slice failures**. A
+slice that fails three times with three *different* gate fingerprints
+(`verify_cmd` once, `holdout` once, `verify_agent` once) is flailing exactly
+as much as one failing the same gate three times, so what advances the ladder
+is a per-slice `fails` counter, not which fingerprint fired — the fingerprint
+still survives for `FEEDBACK.md`, the `plan_dag` bypass, and telling
+`holdout` apart from `verify_agent`.
+
+State lives in `tmp/autopilot/slices.json` (`skills/autopilot/slices.sh`),
+runner-owned — written and read only by `loop.sh`, never named in any prompt:
+
+```json
+{"plan_sig": "<cksum of the ordered unticked slice ids>",
+ "slices": {"S2": {"fails": 3, "escalated": false, "parked": true}}}
+```
+
+Every iteration reconciles this against the CURRENT plan before selecting: an
+id that's ticked, or no longer in the plan at all, retires silently (drops
+out — that's what makes "ticking a slice retires its record" durable rather
+than something the next reconcile would undo); an id not yet seen starts at
+zero. Missing/corrupt file reconciles to "nothing has failed yet" (contract
+item 8), never an error — a 0.4.0-era `tmp/autopilot/` still loads.
+
+| rung | trigger | action |
+|---|---|---|
+| 1 | a slice fails once | retry the same slice on `--build-model` |
+| 2 | a slice fails twice | **escalate** — S4B, not yet implemented; S4A just retries again |
+| 3 | a slice fails three times | **park** it (`select_next_slice()` skips it for a sibling) |
+| 4 | every remaining candidate is parked or blocked by one | **replan** once, unparking everything (`slices_clear()`) |
+| 5 | the run fails again after that replan | **abort** (exit 4) |
+
+Rung 4's replan is a **one-time reprieve per stuck episode**, tracked by an
+in-process flag (`PARK_REPLAN_DONE`, not persisted — a fresh process, whether
+`--resume-run` or an R1 reload, gets its own fresh chance). Once it has
+fired, the very next iteration failure — of any kind, not only a repeat of
+"every candidate parked" — is rung 5 and aborts unconditionally; making
+real progress resets the flag, so a later, unrelated slice getting stuck
+still earns its own one replan.
+
+A plan whose lines carry no ids at all still selects one (the first token
+after the checkbox, however arbitrary), so the ladder above applies to
+virtually every real plan. The exception is a genuinely id-less checkbox
+line ("- [ ]" with nothing after it) or the case where `select_next_slice()`
+has nothing left to schedule — there, `SELECTED_ID` is empty and the loop
+falls back to the pre-S4A fingerprint-repetition ladder (same failure twice →
+one replan, third time → abort) verbatim, since there is no id to key
+per-slice state on.
+
+`parked_count` (S3A's log field) is real as of S4A: the number of ids
+`slices.json` marks parked at that iteration's selection time.
 
 ### Repo-map digest (S5, ADR-0004 item 7)
 
@@ -261,10 +316,13 @@ push-from-main and `.env`/secret guards stay live.
 - `--per-call-timeout` (1200s) wraps every `claude -p` and the verify command in
   `timeout`, so one hung call can't defeat `--max-minutes` (which is only checked
   between phases).
-- **Stuck detection:** each gate failure is fingerprinted (gate id). The same
-  fingerprint twice triggers one REPLAN pass with the plan model; a third time
-  aborts with exit 4. This catches the tail case where the loop spins on one
-  failure forever.
+- **Stuck detection (S4A):** on an annotated plan, driven by a per-slice
+  `fails` counter (retry → park at 3 → replan once all candidates are parked
+  or blocked → abort on the next failure) — see § The stuck ladder above. On
+  a plan with no slice id to key that off of, the pre-S4A rule still applies
+  verbatim: the same gate fingerprint twice triggers one REPLAN pass with the
+  plan model, a third time aborts with exit 4. Either way this catches the
+  tail case where the loop spins on one failure forever.
 
 ## Log format
 
@@ -282,7 +340,7 @@ Per-call row:
 ```
 
 `runner_reload` (R1) is logged once, immediately before the `exec` that
-re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh` — it costs nothing and
+re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — it costs nothing and
 carries no tokens, but marks exactly where a run's identity carried across a
 process replacement, which matters when reading `iter` back out as a
 monotonic sequence.
@@ -344,6 +402,6 @@ a new run at iteration 0 / cost 0 — a missing log behaves like a fresh run
 you `git reset` to any clean point. On abort, `FEEDBACK.md` holds the last
 failure for a human to read.
 
-A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`
+A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`
 does not need a manual restart at all — see Runner self-reload (R1) above; it
 re-execs itself under the same run id automatically.

@@ -427,6 +427,85 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "autopilot per-slice ladder state (slices.sh)"
+if [[ -f skills/autopilot/slices.sh ]]; then
+  # shellcheck source=/dev/null
+  . skills/autopilot/slices.sh
+  SLICES_TEST_DIR="$(mktemp -d)"; TMP_GATE_DIRS+=("$SLICES_TEST_DIR")
+  SLICES_TEST_FILE="$SLICES_TEST_DIR/slices.json"
+
+  # -- missing file reconciles to "nothing has failed yet" (contract item 8) -
+  GOT="$(slices_read "$SLICES_TEST_FILE")"
+  [[ "$(printf '%s' "$GOT" | jq -r '.slices')" == "{}" ]] \
+    && ok "a missing slices.json reads as empty state, not an error" \
+    || note "slices_read on a missing file returned '$GOT', want empty .slices"
+
+  # -- reconcile: zero-inits new ids, preserves an existing id's counters ----
+  STATE="$(slices_reconcile "$SLICES_TEST_FILE" A B)"
+  FAILS_A="$(slices_get_fails "$STATE" A)"
+  [[ "$FAILS_A" == "0" ]] \
+    && ok "reconcile zero-inits a brand-new id" \
+    || note "expected A to start at fails=0, got '$FAILS_A'"
+
+  STATE="$(slices_record_fail "$STATE" A)"
+  STATE="$(slices_record_fail "$STATE" A)"
+  FAILS_A="$(slices_get_fails "$STATE" A)"
+  [[ "$FAILS_A" == "2" ]] \
+    && ok "slices_record_fail increments that id's counter (2 calls -> 2)" \
+    || note "expected A to be at fails=2 after two record_fail calls, got '$FAILS_A'"
+
+  slices_write "$SLICES_TEST_FILE" "$STATE"
+  STATE="$(slices_reconcile "$SLICES_TEST_FILE" A B)"
+  FAILS_A="$(slices_get_fails "$STATE" A)"
+  [[ "$FAILS_A" == "2" ]] \
+    && ok "a re-read/reconcile against the same ids preserves the counter (no reset)" \
+    || note "reconcile against unchanged ids reset A's fails to '$FAILS_A', want 2 preserved"
+
+  # -- reconcile: an id no longer passed in (ticked, or dropped by a replan) -
+  #    retires silently, even though it was never explicitly retired --------
+  STATE="$(slices_reconcile "$SLICES_TEST_FILE" A)"
+  HAS_B="$(printf '%s' "$STATE" | jq -r '.slices | has("B")' 2>/dev/null)"
+  [[ "$HAS_B" == "false" ]] \
+    && ok "reconcile drops an id that's no longer passed in (ticked/removed)" \
+    || note "B should have been dropped by reconcile, still present: $STATE"
+
+  # -- park: fails>=3 in loop.sh's own ladder, but slices_park() itself is ---
+  #    a plain setter, exercised directly here -------------------------------
+  STATE="$(slices_park "$STATE" A)"
+  [[ "$(slices_parked_csv "$STATE")" == "A" ]] \
+    && ok "slices_park marks the id parked; slices_parked_csv reflects it" \
+    || note "expected parked_csv 'A', got '$(slices_parked_csv "$STATE")'"
+  [[ "$(slices_parked_count "$STATE")" == "1" ]] \
+    && ok "slices_parked_count counts exactly the parked ids (1)" \
+    || note "expected parked_count 1, got '$(slices_parked_count "$STATE")'"
+
+  # -- retire: an explicit removal, independent of reconcile -----------------
+  STATE="$(slices_retire "$STATE" A)"
+  [[ "$(slices_get_fails "$STATE" A)" == "0" ]] \
+    && ok "slices_retire removes the record outright (a fresh read for A is 0)" \
+    || note "expected A's record gone after retire, still shows fails=$(slices_get_fails "$STATE" A)"
+
+  # -- clear: the whole file is gone, exactly what a rung-4 replan needs -----
+  slices_write "$SLICES_TEST_FILE" "$(slices_reconcile "$SLICES_TEST_FILE" A B C)"
+  [[ -f "$SLICES_TEST_FILE" ]] \
+    && ok "sanity: slices.json exists before slices_clear" \
+    || note "setup for the clear test failed to write $SLICES_TEST_FILE"
+  slices_clear "$SLICES_TEST_FILE"
+  [[ ! -f "$SLICES_TEST_FILE" ]] \
+    && ok "slices_clear removes the file entirely (a replan unparks everything)" \
+    || note "slices.json still exists after slices_clear"
+
+  # -- a corrupt file degrades to empty state, never crashes -----------------
+  printf 'not json' > "$SLICES_TEST_FILE"
+  GOT="$(slices_read "$SLICES_TEST_FILE")"
+  [[ "$(printf '%s' "$GOT" | jq -r '.slices')" == "{}" ]] \
+    && ok "a corrupt slices.json degrades to empty state instead of erroring" \
+    || note "corrupt slices.json produced '$GOT', want empty .slices"
+else
+  note "skills/autopilot/slices.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
 section "code-map renders repo-map"
 CODE_MAP_SKILL="skills/code-map/SKILL.md"
 if [[ -f "$CODE_MAP_SKILL" ]]; then

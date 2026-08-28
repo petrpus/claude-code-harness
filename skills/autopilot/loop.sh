@@ -43,6 +43,9 @@ MEMORY_FILE="$STATE_DIR/MEMORY.md"
 FEEDBACK_FILE="$STATE_DIR/FEEDBACK.md"
 STATUS_FILE="$STATE_DIR/status.json"
 LOCK_FILE="$STATE_DIR/lock"
+# S4A: runner-owned per-slice ladder state — written and read only by
+# loop.sh, never named in any prompt (skills/autopilot/slices.sh).
+SLICES_FILE="$STATE_DIR/slices.json"
 
 # Defaults (all overridable).
 MAX_ITERATIONS=10
@@ -127,18 +130,22 @@ fi
 # unit-testable without a run (scripts/verify.sh exercises it directly).
 # shellcheck source=plan.sh
 . "$SCRIPT_DIR/plan.sh"
+# S4A: per-slice retry/park ladder state (tmp/autopilot/slices.json) — own
+# file, same reasoning as plan.sh/allowlist.sh.
+# shellcheck source=slices.sh
+. "$SCRIPT_DIR/slices.sh"
 
 # R1: bash parses this script's function bodies once, at startup — a slice
-# whose job is to fix loop.sh/plan.sh/allowlist.sh therefore never changes the
-# behaviour of the very process running it, only the next run a human starts
-# by hand. runner_files_hash() lets each iteration notice its own sourced
-# files changed on disk since startup and re-exec itself (see the check at
-# the top of the main loop) so the fix applies within the same run. Hashing
-# content (not mtime) means an edit that doesn't change the bytes — or a
-# clock skew — never triggers a spurious reload.
+# whose job is to fix loop.sh/plan.sh/allowlist.sh/slices.sh therefore never
+# changes the behaviour of the very process running it, only the next run a
+# human starts by hand. runner_files_hash() lets each iteration notice its own
+# sourced files changed on disk since startup and re-exec itself (see the
+# check at the top of the main loop) so the fix applies within the same run.
+# Hashing content (not mtime) means an edit that doesn't change the bytes — or
+# a clock skew — never triggers a spurious reload.
 runner_files_hash() {
   local f
-  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh"; do
+  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh" "$SCRIPT_DIR/slices.sh"; do
       [[ -f "$f" ]] && cat "$f"
     done
   } | cksum
@@ -178,7 +185,7 @@ mkdir -p "$STATE_DIR"
 
 # Run identity: fresh, resumed (--resume-run — a human restarting a killed or
 # stopped process), or reloaded (R1 — this exact process re-exec'ing itself
-# after a slice edited loop.sh/plan.sh/allowlist.sh; the AUTOPILOT_* vars are
+# after a slice edited loop.sh/plan.sh/allowlist.sh/slices.sh; the AUTOPILOT_* vars are
 # its own handoff to itself, set right before the exec at the top of the main
 # loop below). A reload always wins when both are present, since it also
 # appends --resume-run to argv.
@@ -246,9 +253,11 @@ logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_fai
 #               <parked_count> <escalated> <repo_map>
 #   S3A: one summary row per ITERATION (as opposed to logline()'s one row per
 #   `claude -p` CALL) — the fields a run-level report (S3B, /usage-report)
-#   needs without re-deriving them from the per-call rows. parked_count and
-#   escalated are logged 0/false until S4A/S4B implement parking/escalation,
-#   so the schema doesn't change again when they do (PRD § S3A). repo_map
+#   needs without re-deriving them from the per-call rows. parked_count (S4A)
+#   is the number of ids slices.json marks parked at this iteration's
+#   selection time — real as of S4A. escalated is logged false until S4B
+#   implements escalation, so the schema doesn't change again when it lands
+#   (PRD § S3A). repo_map
 #   (S5) is whether this iteration's BUILD prompt actually carried a repo-map
 #   digest — false both when --no-repo-map was given and when the digest
 #   generator failed/produced nothing, so the field answers "did BUILD see
@@ -334,8 +343,18 @@ holdout_notice_once() {
   HOLDOUT_NOTICE_SHOWN=1
 }
 
-# Stuck detection: same gate-failure fingerprint twice → one replan; third → abort.
+# Stuck detection. Two mechanisms coexist:
+#  - LAST_FP/REPEAT: the pre-S4A fingerprint-repetition ladder, kept as the
+#    fallback for iterations where no slice id was selected (an id-less or
+#    otherwise unmeasurable plan line) — see the FAILURE branch below.
+#  - PARK_REPLAN_DONE (S4A): the fifth rung. Rung 4's replan (every remaining
+#    candidate parked or blocked by one) is a ONE-TIME reprieve per stuck
+#    episode; once it has fired, the next failure of any kind aborts rather
+#    than replanning again — "the run fails again after a replan" (ADR-0005
+#    decision 6 / PRD § S4). Reset to 0 whenever the run makes real progress,
+#    so a later, unrelated slice getting stuck still gets its own one replan.
 LAST_FP=""; REPEAT=0
+PARK_REPLAN_DONE=0
 
 # Progress is measured from the plan's checkboxes, not claimed by the model.
 # BUILD is told to do exactly ONE item per iteration, so on any plan longer than
@@ -578,7 +597,7 @@ while :; do
   # iteration — the new process computes its own baseline hash at startup, so
   # an unchanged file can never spin.
   if [[ "$(runner_files_hash)" != "$STARTUP_RUNNER_HASH" ]]; then
-    log_err "loop.sh/plan.sh/allowlist.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
+    log_err "loop.sh/plan.sh/allowlist.sh/slices.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
     logline "runner_reload" "-" 0 0 0 0 0 "reload"
     write_status "reloading"
     AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
@@ -607,12 +626,35 @@ while :; do
   TICKED_BEFORE="$(count_ticked)"
   TOTAL_BOXES="$(count_boxes)"
 
-  # Select the next slice from the Plan DAG (docs/adr/0005-*.md). Parked ids
-  # land with S4A's tmp/autopilot/slices.json; until then every call passes
-  # none, which is exactly 0.4.0 behaviour: select_next_slice() degrades to
-  # "first unchecked box" on a plan with no after: annotations.
+  # S4A: reconcile the per-slice ladder state against the CURRENT plan before
+  # selecting — an id the plan no longer has, OR one that's now ticked,
+  # retires silently (a ticked slice needs no more retry tracking, and this
+  # is what makes "ticking a slice retires its record" durable rather than a
+  # one-iteration effect the very next reconcile would undo); a new unticked
+  # id starts at zero fails; parked ids feed select_next_slice() so it skips
+  # them for a sibling instead. Missing/corrupt file reconciles to "nothing
+  # has failed yet" (contract item 8), never an error. plan_load() here is a
+  # direct (non-subshell) parse so its PLAN_IDS[]/PLAN_ROW_TICKED[] reach
+  # slices_reconcile(); select_next_slice() below re-parses its own copy
+  # inside its own `$(...)` subshell, same duplication DAG_WIDTH already
+  # lived with pre-S4A.
+  plan_load "$PLAN_FILE"
+  UNTICKED_IDS=()
+  for (( _i=0; _i<${#PLAN_IDS[@]}; _i++ )); do
+    [[ "${PLAN_ROW_TICKED[$_i]}" == "1" ]] && continue
+    UNTICKED_IDS+=("${PLAN_IDS[$_i]}")
+  done
+  SLICES_STATE="$(slices_reconcile "$SLICES_FILE" "${UNTICKED_IDS[@]}")"
+  slices_write "$SLICES_FILE" "$SLICES_STATE"
+  PARKED_CSV="$(slices_parked_csv "$SLICES_STATE")"
+  PARKED_COUNT="$(slices_parked_count "$SLICES_STATE")"
+
+  # Select the next slice from the Plan DAG (docs/adr/0005-*.md), skipping any
+  # id S4A's ladder has parked. On a plan with no after: annotations and
+  # nothing parked, this still degrades to "first unchecked box" — 0.4.0
+  # behaviour, unchanged.
   SELECTED_ID=""; SELECTED_LINE=""
-  SELECT_OUT="$(select_next_slice "$PLAN_FILE")"; SELECT_RC=$?
+  SELECT_OUT="$(select_next_slice "$PLAN_FILE" "$PARKED_CSV")"; SELECT_RC=$?
   case "$SELECT_RC" in
     0)
       SELECTED_ID="$SELECT_OUT"
@@ -621,24 +663,39 @@ while :; do
     2)
       # Plan-dependency failure (cycle, or after: names an unknown id) — a
       # plan bug, not a build bug. Straight to replan, bypassing the stuck
-      # ladder entirely rather than waiting for it to repeat.
+      # ladder entirely rather than waiting for it to repeat. A replan
+      # invalidates every per-slice count (the plan itself is about to
+      # change), so the ladder state is cleared too — but this does NOT
+      # count as rung 4's one park-exhaustion replan; PARK_REPLAN_DONE is
+      # untouched, since a DAG bug has nothing to do with a slice flailing.
       FAIL_REASON="plan dependency failure: $SELECT_OUT"
       log_err "gate failed [plan_dag]: $FAIL_REASON — replanning immediately (bypasses the stuck ladder)."
       : > "$FEEDBACK_FILE"; append_feedback "plan_dag" "$FAIL_REASON"
+      slices_clear "$SLICES_FILE"
       run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
         "$(replan_prompt "$FAIL_REASON")" >/dev/null
       LAST_FP=""; REPEAT=0
       continue
       ;;
     3)
-      # Every remaining candidate is parked, or blocked by one — replan, which
-      # also unparks everything (S4A). Unreachable until then: with no caller
-      # ever passing parked ids, select_next_slice() can't return 3 yet.
+      # Rung 4: every remaining candidate is parked, or blocked by one — the
+      # first time this happens this run, replan once and unpark everything
+      # (slices_clear). If it happens AGAIN after that one replan, parking
+      # has already been given its one chance to make room and failed to —
+      # that is rung 5, "the run fails again after a replan": abort rather
+      # than replan forever.
       FAIL_REASON="every remaining slice is parked or blocked by a parked slice"
-      log_err "gate failed [plan_parked]: $FAIL_REASON — replanning immediately (bypasses the stuck ladder)."
+      if [[ "$PARK_REPLAN_DONE" -eq 1 ]]; then
+        log_err "gate failed [plan_parked]: $FAIL_REASON — already spent rung 4's replan; aborting (rung 5)."
+        : > "$FEEDBACK_FILE"; append_feedback "plan_parked" "$FAIL_REASON"
+        write_status "stuck"; exit 4
+      fi
+      log_err "gate failed [plan_parked]: $FAIL_REASON — replanning once and unparking everything (rung 4)."
       : > "$FEEDBACK_FILE"; append_feedback "plan_parked" "$FAIL_REASON"
+      slices_clear "$SLICES_FILE"
       run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
         "$(replan_prompt "$FAIL_REASON")" >/dev/null
+      PARK_REPLAN_DONE=1
       LAST_FP=""; REPEAT=0
       continue
       ;;
@@ -653,12 +710,10 @@ while :; do
   # actually choosable at selection time (not just which one got picked).
   # select_next_slice() above ran inside a `$(...)` command substitution, so
   # the PLAN_* globals its own plan_load() populated were a subshell's copy
-  # and never reached this process — re-parse the (unchanged) plan file
-  # directly, not via a subshell, so plan_dag_width() has something to read.
-  # Parked ids land with S4A; until then this is always evaluated against
-  # none parked.
-  plan_load "$PLAN_FILE"
-  DAG_WIDTH="$(plan_dag_width "")"
+  # and never reached this process — the direct plan_load() call above (for
+  # slices_reconcile()) already re-parsed the same unchanged file, so
+  # plan_dag_width() has something to read without a third parse.
+  DAG_WIDTH="$(plan_dag_width "$PARKED_CSV")"
 
   # S5 (ADR-0004 item 7): a compact repo-map digest for BUILD only — never for
   # PLAN or the verifier (see skills/repo-map/digest.sh's header for why).
@@ -787,9 +842,13 @@ while :; do
 
   if [[ -z "$FAIL_REASON" && "$PLAN_DONE" -eq 1 ]]; then
     # SUCCESS — plan complete and every gate green.
+    if [[ -n "$SELECTED_ID" && "$TICKED_AFTER" -gt "$TICKED_BEFORE" ]]; then
+      SLICES_STATE="$(slices_retire "$SLICES_STATE" "$SELECTED_ID")"
+      slices_write "$SLICES_FILE" "$SLICES_STATE"
+    fi
     git add -A && git commit -q -m "autopilot: iteration $ITER (green)" 2>/dev/null || true
     log_iteration "done" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
     log_err "✅ all gates green at iteration $ITER — run complete."
     : > "$FEEDBACK_FILE"
     write_status "done"
@@ -803,7 +862,7 @@ while :; do
     log_err "plan has no checkboxes — progress can't be measured; relying on the caps."
     git add -A && git commit -q -m "autopilot: iteration $ITER (unmeasured)" 2>/dev/null || true
     log_iteration "unmeasured" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
     : > "$FEEDBACK_FILE"
     continue
   fi
@@ -811,12 +870,18 @@ while :; do
   if [[ -z "$FAIL_REASON" && "$TICKED_AFTER" -gt "$TICKED_BEFORE" ]]; then
     # PROGRESS — an incomplete plan that moved forward with every gate green is
     # exactly what a slice-by-slice run looks like. Not a failure.
+    # S4A: the slice that just landed retires its ladder record — a future
+    # id reuse (which shouldn't happen on an annotated plan) starts fresh.
+    if [[ -n "$SELECTED_ID" ]]; then
+      SLICES_STATE="$(slices_retire "$SLICES_STATE" "$SELECTED_ID")"
+      slices_write "$SLICES_FILE" "$SLICES_STATE"
+    fi
     git add -A && git commit -q -m "autopilot: iteration $ITER (progress: $TICKED_BEFORE→$TICKED_AFTER of $TOTAL_BOXES)" 2>/dev/null || true
     log_iteration "progressed" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
-    LAST_FP=""; REPEAT=0
+    LAST_FP=""; REPEAT=0; PARK_REPLAN_DONE=0
     continue
   fi
 
@@ -828,26 +893,56 @@ while :; do
     GATE_FAILED="$FP"
   fi
 
-  # FAILURE — feed back, reset sentinel, checkpoint WIP, maybe replan.
+  # FAILURE — feed back, reset sentinel, checkpoint WIP, then rung 1/3/4/5 of
+  # the stuck ladder (ADR-0005 decision 6 / PRD § S4).
   log_err "gate failed [$FP]: $FAIL_REASON"
   : > "$FEEDBACK_FILE"; append_feedback "$FP" "$FAIL_REASON"
   sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$PLAN_FILE" 2>/dev/null && rm -f "$PLAN_FILE.bak"
   git add -A && git commit -q -m "autopilot: iteration $ITER (wip, gate=$FP)" 2>/dev/null || true
   log_iteration "fail" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
+    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
 
-  # Stuck detection.
-  if [[ "$FP" == "$LAST_FP" ]]; then
-    REPEAT=$(( REPEAT + 1 ))
+  # Rung 5: a failure of ANY kind that arrives after rung 4's one
+  # park-exhaustion replan is "the run fails again after a replan" — that
+  # replan was the one reprieve parking earns, and it did not resolve
+  # things. Abort unconditionally rather than run the per-slice ladder again.
+  if [[ "$PARK_REPLAN_DONE" -eq 1 ]]; then
+    log_err "stuck on '$FP' — failed again after the park-exhaustion replan — aborting."
+    write_status "stuck"; exit 4
+  fi
+
+  if [[ -n "$SELECTED_ID" ]]; then
+    # S4A: the per-slice ladder. Rung 1 (fails once) and what would be rung 2
+    # (fails twice — escalation lands in S4B; until then it is just another
+    # retry) both fall through to "try the same slice again next iteration,"
+    # which needs no code here. Rung 3 parks the slice once its OWN failure
+    # count reaches 3, regardless of which gate fingerprint each of the three
+    # failures carried — a slice flailing across three different gates is
+    # exactly as stuck as one failing the same gate three times.
+    SLICES_STATE="$(slices_record_fail "$SLICES_STATE" "$SELECTED_ID")"
+    SLICE_FAILS="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
+    if [[ "$SLICE_FAILS" -ge 3 ]]; then
+      log_err "slice '$SELECTED_ID' failed ${SLICE_FAILS}× — parking it; the runner tries a sibling next."
+      SLICES_STATE="$(slices_park "$SLICES_STATE" "$SELECTED_ID")"
+    fi
+    slices_write "$SLICES_FILE" "$SLICES_STATE"
   else
-    REPEAT=0; LAST_FP="$FP"
-  fi
-  if [[ "$REPEAT" -ge 2 ]]; then
-    log_err "stuck on '$FP' 3× — aborting."; write_status "stuck"; exit 4
-  fi
-  if [[ "$REPEAT" -eq 1 ]]; then
-    log_err "same failure twice — one REPLAN pass with $PLAN_MODEL."
-    run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
-      "$(replan_prompt "repeated failure ($FP): $FAIL_REASON")" >/dev/null
+    # No slice was selected this iteration (an id-less or otherwise
+    # unmeasurable plan line) — there is no id to key per-slice state off
+    # of, so fall back to the pre-S4A fingerprint-repetition ladder exactly:
+    # same failure twice → one replan, third time → abort.
+    if [[ "$FP" == "$LAST_FP" ]]; then
+      REPEAT=$(( REPEAT + 1 ))
+    else
+      REPEAT=0; LAST_FP="$FP"
+    fi
+    if [[ "$REPEAT" -ge 2 ]]; then
+      log_err "stuck on '$FP' 3× — aborting."; write_status "stuck"; exit 4
+    fi
+    if [[ "$REPEAT" -eq 1 ]]; then
+      log_err "same failure twice — one REPLAN pass with $PLAN_MODEL."
+      run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
+        "$(replan_prompt "repeated failure ($FP): $FAIL_REASON")" >/dev/null
+    fi
   fi
 done

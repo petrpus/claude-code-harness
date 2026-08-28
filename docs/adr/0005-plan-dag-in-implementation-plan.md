@@ -99,3 +99,42 @@ stuck ladder's normal two-strikes rule.
 A plan written without ids or `after:` clauses pays no tax: `select_next_slice()`
 walks it exactly as "first unchecked box," so every 0.4.0-era
 `tmp/autopilot/` directory keeps working unmodified.
+
+## Update (S4A) — the per-slice ladder state lands
+
+Decision 6 above sketched the shape; this slice implements it. Notes worth
+recording that weren't decidable until the code existed:
+
+- **State is a plain jq-manipulated JSON blob, not a bash associative array**
+  (`skills/autopilot/slices.sh`), unlike `plan.sh`'s own hand-rolled parser.
+  The state's shape is trivial (an object keyed by id, three scalar fields
+  each) and every operation on it — reconcile, record a failure, park,
+  retire, read a count back out — is a one-line `jq` filter; hand-parsing it
+  in bash would only add a second, slower implementation of what `jq`
+  already does correctly. `plan.sh` earns its own parser because Markdown
+  checkbox syntax isn't JSON; `slices.sh`'s file already is.
+- **Reconciliation keys on UNTICKED ids only**, not every id in the plan.
+  Passing every id (ticked or not) into the reconcile step would zero-init a
+  just-ticked slice's record right back into existence on the very next
+  iteration, undoing "ticking a slice retires its record" one iteration
+  later. `loop.sh` filters `PLAN_IDS[]` by `PLAN_ROW_TICKED[]` before calling
+  `slices_reconcile()`, so a ticked id simply stops appearing in the set the
+  state is reconciled against and drops out for good.
+- **Rung 4's "one replan" is tracked by an in-process flag
+  (`PARK_REPLAN_DONE`), not written to `slices.json`.** It answers "has this
+  *process* already spent its one park-exhaustion reprieve," which is a
+  question about the run's control flow, not about any slice's retry count —
+  putting it in the state file would conflate the two and complicate
+  reconciliation for no benefit. It is deliberately NOT threaded through the
+  R1 reload / `--resume-run` env handoff the way `RUN_ID`/`ITER`/`TOTAL_COST`
+  are: a fresh process (whether a manual `--resume-run` or an R1 self-reload)
+  earns its own fresh chance at rung 4, on the theory that a human or a
+  runner-code fix intervening is itself a reason to give the stuck episode
+  one more look rather than treat it as already spent.
+- **A plan whose selected line carries no real id** (the degenerate case
+  `select_next_slice()` never selects anything for) falls back to the
+  pre-S4A fingerprint-repetition ladder verbatim, rather than trying to key
+  per-slice state on an empty string. In practice this is rare — the id is
+  just the first token after the checkbox, so almost any real checklist line
+  produces *something* — but it is the honest fallback for the one case
+  where no id exists to track.
