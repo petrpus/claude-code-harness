@@ -12,6 +12,7 @@ skeptical cheap model run many times than by one expensive pass.
 | **cheap** | `haiku` | Verification, adversarial gates, mechanical/greppable checks, lint triage, log parsing, secret-scans, classification. High volume, low judgement. |
 | **mid** | `sonnet` | Implementation, code review, refactoring, most day-to-day agent work. The default working tier. |
 | **top** | `opus` | Planning, architecture, decomposition (PRD → plan), domain modeling, grilling, resolving genuinely hard trade-offs. Low volume, high judgement. |
+| **escalation** | `--escalate-model` (default `opus`) | Rung 2 of autopilot's stuck ladder (S4B) — a slice's *next* BUILD attempt only, after it has failed twice on `--build-model`; the slice returns to `--build-model` once it ticks. `none` disables escalation outright. Never applied to the verifier — the cheap adversarial tier is the point. |
 
 `fable` is available as a fast planning-tier model where latency matters more
 than depth; treat it as an alternative top-tier for planning, not for
@@ -24,8 +25,11 @@ implementation.
   - `agents/code-reviewer.md` → `model: sonnet` (mid; prevents an opus-priced
     review when the main session runs opus).
 - **autopilot** (`skills/autopilot/loop.sh`) defaults: `--plan-model opus`,
-  `--build-model sonnet`, `--verify-model haiku`. Every phase is overridable per
-  run.
+  `--build-model sonnet`, `--verify-model haiku`, `--escalate-model opus`.
+  Every phase is overridable per run. Escalation counts against the same
+  `--budget-usd` as everything else — no separate ceiling — but a single
+  escalated call costing more than 25% of what's left logs a warning, since
+  an escalation that's burning the budget fast is worth a human noticing.
 - **Subagent fanout** (`cost-discipline`): fan work out to the cheapest tier
   that fits; pin the model explicitly so a fanned-out fleet doesn't inherit an
   expensive main-session model.

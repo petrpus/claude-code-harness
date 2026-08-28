@@ -138,3 +138,48 @@ recording that weren't decidable until the code existed:
   just the first token after the checkbox, so almost any real checklist line
   produces *something* — but it is the honest fallback for the one case
   where no id exists to track.
+
+## Update (S4B) — rung 2, escalation
+
+Decision 6 sketched a four-step ladder (retry → escalate → park → replan →
+abort — five words, four transitions); this slice fills in the "escalate"
+step S4A deliberately left as "just retry again."
+
+- **The escalation decision reads `slices.json`'s `fails` counter BEFORE this
+  iteration's own attempt**, the same reconciled state `select_next_slice()`
+  and the park check already read this iteration. `fails >= 2` means the
+  slice has already failed twice; this one BUILD call runs on
+  `--escalate-model` instead of `--build-model`. There is no separate
+  "de-escalate" transition — `slices_retire()` (on a tick) or
+  `slices_clear()` (on a replan) already remove the record that made the
+  slice eligible, so the very next BUILD call for it, or for any other
+  slice, is back on `--build-model` simply because there is nothing left to
+  read `fails >= 2` from.
+- **`--escalate-model none` is a first-class value, not an error.** It skips
+  the escalation check entirely, which degrades rung 2 to exactly what S4A
+  shipped — "just retry again" — verbatim. This was the deciding reason not
+  to make escalation mandatory: a run against a project with no meaningfully
+  stronger model available (or one where the cost of an escalation is judged
+  not worth it) should be able to opt out without losing the rest of the
+  ladder.
+- **The cost guard warns; it does not cap.** A hard per-escalation ceiling
+  was considered and rejected — it would just convert "the slice never gets
+  rescued" into "the run aborts mid-rescue," which is worse: the whole point
+  of rung 2 is to spend more to fix what rung 1 couldn't. Escalation is
+  already bounded by the run's own `--budget-usd`, the same ceiling every
+  other call answers to. The 25%-of-remaining-budget threshold is a
+  judgement call, not a derived number: cheap enough to fire on a run that's
+  actually being eaten by escalations, loose enough not to fire on a single
+  ordinary-priced call late in a small budget.
+- **Escalation never touches the verifier.** `--verify-model` is read once at
+  startup and never reassigned; only the BUILD call's model argument is
+  computed per iteration. This follows directly from `docs/model-policy.md`'s
+  rule of thumb — the adversarial gate's value comes from being cheap and run
+  often, not from being smart, and escalating it would blur exactly the
+  build/verify asymmetry the tiering exists to preserve.
+- **Escalation does not reset stuck detection.** An escalated call that still
+  fails increments the same per-slice `fails` counter as any other failure —
+  there is no separate "gave it the strong model and it still couldn't"
+  state. A slice opus can't rescue still parks on its 3rd failure exactly
+  like one sonnet couldn't rescue; escalation changes which model gets an
+  attempt, never whether that attempt's outcome counts toward the ladder.

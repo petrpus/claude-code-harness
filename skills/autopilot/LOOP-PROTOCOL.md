@@ -67,7 +67,7 @@ loop:
     └─ picks the one unblocked, unparked slice to build this iteration
     └─ broken DAG (cycle / unknown after: id) → Plan-dependency failure,
        fingerprint plan_dag, straight to replan — bypasses the ladder below
-  BUILD                    sonnet   acceptEdits + explicit --allowedTools
+  BUILD           sonnet (or --escalate-model on rung 2)   acceptEdits + explicit --allowedTools
     └─ exactly the selected plan item, TDD (red-green-refactor), ADR if
        architectural, run verify, tick box, append MEMORY, set STATUS
   GATE b  machine verify   runner    executes the verify command itself
@@ -172,7 +172,7 @@ item 8), never an error — a 0.4.0-era `tmp/autopilot/` still loads.
 | rung | trigger | action |
 |---|---|---|
 | 1 | a slice fails once | retry the same slice on `--build-model` |
-| 2 | a slice fails twice | **escalate** — S4B, not yet implemented; S4A just retries again |
+| 2 | a slice fails twice | **escalate** (S4B) — the slice's *next* BUILD call runs on `--escalate-model` (default `opus`); `none` disables this rung, which just falls through to another `--build-model` retry, S4A's own pre-S4B behaviour exactly |
 | 3 | a slice fails three times | **park** it (`select_next_slice()` skips it for a sibling) |
 | 4 | every remaining candidate is parked or blocked by one | **replan** once, unparking everything (`slices_clear()`) |
 | 5 | the run fails again after that replan | **abort** (exit 4) |
@@ -196,6 +196,39 @@ per-slice state on.
 
 `parked_count` (S3A's log field) is real as of S4A: the number of ids
 `slices.json` marks parked at that iteration's selection time.
+
+### Escalation (S4B, `docs/adr/0005-*.md` decision 6 update)
+
+Rung 2 of the ladder above: before each BUILD call, the runner reads the
+selected slice's `fails` counter from the (already reconciled) `slices.json`
+state — NOT the count as of after this iteration's own outcome, the count
+carried in from prior iterations. `fails >= 2` and `--escalate-model` isn't
+`none` means this one BUILD call runs on the escalate model (default `opus`)
+instead of `--build-model`; the very next BUILD call for a *different* slice,
+or for this same slice once it ticks and `slices_retire()` drops its record,
+is back on `--build-model` — there is no separate "de-escalate" step, only
+the absence of a `fails >= 2` record to escalate against.
+
+Escalation is **never applied to the verifier** — `--verify-model` is
+untouched regardless of what BUILD ran on; the cheap adversarial tier is the
+whole point of gate (d) (`docs/model-policy.md`). It also **does not reset
+stuck detection**: an escalated call that still fails counts toward the same
+per-slice `fails` counter as any other failure, so a slice opus can't rescue
+either still parks on its 3rd failure — escalation only changes which model
+gets the *attempt*, not whether that attempt's outcome counts.
+
+**Cost guard.** Escalation counts against `--budget-usd` like any other call
+— there is no separate ceiling, since a hard cap here would just move the
+failure from "the slice never gets rescued" to "the run aborts mid-rescue"
+without fixing anything. It only warns: if a single escalated call's own cost
+exceeds 25% of what was left in the budget at the moment it started, the
+runner logs a warning so a human skimming the log notices an escalation
+that's burning the budget fast.
+
+`escalated` (S3A's log field, `false` until this slice) is `true` only for
+the one iteration whose BUILD call actually ran on `--escalate-model` — not
+merely "the flag was set" or "this slice is eligible." The per-call `build`
+row's own `model` field is the one that shows the escalate model's name.
 
 ### Repo-map digest (S5, ADR-0004 item 7)
 
@@ -374,9 +407,12 @@ ladder tracked for that iteration, or `"none"` when every gate passed —
 before BUILD ever runs) and so never reach this row. `dag_width` is how many
 unchecked, unblocked, unparked slices `select_next_slice()` could have picked
 from, not just the one it did — a chain reads `1` every iteration, a wide plan
-reads higher. `parked_count` and `escalated` are logged `0`/`false` until
-S4A/S4B implement parking and escalation, so the schema doesn't change again
-when they land. `repo_map` (S5) is whether BUILD's prompt actually carried a
+reads higher. `parked_count` (real as of S4A) is the number of ids
+`slices.json` marked parked at that iteration's selection time. `escalated`
+(real as of S4B) is `true` only for the one iteration whose BUILD call
+actually ran on `--escalate-model` (§ Escalation above) — `false` on every
+other iteration, including one where the slice was *eligible* to escalate
+but `--escalate-model none` disabled it. `repo_map` (S5) is whether BUILD's prompt actually carried a
 repo-map digest that iteration — `false` both under `--no-repo-map` and when
 the digest generator produced nothing (missing `jq`/`awk`, an ungeneratable
 map), so it answers "did BUILD see one," not "was the flag on."

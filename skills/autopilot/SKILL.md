@@ -49,8 +49,9 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
      --max-iterations 10 --max-minutes 120 --budget-usd 10
    ```
 
-   Defaults: plan=opus, build=sonnet, verify=haiku (override with
-   `--plan-model` / `--build-model` / `--verify-model`). `--dry-run` prints the
+   Defaults: plan=opus, build=sonnet, verify=haiku, escalate=opus (override with
+   `--plan-model` / `--build-model` / `--verify-model` / `--escalate-model`,
+   the last accepting `none` to disable escalation outright). `--dry-run` prints the
    plan of calls without spending. `--resume-run` continues an interrupted run,
    adopting its prior run id, iteration count and accumulated cost from disk
    (R1) instead of starting over at iteration 0 / cost 0. `--holdout <path>`
@@ -91,8 +92,10 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 Any failure appends to `FEEDBACK.md`, resets the sentinel, checkpoints WIP, and
 feeds the next iteration. A holdout failure is fingerprinted `holdout`, distinct
 from a generic semantic-verify failure (`verify_agent`), so stuck detection can
-tell them apart. Stuck detection is the five-rung ladder (S4A, `slices.sh`,
-`docs/adr/0005-*.md`): a slice retries on its 1st failure, is parked on its
+tell them apart. Stuck detection is the five-rung ladder (S4A/S4B, `slices.sh`,
+`docs/adr/0005-*.md`): a slice retries on its 1st failure, runs its next BUILD
+on `--escalate-model` after its 2nd (back to `--build-model` once it ticks;
+`--escalate-model none` skips straight to another retry), is parked on its
 3rd (a sibling runs instead), and once every remaining slice is parked or
 blocked a single replan unparks everything — a second failure after that
 replan aborts. A plan with no real slice ids falls back to the pre-S4A rule

@@ -61,7 +61,20 @@ cat > "$STUB_DIR/claude" <<'STUB'
 [[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
 prompt="$*"
 plan="tmp/autopilot/IMPLEMENTATION_PLAN.md"
-emit() { printf '{"result":%s,"total_cost_usd":%s,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1" "${STUB_COST_PER_CALL:-0}"; }
+# S4B: a call's own `--model <name>` token is right there in `$*` (loop.sh
+# passes it as a separate argv word, and prompt="$*" joins everything with
+# spaces) — cheap enough to grep for rather than threading a new stub arg
+# through every call site. STUB_ESCALATE_COST lets one test give only the
+# escalated call an elevated cost, to exercise the 25%-of-remaining-budget
+# warning without inflating every other call's cost too.
+emit() { # result
+  local cost="${STUB_COST_PER_CALL:-0}"
+  if [[ -n "${STUB_ESCALATE_COST:-}" ]] \
+     && printf '%s' "$prompt" | grep -q -- "--model ${STUB_ESCALATE_MODEL_NAME:-opus}"; then
+    cost="$STUB_ESCALATE_COST"
+  fi
+  printf '{"result":%s,"total_cost_usd":%s,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1" "$cost"
+}
 
 case "$prompt" in
   *"PLAN phase"*|*"autonomous run is stuck"*)
@@ -113,7 +126,15 @@ case "$prompt" in
       # a genuine "no progress" per-slice failure so the ladder (retry →
       # park) has something real to count for that one id while its siblings
       # complete normally.
-      if [[ -n "${STUB_FAIL_ID:-}" && "$sel_id" == "$STUB_FAIL_ID" ]]; then
+      # S4B: STUB_ESCALATE_ID names an id that fails on whatever model it's
+      # FIRST tried on and only ticks once the prompt shows the escalate
+      # model was actually used (`--model <name>` in $*) — simulates a slice
+      # genuinely rescued by a stronger model rather than one that just
+      # happens to succeed on a later attempt regardless of model.
+      if [[ -n "${STUB_ESCALATE_ID:-}" && "$sel_id" == "$STUB_ESCALATE_ID" ]] \
+         && ! printf '%s' "$prompt" | grep -q -- "--model ${STUB_ESCALATE_MODEL_NAME:-opus}"; then
+        :
+      elif [[ -n "${STUB_FAIL_ID:-}" && "$sel_id" == "$STUB_FAIL_ID" ]]; then
         :
       elif [[ -n "$sel_id" ]]; then
         awk -v id="$sel_id" 'BEGIN{done=0} { if (!done && $0 ~ ("^- \\[ \\] " id "([[:space:]]|$)")) { sub(/^- \[ \]/, "- [x]"); done=1 } print }' \
@@ -637,7 +658,7 @@ got="$(iter_field_type "gate_failed")"
 
 got="$(iter_field_type "escalated")"
 [[ "$got" == "boolean," ]] \
-  && ok "iteration rows carry a boolean 'escalated' (false until S4B)" \
+  && ok "iteration rows carry a boolean 'escalated' (false here — this fixture never fails, so nothing escalates; see test 20 for a true case)" \
   || note "iteration rows' 'escalated' type(s): '$got', want 'boolean,'"
 
 SLICE_SEQ_16="$(cat "$R16"/tmp/autopilot/run-*.jsonl 2>/dev/null \
@@ -816,6 +837,83 @@ ITER_COUNT_19="$(cat "$R19"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'selec
 [[ "${ITER_COUNT_19:-0}" -eq 3 ]] \
   && ok "the pre-seeded fails=2 was honoured (parked after 1 more failure, abort at iteration 3)" \
   || note "run took ${ITER_COUNT_19:-0} iterations to abort, want exactly 3 (fails counter looks reset on resume)"
+
+# --- 20. S4B: two failed BUILDs then an escalated third that passes --------
+# (a) from the plan's own loop-test list. A gets flaky-then-rescued: it fails
+# on --build-model (default sonnet — the escalate threshold is fails>=2, so
+# the first two attempts run un-escalated) and only ticks once rung 2 hands
+# it --escalate-model (default opus). STUB_ESCALATE_COST makes just that
+# third call expensive enough to trip the 25%-of-remaining-budget warning
+# too, so this one fixture covers both halves of S4B without a second run.
+R20="$WORK/r20"; new_repo "$R20"
+cat > "$R20/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] A — flaky twice, rescued by escalation (after: —)
+
+STATUS: in-progress
+EOF
+( cd "$R20" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_ESCALATE_ID=A \
+    STUB_ESCALATE_COST=3 STUB_CALL_LOG="$WORK/r20.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 10 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r20.out" 2>"$WORK/r20.err" )
+RC20=$?
+[[ "$RC20" -eq 0 ]] \
+  && ok "a slice rescued by escalation on its 3rd attempt completes the run (exit 0)" \
+  || note "escalation-rescue run exited $RC20 — expected 0"
+
+BUILD_MODEL_SEQ_20="$(cat "$R20"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="build") | .model' 2>/dev/null | tr '\n' ',')"
+[[ "$BUILD_MODEL_SEQ_20" == "sonnet,sonnet,opus," ]] \
+  && ok "BUILD escalates to opus only on the 3rd attempt (fails 0,1 stay on --build-model): $BUILD_MODEL_SEQ_20" \
+  || note "BUILD model sequence was '$BUILD_MODEL_SEQ_20', want sonnet,sonnet,opus,"
+
+ESCALATED_SEQ_20="$(cat "$R20"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="iteration") | .escalated' 2>/dev/null | tr '\n' ',')"
+[[ "$ESCALATED_SEQ_20" == "false,false,true," ]] \
+  && ok "the run log marks exactly one escalated iteration (the rescuing one): $ESCALATED_SEQ_20" \
+  || note "iteration rows' escalated sequence was '$ESCALATED_SEQ_20', want false,false,true,"
+
+REPLAN_CALLS_20="$(cat "$R20"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="replan")' 2>/dev/null | grep -c .)" || REPLAN_CALLS_20=0
+[[ "${REPLAN_CALLS_20:-0}" -eq 0 ]] \
+  && ok "escalation rescued the slice before the ladder ever reached a replan" \
+  || note "expected no replan calls, saw ${REPLAN_CALLS_20:-0}"
+
+grep -q "exceeds 25%" "$WORK/r20.err" 2>/dev/null \
+  && ok "an escalated call costing more than 25% of the remaining budget is warned about" \
+  || note "no 25%-of-remaining-budget warning found for the \$3 escalated call against a \$5 budget"
+
+# --- 21. S4B: --escalate-model none + an unannotated plan reproduces the ---
+# rung sequence exactly (f) from the plan's own loop-test list. Same
+# five-"slice"-line unannotated fixture and STUB_MODE=stall as test 2 (every
+# line's id is the plan-local token "slice", shared across all five rows,
+# same as any real 0.4.0-era plan with no id/after: annotations) — the only
+# difference from test 2 is passing --escalate-model none explicitly. In
+# STUB_MODE=stall the BUILD stub never ticks regardless of which model it was
+# asked for, so escalation (on or off) cannot change the outcome; this proves
+# the flag being present-but-disabled perturbs neither the exit code, the
+# timing, nor the ladder's own fingerprint/replan/abort sequence.
+R21="$WORK/r21"; new_repo "$R21"
+run_loop "$R21" stall true --escalate-model none
+RC21=$?
+[[ "$RC21" -eq "$RC2" ]] \
+  && ok "--escalate-model none on an unannotated plan aborts exactly like the default (exit $RC21)" \
+  || note "--escalate-model none exited $RC21, plain run (test 2) exited $RC2 — should match"
+
+grep -q "no-progress" "$WORK/r21.err" 2>/dev/null \
+  && ok "--escalate-model none still fingerprints the stall as no-progress, not escalation-related" \
+  || note "stall under --escalate-model none was not fingerprinted as no-progress"
+
+ITER_COUNT_21="$(cat "$R21"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="iteration") | .iter' 2>/dev/null | sort -un | tail -1)"
+ITER_COUNT_2="$(cat "$R2"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="iteration") | .iter' 2>/dev/null | sort -un | tail -1)"
+[[ "${ITER_COUNT_21:-0}" -eq "${ITER_COUNT_2:-0}" ]] \
+  && ok "--escalate-model none takes exactly as many iterations to abort as the default ($ITER_COUNT_21)" \
+  || note "--escalate-model none took ${ITER_COUNT_21:-0} iterations, default took ${ITER_COUNT_2:-0} — should match"
+
+ESCALATED_SEQ_21="$(cat "$R21"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="iteration") | .escalated' 2>/dev/null | tr '\n' ',')"
+case "$ESCALATED_SEQ_21" in
+  *true*) note "escalated:true appeared even though --escalate-model none disables escalation ($ESCALATED_SEQ_21)" ;;
+  *)      ok "escalated stays false throughout with --escalate-model none" ;;
+esac
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

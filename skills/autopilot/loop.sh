@@ -14,7 +14,7 @@
 #           [--plan-model opus] [--build-model sonnet] [--verify-model haiku]
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
 #           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
-#           [--no-repo-map] [--resume-run] [--dry-run]
+#           [--escalate-model opus|none] [--no-repo-map] [--resume-run] [--dry-run]
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
 #             cap · 1 runner error (bad preconditions, missing deps).
@@ -62,6 +62,9 @@ DRY_RUN=0
 EXTRA_ALLOWED_TOOLS=""
 HOLDOUT_ARG=""
 REPO_MAP_ENABLED=1
+# S4B: rung 2 of the stuck ladder. "none" disables escalation outright,
+# reproducing S4A's own "rung 2 is just another retry" behaviour exactly.
+ESCALATE_MODEL=opus
 
 BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
@@ -81,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     --per-call-timeout) PER_CALL_TIMEOUT="$2"; shift 2 ;;
     --extra-allowed-tools) EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
     --holdout)           HOLDOUT_ARG="$2"; shift 2 ;;
+    --escalate-model)    ESCALATE_MODEL="$2"; shift 2 ;;
     --no-repo-map)       REPO_MAP_ENABLED=0; shift ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
@@ -255,9 +259,9 @@ logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_fai
 #   `claude -p` CALL) — the fields a run-level report (S3B, /usage-report)
 #   needs without re-deriving them from the per-call rows. parked_count (S4A)
 #   is the number of ids slices.json marks parked at this iteration's
-#   selection time — real as of S4A. escalated is logged false until S4B
-#   implements escalation, so the schema doesn't change again when it lands
-#   (PRD § S3A). repo_map
+#   selection time — real as of S4A. escalated (S4B) is true only for the one
+#   iteration whose BUILD call actually ran on --escalate-model, real as of
+#   this slice (PRD § S3A/S4B). repo_map
 #   (S5) is whether this iteration's BUILD prompt actually carried a repo-map
 #   digest — false both when --no-repo-map was given and when the digest
 #   generator failed/produced nothing, so the field answers "did BUILD see
@@ -726,8 +730,43 @@ while :; do
   REPO_MAP_USED=false
   [[ -n "$REPO_MAP_DIGEST" ]] && REPO_MAP_USED=true
 
+  # S4B: rung 2 of the stuck ladder. A slice that has ALREADY failed twice
+  # (its per-slice `fails` counter, read before this iteration's own attempt)
+  # runs this one BUILD call on --escalate-model instead of --build-model;
+  # once it ticks, slices_retire() drops its record and the very next slice
+  # to need a BUILD call starts back on --build-model — there is no separate
+  # "de-escalate" step, reverting is just what having no record means.
+  # `--escalate-model none` disables this outright, reproducing S4A's own
+  # "rung 2 is just another retry" behaviour exactly. Never applied to the
+  # verifier — VERIFY_MODEL below is untouched; the cheap adversarial tier is
+  # the point (docs/model-policy.md).
+  BUILD_MODEL_THIS_ITER="$BUILD_MODEL"
+  ESCALATED_THIS_ITER=false
+  if [[ -n "$SELECTED_ID" && "$ESCALATE_MODEL" != "none" ]]; then
+    SLICE_FAILS_NOW="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
+    if [[ "$SLICE_FAILS_NOW" -ge 2 ]]; then
+      BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
+      ESCALATED_THIS_ITER=true
+    fi
+  fi
+
   # BUILD
-  run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
+  BUILD_COST_START="$TOTAL_COST"
+  run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
+
+  # S4B cost guard: escalation counts against --budget-usd like any other
+  # call — there is no separate ceiling, a hard cap here would just move the
+  # failure from "the slice never gets rescued" to "the run aborts mid-rescue"
+  # without fixing anything. It only WARNS when a single escalated call ate
+  # more than a quarter of what was left, so a human skimming the log notices
+  # an escalation that's burning the budget fast.
+  if [[ "$ESCALATED_THIS_ITER" == "true" ]]; then
+    BUILD_CALL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "$BUILD_COST_START" '$a - $b' 2>/dev/null || echo 0)"
+    REMAINING_BUDGET="$(jq -cn --argjson bud "$BUDGET_USD" --argjson s "$BUILD_COST_START" '$bud - $s' 2>/dev/null || echo 0)"
+    if jq -en --argjson c "$BUILD_CALL_COST" --argjson r "$REMAINING_BUDGET" '$r > 0 and $c > ($r * 0.25)' >/dev/null 2>&1; then
+      log_err "escalated build call cost \$$BUILD_CALL_COST — exceeds 25% of the \$$REMAINING_BUDGET remaining budget."
+    fi
+  fi
 
   TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
@@ -848,7 +887,7 @@ while :; do
     fi
     git add -A && git commit -q -m "autopilot: iteration $ITER (green)" 2>/dev/null || true
     log_iteration "done" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✅ all gates green at iteration $ITER — run complete."
     : > "$FEEDBACK_FILE"
     write_status "done"
@@ -862,7 +901,7 @@ while :; do
     log_err "plan has no checkboxes — progress can't be measured; relying on the caps."
     git add -A && git commit -q -m "autopilot: iteration $ITER (unmeasured)" 2>/dev/null || true
     log_iteration "unmeasured" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     : > "$FEEDBACK_FILE"
     continue
   fi
@@ -878,7 +917,7 @@ while :; do
     fi
     git add -A && git commit -q -m "autopilot: iteration $ITER (progress: $TICKED_BEFORE→$TICKED_AFTER of $TOTAL_BOXES)" 2>/dev/null || true
     log_iteration "progressed" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
     LAST_FP=""; REPEAT=0; PARK_REPLAN_DONE=0
@@ -900,7 +939,7 @@ while :; do
   sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$PLAN_FILE" 2>/dev/null && rm -f "$PLAN_FILE.bak"
   git add -A && git commit -q -m "autopilot: iteration $ITER (wip, gate=$FP)" 2>/dev/null || true
   log_iteration "fail" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" false "$REPO_MAP_USED"
+    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
 
   # Rung 5: a failure of ANY kind that arrives after rung 4's one
   # park-exhaustion replan is "the run fails again after a replan" — that
