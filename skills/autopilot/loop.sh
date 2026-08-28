@@ -280,11 +280,53 @@ log_iteration() {
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
+# S3B: per-run aggregates derived from THIS run's own JSONL log — recomputed
+# fresh on every write_status() call rather than accumulated in bash
+# variables, so a run interrupted mid-iteration (or read by a human via
+# status.json while still in progress) always reflects exactly what the log
+# on disk records, and a reload (R1) / --resume-run picks up the same run's
+# earlier rows for free since RUN_LOG is keyed by RUN_ID, not by process.
+# Missing/empty log = all-zero aggregates, never an error (contract item 8 —
+# before the first iteration's log_iteration() call, nothing has happened
+# yet, same posture as a fresh run). `parked_total` is the PEAK number of
+# slices.json marked as parked at any one iteration's selection time this
+# run — parked_count itself resets to 0 across a replan (slices_clear), so a
+# running total would double-count a slice parked, unparked, and parked
+# again; the max is the "how bad did it get" read /usage-report wants.
+run_aggregates() {
+  if [[ ! -s "$RUN_LOG" ]]; then
+    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+    return
+  fi
+  jq -sc --argjson total_cost "$TOTAL_COST" '
+    (map(select(.phase=="iteration"))) as $it
+    | ($it | length) as $n
+    | (map(select(.phase=="replan")) | length) as $replans
+    | ($it | map(select(.gate_failed != "none" and .gate_failed != null)) | length) as $failed
+    | ($it | map(.ticked_delta // 0) | add // 0) as $ticked
+    | ($it | map(.dag_width // 0)) as $widths
+    | ($it | map(.parked_count // 0) | (max // 0)) as $parked_total
+    | ($it | map(select(.escalated == true)) | length) as $escalations
+    | {
+        iterations: $n,
+        gate_fail_rate: (if $n > 0 then ($failed / $n) else 0 end),
+        cost_per_ticked_slice: (if $ticked > 0 then ($total_cost / $ticked) else null end),
+        replans: $replans,
+        mean_dag_width: (if ($widths|length) > 0 then (($widths|add) / ($widths|length)) else 0 end),
+        parked_total: $parked_total,
+        escalations: $escalations
+      }
+  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+}
+
 write_status() { # state
+  local agg
+  agg="$(run_aggregates)"
   jq -cn --arg run "$RUN_ID" --arg state "$1" --argjson iter "${ITER:-0}" \
      --argjson cost "$TOTAL_COST" --arg branch "$BRANCH" \
      --arg sha "$(git rev-parse --short HEAD 2>/dev/null || echo '')" \
-     '{run_id:$run,state:$state,iterations_done:$iter,total_cost_usd:$cost,branch:$branch,head:$sha}' \
+     --argjson agg "$agg" \
+     '{run_id:$run,state:$state,iterations_done:$iter,total_cost_usd:$cost,branch:$branch,head:$sha} + $agg' \
      > "$STATUS_FILE" 2>/dev/null || true
 }
 

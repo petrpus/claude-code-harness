@@ -45,6 +45,11 @@ DIGEST="skills/repo-map/digest.sh"
 [[ -f "$DIGEST" ]] || { note "$DIGEST is missing"; echo; echo "test-autopilot-loop: $FAIL failure(s)"; exit 1; }
 DIGEST_ABS="$(cd "$(dirname "$DIGEST")" && pwd)/$(basename "$DIGEST")"
 
+# S3B: usage-report/report.sh, exercised directly against combined run logs.
+REPORT="skills/usage-report/report.sh"
+[[ -f "$REPORT" ]] || { note "$REPORT is missing"; echo; echo "test-autopilot-loop: $FAIL failure(s)"; exit 1; }
+REPORT_ABS="$(cd "$(dirname "$REPORT")" && pwd)/$(basename "$REPORT")"
+
 command -v jq >/dev/null 2>&1 || { note "jq is required"; echo; echo "test-autopilot-loop: $FAIL failure(s)"; exit 1; }
 
 WORK="$(mktemp -d)"
@@ -914,6 +919,123 @@ case "$ESCALATED_SEQ_21" in
   *true*) note "escalated:true appeared even though --escalate-model none disables escalation ($ESCALATED_SEQ_21)" ;;
   *)      ok "escalated stays false throughout with --escalate-model none" ;;
 esac
+
+# --- 22. S3B: per-run aggregates land in status.json -----------------------
+# PRD § S3B: status.json gains iterations, gate_fail_rate, cost_per_ticked_slice,
+# replans, mean_dag_width, parked_total, escalations. R20 (escalation-rescue,
+# reused from test 20 above — its own run is not repeated here) is a clean
+# fixture for the base-case numbers: 3 iterations (2 no-progress failures then
+# a ticking success), exactly one escalated call costing $3 against an
+# otherwise-free run, a single-slice plan (dag_width 1 throughout), no parks,
+# no replans.
+STATUS_22="$R20/tmp/autopilot/status.json"
+[[ -f "$STATUS_22" ]] \
+  && ok "status.json exists after the R20 run" \
+  || note "status.json is missing at $STATUS_22"
+
+field_22() { jq -r --arg f "$1" '.[$f]' "$STATUS_22" 2>/dev/null; }
+
+[[ "$(field_22 iterations)" == "3" ]] \
+  && ok "status.json .iterations == 3" \
+  || note "status.json .iterations == '$(field_22 iterations)', want 3"
+
+GFR_22="$(field_22 gate_fail_rate)"
+jq -en --argjson g "${GFR_22:-null}" '$g != null and (($g - (2/3)) | fabs) < 0.001' >/dev/null 2>&1 \
+  && ok "status.json .gate_fail_rate ≈ 2/3 (2 of 3 iterations failed a gate): $GFR_22" \
+  || note "status.json .gate_fail_rate == '$GFR_22', want ≈ 0.6667"
+
+[[ "$(field_22 cost_per_ticked_slice)" == "3" ]] \
+  && ok "status.json .cost_per_ticked_slice == 3 (\$3 total / 1 slice ticked)" \
+  || note "status.json .cost_per_ticked_slice == '$(field_22 cost_per_ticked_slice)', want 3"
+
+[[ "$(field_22 replans)" == "0" ]] \
+  && ok "status.json .replans == 0 (escalation rescued the slice before any replan)" \
+  || note "status.json .replans == '$(field_22 replans)', want 0"
+
+[[ "$(field_22 mean_dag_width)" == "1" ]] \
+  && ok "status.json .mean_dag_width == 1 (a single-slice plan is width 1 throughout)" \
+  || note "status.json .mean_dag_width == '$(field_22 mean_dag_width)', want 1"
+
+[[ "$(field_22 parked_total)" == "0" ]] \
+  && ok "status.json .parked_total == 0 (the slice never reached 3 fails — it was rescued at 2)" \
+  || note "status.json .parked_total == '$(field_22 parked_total)', want 0"
+
+[[ "$(field_22 escalations)" == "1" ]] \
+  && ok "status.json .escalations == 1 (exactly the one rescued iteration)" \
+  || note "status.json .escalations == '$(field_22 escalations)', want 1"
+
+# R18 (park-exhaustion replan, reused from test 18) proves .replans is wired
+# for real rather than hardcoded to 0.
+REPLANS_18="$(jq -r '.replans' "$R18/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "${REPLANS_18:-0}" -ge 1 ]] \
+  && ok "status.json .replans >= 1 on the run that hit a park-exhaustion replan (R18): $REPLANS_18" \
+  || note "status.json .replans == '${REPLANS_18:-0}' on R18, want >= 1"
+
+# A run with no prior log (nothing has happened yet) must not error out of
+# write_status() — contract item 8, missing state is never a failure.
+R22="$WORK/r22"; new_repo "$R22"
+( cd "$R22" && PATH="$STUB_DIR:$PATH" STUB_MODE=stall STUB_VERIFY_FAIL=1 \
+    STUB_CALL_LOG="$WORK/r22.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 6 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r22.out" 2>"$WORK/r22.err" )
+RC22=$?
+[[ "$RC22" -eq 4 ]] \
+  && ok "a verifier that always finds shortcut #7 aborts on the fingerprint ladder (exit 4)" \
+  || note "the shortcut-#7 fixture exited $RC22 — expected 4"
+
+# --- 23. S3B: /usage-report's report.sh renders across several run logs ----
+# PRD § S3: /usage-report gains a "per run" table, a per-shortcut violation
+# histogram across runs, and a repo-map on/off comparison — the column empty
+# when only one side is present. Combine R17 (repo_map:true), R17B
+# (repo_map:false) and R22 (verify_agent violations, shortcut #7) into one
+# directory so all three sections have something real to render. R22's
+# unannotated plan gives every line the same shared plan-local id ("slice" —
+# the first token after the checkbox, same for all five "- [ ] slice N"
+# lines), so it runs the per-slice ladder (retry x2, park at fails=3, one
+# park-exhaustion replan, abort on the next failure): verify_agent actually
+# runs on iterations 1, 2, 3 and 5 (the plan_parked iteration in between
+# `continue`s before BUILD/verify ever run) — four violations, not three.
+REPORTS_DIR="$WORK/reports"; mkdir -p "$REPORTS_DIR"
+cp "$R17"/tmp/autopilot/run-*.jsonl "$REPORTS_DIR"/ 2>/dev/null
+cp "$R17B"/tmp/autopilot/run-*.jsonl "$REPORTS_DIR"/ 2>/dev/null
+cp "$R22"/tmp/autopilot/run-*.jsonl "$REPORTS_DIR"/ 2>/dev/null
+
+REPORT_OUT="$(bash "$REPORT_ABS" "$REPORTS_DIR" 2>"$WORK/report.err")"
+REPORT_RC=$?
+[[ "$REPORT_RC" -eq 0 ]] \
+  && ok "report.sh exits 0 against a directory of combined run logs" \
+  || note "report.sh exited $REPORT_RC: $(cat "$WORK/report.err" 2>/dev/null)"
+
+RUN_ROWS_23="$(printf '%s\n' "$REPORT_OUT" | grep -cE '^\| [0-9]{8}T[0-9]{6}Z-')"
+[[ "${RUN_ROWS_23:-0}" -eq 3 ]] \
+  && ok "the per-run table has one row per run (3 runs combined)" \
+  || note "per-run table had ${RUN_ROWS_23:-0} run rows, want 3"
+
+printf '%s\n' "$REPORT_OUT" | grep -qE '^\| 7 \| 4 \|' \
+  && ok "the per-shortcut histogram counts shortcut #7 four times (R22's four verify_agent runs)" \
+  || note "per-shortcut histogram is missing '| 7 | 4 |'"
+
+printf '%s\n' "$REPORT_OUT" | grep -q "repo_map=true" \
+  && printf '%s\n' "$REPORT_OUT" | grep -q "repo_map=false" \
+  && ok "the repo-map comparison header shows both the on and off columns" \
+  || note "repo-map comparison is missing an on or off column header"
+
+# Neither side of the comparison row is the placeholder "—" — R17 and R17B
+# each contribute exactly one real BUILD call to their side.
+COMPARISON_ROW_23="$(printf '%s\n' "$REPORT_OUT" | grep -A2 'repo_map=true' | tail -1)"
+case "$COMPARISON_ROW_23" in
+  *'—'*) note "repo-map comparison row still shows a placeholder even though both sides have data: $COMPARISON_ROW_23" ;;
+  *)     ok "repo-map comparison row has real numbers on both sides: $COMPARISON_ROW_23" ;;
+esac
+
+# report.sh must degrade gracefully (not error) against a directory with no
+# run logs at all — contract item 8, a fresh repo that never ran autopilot.
+EMPTY_DIR_23="$WORK/empty-reports"; mkdir -p "$EMPTY_DIR_23"
+bash "$REPORT_ABS" "$EMPTY_DIR_23" >"$WORK/empty-report.out" 2>"$WORK/empty-report.err"
+EMPTY_RC_23=$?
+[[ "$EMPTY_RC_23" -eq 0 ]] \
+  && ok "report.sh exits 0 against a directory with no run logs" \
+  || note "report.sh exited $EMPTY_RC_23 against an empty directory — expected 0"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

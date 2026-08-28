@@ -46,7 +46,7 @@ so an unchanged file can never spin.
 | `IMPLEMENTATION_PLAN.md` | Checklist of independently verifiable vertical slices + a final `STATUS: in-progress\|done` line. Written by PLAN, ticked by BUILD, sentinel-checked by the gate. Slice lines may carry `(after: <id>, <id>)` — the **Plan DAG** the runner selects from each iteration (`plan.sh`, `docs/adr/0005-*.md`). |
 | `MEMORY.md` | Durable cross-iteration notes. Mechanically pruned to the last 100 lines every iteration — instructions to the model are advisory; the cap is enforced by the runner. |
 | `FEEDBACK.md` | Why the last gate failed. The next BUILD iteration must address it first. Cleared when consumed. |
-| `status.json` | Live run state, iterations done, accumulated cost, HEAD sha. |
+| `status.json` | Live run state, iterations done, accumulated cost, HEAD sha, plus S3B's per-run aggregates. |
 | `run-<id>.jsonl` | Structured per-phase log (see below). |
 | `lock` | `PID run_id` — concurrency guard with stale-PID detection. |
 | `slices.json` | Per-slice retry/park ladder state (S4A, `slices.sh`). Runner-owned; never named in any prompt. Missing = nothing has failed yet. |
@@ -418,6 +418,46 @@ the digest generator produced nothing (missing `jq`/`awk`, an ungeneratable
 map), so it answers "did BUILD see one," not "was the flag on."
 
 `/usage-report` reads these to attribute cost per run.
+
+### Per-run aggregates (S3B)
+
+`write_status()` recomputes seven aggregates from the run's own JSONL log on
+*every* call (not accumulated in a bash variable across the run), and merges
+them into `status.json`:
+
+```json
+{"iterations":3,"gate_fail_rate":0.667,"cost_per_ticked_slice":3,
+ "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1}
+```
+
+- `iterations` — count of `phase:"iteration"` rows so far.
+- `gate_fail_rate` — the fraction of those rows whose `gate_failed` isn't
+  `"none"`.
+- `cost_per_ticked_slice` — `total_cost_usd` divided by the sum of
+  `ticked_delta` across iterations; `null` (not `0`) until at least one slice
+  has ticked, so a run that hasn't finished anything yet doesn't misreport a
+  free run.
+- `replans` — count of `phase:"replan"` call rows (both the S1B `plan_dag`
+  path and S4A's park-exhaustion replan land here).
+- `mean_dag_width` — the mean of `dag_width` across iterations.
+- `parked_total` — the PEAK (not running total) of `parked_count` seen at any
+  one iteration's selection time this run. A running sum would double-count a
+  slice parked, unparked by a replan, and parked again as two separate
+  incidents; the peak answers "how bad did it get."
+- `escalations` — count of iterations with `escalated:true`.
+
+A missing or empty run log (before the first `log_iteration()` call, or a
+0.4.0-era `tmp/autopilot/` with no log at all) yields all-zero aggregates and
+`cost_per_ticked_slice: null` — never an error (contract item 8).
+
+`skills/usage-report/report.sh [state-dir]` (default `tmp/autopilot`) renders
+the mechanical part of `/usage-report`'s "Autopilot run logs" source straight
+from the JSONL files, so the arithmetic isn't re-derived by hand each time:
+a per-run table (slices ticked, cost/slice, gate-fail rate, mean turns), a
+per-shortcut violation histogram across every run given, and a repo-map
+on/off comparison of mean `input_tokens + cache_read_input_tokens +
+cache_creation_input_tokens` per BUILD call, keyed on S5's `repo_map` flag —
+whichever side has no data in the logs given renders as `—`, not an error.
 
 ## PRD / ADR / TDD wiring
 

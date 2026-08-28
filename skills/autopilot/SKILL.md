@@ -70,9 +70,15 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 
 ## What you get
 
-- `tmp/autopilot/status.json` — live state, iterations, accumulated `$` cost.
+- `tmp/autopilot/status.json` — live state, iterations, accumulated `$` cost,
+  plus per-run aggregates (S3B): `iterations`, `gate_fail_rate`,
+  `cost_per_ticked_slice`, `replans`, `mean_dag_width`, `parked_total`,
+  `escalations` — recomputed from the run's own log on every write, not
+  accumulated separately.
 - `tmp/autopilot/run-<id>.jsonl` — one line per phase (model, duration, cost,
-  tokens, verdict) — feed it to `/usage-report`.
+  tokens, verdict) — feed it to `/usage-report`, or render it directly with
+  `skills/usage-report/report.sh [state-dir]` (per-run table, per-shortcut
+  violation histogram, repo-map on/off comparison).
 - A git checkpoint commit per iteration (`autopilot: iteration N (...)`) for
   clean rollback.
 

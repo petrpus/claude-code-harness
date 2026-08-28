@@ -45,6 +45,20 @@ assumes the code is broken catches shortcuts the author's own model rationalizes
 away. That is why the gate is haiku running `agents/verifier.md`, not the build
 model checking its own work.
 
+## How we measure
+
+Claims about model tiering (does the escalation rung earn its cost? does the
+repo-map digest actually save tokens?) are checked against data, not
+intuition. Every `claude -p` call and every iteration outcome is logged to
+`tmp/autopilot/run-<id>.jsonl` (S3A); `tmp/autopilot/status.json` carries
+per-run aggregates recomputed on every write (S3B: `gate_fail_rate`,
+`cost_per_ticked_slice`, `mean_dag_width`, `escalations`, …); and
+`bash skills/usage-report/report.sh` renders a per-run table, a per-shortcut
+verdict-distribution histogram, and the repo-map on/off token comparison
+across however many runs are on disk. See
+`skills/autopilot/LOOP-PROTOCOL.md` § Per-run aggregates for field
+definitions.
+
 **Open question (2026-08-28, loopkit survey).** Loopkit's `model-routing` claims the
 opposite corner of the grid: a *cheap executor + frontier judge* beats a frontier
 executor with no judge, arguing a weak judge is worse than no judge and that judge
