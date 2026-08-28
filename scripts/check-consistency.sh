@@ -106,6 +106,18 @@ for bad in diagnosing-bugs writing-great-skills loop-me ask-matt; do
   [[ -z "$hits" ]] && ok "no /$bad refs" || note "upstream-only name /$bad referenced in: $hits"
 done
 
+# ---------------------------------------------------------------------------
+section "harness CI workflow exists and invokes scripts/verify.sh"
+CI_WORKFLOW=".github/workflows/verify.yml"
+if [[ -f "$CI_WORKFLOW" ]]; then
+  ok "$CI_WORKFLOW exists"
+  grep -q 'scripts/verify\.sh' "$CI_WORKFLOW" \
+    && ok "$CI_WORKFLOW invokes scripts/verify.sh" \
+    || note "$CI_WORKFLOW does not invoke scripts/verify.sh"
+else
+  note "$CI_WORKFLOW is missing"
+fi
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"

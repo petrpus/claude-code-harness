@@ -4,6 +4,13 @@
 # own `npm run verify` (installed by `/project-infra verify`). Keep the real
 # logic (typecheck/lint/test) inside `verify`, not duplicated here — this
 # workflow is just the runner + trigger.
+#
+# The harness repo's own .github/workflows/verify.yml is NOT an instance of
+# this template — this template assumes an npm/pnpm project with a lockfile;
+# the harness's verify command is a dependency-free bash script that only
+# needs `jq` installed, so its workflow skips the Node setup/install steps
+# entirely. Diverge the same way for any consumer project whose verify
+# command isn't npm/pnpm-based.
 name: CI
 
 on:

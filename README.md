@@ -120,4 +120,7 @@ Licensed under [MIT](LICENSE).
 Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record and
 `scripts/check-consistency.sh` asserts the two agree. Tag on the merge commit on
 `main`, never on a feature branch. The harness can generate CI/CD for *consumer*
-projects (`/project-infra ci`); the harness repo itself has no pipeline yet.
+projects (`/project-infra ci`); the harness repo runs its own CI too —
+`.github/workflows/verify.yml` runs `scripts/verify.sh` on every PR and on push
+to `main`. Requiring that check on branch protection is a human step taken once
+at PR time, not something this repo automates on itself.
