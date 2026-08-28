@@ -182,7 +182,46 @@ author model rationalizes its own shortcuts; an independent skeptic on a cheap
 model, run every iteration, is both cheaper and more honest. The checklist is
 single-sourced in `agents/verifier.md` (the runner strips its frontmatter and
 inlines the body). Verdict parsing is **fail-closed**: unparseable output counts
-as a failure, never a pass.
+as a failure, never a pass — see the next section for what "counts as a
+failure" now means in more detail.
+
+### A refusal is not a verdict (R2)
+
+`parse_verdict()` splits the verifier's raw output three ways, not two:
+`pass` (a parseable JSON object with `.pass == true`), `fail` (parseable, `.pass
+== false`), and `no_verdict` (no parseable JSON object at all, or one missing a
+boolean `.pass` key). All three still block the tick — this changes
+*attribution*, not strictness.
+
+Before R2, `parse_verdict()` folded `no_verdict` into `fail`, which made a
+verifier that *declined to judge* (refusal prose, a clarifying question it had
+no way to get an answer to, output truncated by the per-call timeout)
+indistinguishable from one that *found real shortcuts*. The loop then wrote
+`verifier found shortcuts: <300 chars of refusal prose>` into `FEEDBACK.md` and
+sent BUILD chasing violations that were never made — a real occurrence during
+this harness's own 0.5.0 build, when the verifier's own charter file
+(`agents/verifier.md`) showed up in the diff it was reviewing and it asked a
+clarifying question instead of a verdict.
+
+`no_verdict` is a **gate malfunction, not a slice defect**. On a `no_verdict`,
+the runner retries gate (d) once, against the exact same unchanged diff,
+before drawing any conclusion about BUILD's work — one retry only, so a
+verifier that never recovers doesn't spin. If the retry also yields no
+verdict, the failure is fingerprinted `no_verdict` (distinct from both
+`verify_agent` and `holdout`) and `FEEDBACK.md` gets a sentence naming the
+malfunction ("the semantic gate returned no verdict twice; the diff was not
+judged") rather than the raw refusal text — the raw text still only ever goes
+to `verifier-raw.log`, never presented as a finding. `no_verdict` is still
+counted on the stuck ladder like any other fingerprint, so a permanently
+broken gate still aborts the run instead of looping forever.
+
+This adds **no new gate** — gate (d) is still one gate; `no_verdict` is a way
+it can fail to render a verdict at all, the same way `plan_dag` is a way the
+plan itself can fail to be walkable. Both bypass business-as-usual handling
+for a structural reason, but only `plan_dag` bypasses the stuck ladder itself
+(§ Slice selection above) — `no_verdict` still goes through it, because unlike
+a broken Plan DAG, a flaky verifier gate might legitimately produce a real
+verdict on the very next iteration's fresh diff.
 
 ### Permissions in headless mode
 
@@ -214,7 +253,7 @@ Each line of `run-<id>.jsonl`:
 ```json
 {"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
- "exit_code":0,"verdict":"pass|fail|","holdout_failed":0}
+ "exit_code":0,"verdict":"pass|fail|no_verdict|","holdout_failed":0}
 ```
 
 `runner_reload` (R1) is logged once, immediately before the `exec` that

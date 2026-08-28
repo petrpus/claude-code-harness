@@ -433,18 +433,30 @@ Inspect the diff since the last checkpoint: run \`git diff HEAD\` and
 EOF
 }
 
-# Robust extraction of the verifier's JSON verdict (fail-closed).
-parse_verdict() { # raw -> echoes "pass" or "fail"
-  local raw="$1" obj
+# Robust extraction of the verifier's JSON verdict. Three-way, not fail-closed
+# binary (R2): a verifier that DECLINED TO JUDGE (refusal prose, a clarifying
+# question, garbled/fenced non-JSON, or valid JSON missing the `.pass` key)
+# is a gate malfunction, not a finding — parse_verdict() used to fold all of
+# that into "fail" and the loop then quoted the refusal as "shortcuts" in
+# FEEDBACK.md, sending BUILD chasing violations that were never made. Still
+# fails closed: only an explicit `.pass == true` counts as a pass.
+parse_verdict() { # raw -> echoes "pass", "fail" or "no_verdict"
+  local raw="$1" obj pass_type pass_val
   obj="$(printf '%s' "$raw" | jq -c 'if type=="object" then . else empty end' 2>/dev/null)"
   if [[ -z "$obj" ]]; then
     # strip code fences, then grab the first {...} block
     obj="$(printf '%s' "$raw" | sed -e 's/```json//g' -e 's/```//g' \
             | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
   fi
-  local pass
-  pass="$(printf '%s' "$obj" | jq -r '.pass // empty' 2>/dev/null)"
-  if [[ "$pass" == "true" ]]; then echo "pass"; else echo "fail"; fi
+  if [[ -z "$obj" ]] || ! printf '%s' "$obj" | jq -e 'type=="object"' >/dev/null 2>&1; then
+    echo "no_verdict"; return
+  fi
+  pass_type="$(printf '%s' "$obj" | jq -r '.pass | type' 2>/dev/null)"
+  if [[ "$pass_type" != "boolean" ]]; then
+    echo "no_verdict"; return
+  fi
+  pass_val="$(printf '%s' "$obj" | jq -r '.pass' 2>/dev/null)"
+  if [[ "$pass_val" == "true" ]]; then echo "pass"; else echo "fail"; fi
 }
 
 # parse_holdout_ids <raw> -> comma-separated ids from .holdout.failed[], or
@@ -605,22 +617,44 @@ while :; do
   if [[ -z "$FAIL_REASON" ]]; then
     holdout_notice_once
     HOLDOUT_CONTENT="$(holdout_content)"
-    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$(verify_prompt "$HOLDOUT_CONTENT")")"
+    VERIFY_PROMPT_TEXT="$(verify_prompt "$HOLDOUT_CONTENT")"
+    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
     VERDICT="$(parse_verdict "$VOUT")"
+    if [[ "$VERDICT" == "no_verdict" ]]; then
+      # R2: a verifier that declined to judge (refusal, clarifying question,
+      # garbled output) is a GATE MALFUNCTION, not a slice defect — retry
+      # once against the SAME unchanged diff before blaming BUILD. At most
+      # one retry: if it's also inconclusive, the gate itself is broken and
+      # that becomes the (still-blocking) failure below.
+      log_err "verifier returned no verdict — retrying once against the same diff."
+      VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
+      VERDICT="$(parse_verdict "$VOUT")"
+    fi
     HOLDOUT_FAILED_IDS="$(parse_holdout_ids "$VOUT")"
     HOLDOUT_FAILED_COUNT=0
     [[ -n "$HOLDOUT_FAILED_IDS" ]] && HOLDOUT_FAILED_COUNT="$(printf '%s' "$HOLDOUT_FAILED_IDS" | tr ',' '\n' | grep -c .)"
     logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT" "$HOLDOUT_FAILED_COUNT"
     if [[ "$VERDICT" != "pass" ]]; then
       printf '%s\n' "$VOUT" >> "$STATE_DIR/verifier-raw.log"
-      if [[ -n "$HOLDOUT_FAILED_IDS" ]]; then
+      if [[ "$VERDICT" == "no_verdict" ]]; then
+        # Both attempts were inconclusive. Name the malfunction in
+        # FEEDBACK.md instead of quoting the refusal prose as "shortcuts" —
+        # that used to send BUILD chasing violations that were never made.
+        # Still fingerprinted and still blocks the tick, so a permanently
+        # broken gate still terminates the run via the stuck ladder below.
+        FAIL_REASON="the semantic gate returned no verdict twice; the diff was not judged"
+        FP="no_verdict"
+      elif [[ -n "$HOLDOUT_FAILED_IDS" ]]; then
         # Fingerprinted separately from verify_agent (PRD § S2) so stuck
         # detection — and a human reading FEEDBACK.md — can tell "the diff
         # missed a hidden acceptance scenario" apart from a generic shortcut.
         FAIL_REASON="holdout scenario(s) unmet: $HOLDOUT_FAILED_IDS"
         FP="holdout"
       else
-        FAIL_REASON="verifier found shortcuts: $(printf '%s' "$VOUT" | tr '\n' ' ' | head -c 300)"
+        # Labelled as verifier output, not presented as a bare finding — the
+        # raw text is still only ever a truncated excerpt here; the full
+        # transcript goes to verifier-raw.log above.
+        FAIL_REASON="verifier output (found shortcuts): $(printf '%s' "$VOUT" | tr '\n' ' ' | head -c 300)"
         FP="verify_agent"
       fi
     fi

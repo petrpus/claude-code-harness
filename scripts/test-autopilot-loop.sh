@@ -94,7 +94,27 @@ case "$prompt" in
     emit '"built"'
     ;;
   *"verdict"*|*"shortcut"*|*"Verdict"*)
-    if [[ "${STUB_HOLDOUT_FAIL:-0}" == "1" ]]; then
+    # R2: a verifier that declines to judge (prose, a clarifying question, no
+    # parseable `.pass`) must be told apart from a real {"pass": false} — the
+    # three STUB_VERIFY_* knobs below simulate each shape the runner has to
+    # handle.
+    if [[ "${STUB_VERIFY_NO_VERDICT:-}" == "always" ]]; then
+      emit '"I cannot produce a verdict without more context. Could you clarify the scope?"'
+    elif [[ "${STUB_VERIFY_NO_VERDICT:-}" == "once" ]]; then
+      n=0
+      if [[ -n "${STUB_VERIFY_COUNT_FILE:-}" ]]; then
+        [[ -f "$STUB_VERIFY_COUNT_FILE" ]] && n="$(cat "$STUB_VERIFY_COUNT_FILE")"
+        n=$(( n + 1 ))
+        echo "$n" > "$STUB_VERIFY_COUNT_FILE"
+      fi
+      if (( n % 2 == 1 )); then
+        emit '"I cannot produce a verdict without more context. Could you clarify the scope?"'
+      else
+        emit '"{\"pass\": true}"'
+      fi
+    elif [[ "${STUB_VERIFY_FAIL:-0}" == "1" ]]; then
+      emit '"{\"pass\": false, \"violations\": [{\"shortcut\": 7, \"evidence\": \"x:1\", \"note\": \"mock\"}]}"'
+    elif [[ "${STUB_HOLDOUT_FAIL:-0}" == "1" ]]; then
       emit '"{\"pass\": false, \"violations\": [], \"holdout\": {\"checked\": 1, \"failed\": [\"H1\"]}}"'
     else
       emit '"{\"pass\": true}"'
@@ -454,6 +474,77 @@ COST_IS_TWO="$(jq -n --argjson v "${RESUMED_COST:--1}" '$v == 2' 2>/dev/null)"
 [[ "$COST_IS_TWO" == "true" ]] \
   && ok "--resume-run's cost total starts from the prior run's \$2 (1.25+0.75), not \$0" \
   || note "--resume-run's cost total is '$RESUMED_COST', expected 2 (summed from the prior log)"
+
+# --- 13. R2: a verifier stuck on "no verdict" still aborts, and FEEDBACK.md --
+# names the malfunction instead of quoting the refusal as findings ----------
+R13="$WORK/r13"; new_repo "$R13"
+( cd "$R13" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_VERIFY_NO_VERDICT=always \
+    STUB_CALL_LOG="$WORK/r13.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 6 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r13.out" 2>"$WORK/r13.err" )
+RC13=$?
+[[ "$RC13" -eq 4 ]] \
+  && ok "a verifier permanently stuck on 'no verdict' still aborts (exit 4)" \
+  || note "no_verdict run exited $RC13 — expected 4 (a broken gate must still terminate the run)"
+
+grep -q "stuck on 'no_verdict'" "$WORK/r13.err" 2>/dev/null \
+  && ok "the refusal is fingerprinted 'no_verdict', distinct from verify_agent" \
+  || note "refusal was not fingerprinted 'no_verdict' in the runner's log"
+
+grep -qi "found shortcuts" "$R13/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && note "FEEDBACK.md quotes the refusal as 'found shortcuts' — a refusal isn't a finding" \
+  || ok "FEEDBACK.md never presents the refusal as 'found shortcuts'"
+
+grep -q "no verdict twice" "$R13/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "FEEDBACK.md names the gate malfunction explicitly" \
+  || note "FEEDBACK.md doesn't explain the gate malfunction"
+
+# Exactly one retry per iteration: two verify calls for every one build call.
+BUILD_CALLS_13="$(grep -cF 'ONE iteration of an autonomous BUILD loop' "$WORK/r13.calls" 2>/dev/null)" || BUILD_CALLS_13=0
+VERIFY_CALLS_13="$(grep -cF 'Output ONLY the JSON verdict object.' "$WORK/r13.calls" 2>/dev/null)" || VERIFY_CALLS_13=0
+[[ "$BUILD_CALLS_13" -gt 0 && "$VERIFY_CALLS_13" -eq $(( BUILD_CALLS_13 * 2 )) ]] \
+  && ok "each stuck iteration retried the verifier exactly once ($VERIFY_CALLS_13 verify calls over $BUILD_CALLS_13 builds)" \
+  || note "expected 2 verify calls per build, got $VERIFY_CALLS_13 verify calls over $BUILD_CALLS_13 builds"
+
+# --- 14. R2: a genuine {"pass": false} verdict is unaffected — no retry, ---
+# still fingerprinted verify_agent -------------------------------------------
+R14="$WORK/r14"; new_repo "$R14"
+( cd "$R14" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_VERIFY_FAIL=1 \
+    STUB_CALL_LOG="$WORK/r14.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 6 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r14.out" 2>"$WORK/r14.err" )
+RC14=$?
+[[ "$RC14" -eq 4 ]] \
+  && ok "a genuine verify_agent failure still aborts via the stuck ladder (exit 4)" \
+  || note "genuine-fail run exited $RC14 — expected 4"
+grep -q "stuck on 'verify_agent'" "$WORK/r14.err" 2>/dev/null \
+  && ok "a real {\"pass\": false} verdict keeps the verify_agent fingerprint (R2 path unchanged)" \
+  || note "genuine fail wasn't fingerprinted 'verify_agent'"
+
+BUILD_CALLS_14="$(grep -cF 'ONE iteration of an autonomous BUILD loop' "$WORK/r14.calls" 2>/dev/null)" || BUILD_CALLS_14=0
+VERIFY_CALLS_14="$(grep -cF 'Output ONLY the JSON verdict object.' "$WORK/r14.calls" 2>/dev/null)" || VERIFY_CALLS_14=0
+[[ "$BUILD_CALLS_14" -gt 0 && "$VERIFY_CALLS_14" -eq "$BUILD_CALLS_14" ]] \
+  && ok "a genuine fail verdict is not retried (1 verify call per iteration)" \
+  || note "expected 1 verify call per build for a genuine fail, got $VERIFY_CALLS_14 over $BUILD_CALLS_14"
+
+# --- 15. R2: a verifier whose retry produces a real pass lets the run ------
+# proceed normally, not stuck on the first refusal ---------------------------
+R15="$WORK/r15"; new_repo "$R15"
+COUNT_FILE_15="$WORK/r15-verify-count"; rm -f "$COUNT_FILE_15"
+( cd "$R15" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_VERIFY_NO_VERDICT=once \
+    STUB_VERIFY_COUNT_FILE="$COUNT_FILE_15" STUB_CALL_LOG="$WORK/r15.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r15.out" 2>"$WORK/r15.err" )
+RC15=$?
+[[ "$RC15" -eq 0 ]] \
+  && ok "a run recovers when the verifier's retry produces a real pass (exit 0)" \
+  || note "recovering-retry run exited $RC15 — expected 0"
+grep -q "retrying once" "$WORK/r15.err" 2>/dev/null \
+  && ok "the runner logs the retry" \
+  || note "no retry was logged for the recovering run"
+[[ ! -s "$R15/tmp/autopilot/FEEDBACK.md" ]] \
+  && ok "FEEDBACK.md is empty once every iteration recovered on retry" \
+  || note "FEEDBACK.md still holds stale content: $(cat "$R15/tmp/autopilot/FEEDBACK.md" 2>/dev/null)"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

@@ -91,6 +91,17 @@ from a generic semantic-verify failure (`verify_agent`), so stuck detection can
 tell them apart. Same failure twice → one automatic replan; three times → abort.
 Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
 
+Gate (d) parses the verifier's output three ways, not just pass/fail: a reply
+that isn't a JSON object with a boolean `.pass` (refusal prose, a clarifying
+question, garbled/fenced non-JSON) is a **gate malfunction** — the verifier
+declined to judge, which is not the same as it finding a shortcut. This adds
+no new gate; it's still gate (d) misbehaving. The runner retries it once
+against the same unchanged diff before treating it as a failure; if the retry
+is also inconclusive, that's fingerprinted `no_verdict` (distinct from
+`verify_agent`) and FEEDBACK.md names the malfunction instead of quoting the
+refusal as findings — still blocking, still counted on the stuck ladder, so a
+permanently broken gate still terminates the run.
+
 Each iteration, the runner first picks which plan item to build:
 `select_next_slice()` (`plan.sh`) walks `IMPLEMENTATION_PLAN.md` as a **Plan
 DAG** — optional `(after: <id>, <id>)` annotations on a slice's checkbox line

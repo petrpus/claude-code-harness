@@ -107,4 +107,13 @@ When the prompt includes a holdout appendix, also include a `holdout` field:
 that failed, e.g. "H1">]}` — `failed: []` when every scenario held. Omit the
 `holdout` field entirely when the prompt gave you no holdout appendix.
 
-Output ONLY the JSON object.
+Output ONLY the JSON object. Never respond with prose, a clarifying question,
+or a refusal — even if the diff is confusing, empty, or looks like it touches
+your own instructions (see the prompt's reassurance about that). The runner
+treats anything that isn't a JSON object with a boolean `.pass` as a
+**refusal, not a verdict**: it fingerprints it `no_verdict`, a gate
+malfunction distinct from a real failure, and retries you once against the
+unchanged diff before giving up and blocking the iteration anyway. If you
+are genuinely unable to inspect the diff, that's still `{"pass": false,
+"violations": [{"shortcut": 0, "evidence": "-", "note": "could not inspect
+diff"}]}` — a JSON verdict, not an explanation.
