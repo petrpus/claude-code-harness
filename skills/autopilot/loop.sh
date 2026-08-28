@@ -228,12 +228,35 @@ HOLDOUT_NOTICE_SHOWN=0
 now_epoch() { date +%s 2>/dev/null || echo 0; }
 START_EPOCH="$(now_epoch)"
 
-logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed]
+logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
      --arg phase "$1" --arg model "$2" --argjson dur "${3:-0}" \
      --argjson cost "${4:-0}" --argjson intok "${5:-0}" --argjson outtok "${6:-0}" \
      --argjson exit "${7:-0}" --arg verdict "${8:-}" --argjson holdout_failed "${9:-0}" \
-     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed}' \
+     --argjson turns "${10:-0}" --argjson cache_read "${11:-0}" --argjson cache_creation "${12:-0}" \
+     --argjson violations "${13:-[]}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed,turns:$turns,cache_read_input_tokens:$cache_read,cache_creation_input_tokens:$cache_creation,violations:$violations}' \
+     >> "$RUN_LOG" 2>/dev/null || true
+}
+
+# log_iteration <verdict> <slice_id> <ticked_delta> <gate_failed> <wall_s>
+#               <cost_usd> <files_changed> <verify_s> <dag_width>
+#               <parked_count> <escalated>
+#   S3A: one summary row per ITERATION (as opposed to logline()'s one row per
+#   `claude -p` CALL) — the fields a run-level report (S3B, /usage-report)
+#   needs without re-deriving them from the per-call rows. parked_count and
+#   escalated are logged 0/false until S4A/S4B implement parking/escalation,
+#   so the schema doesn't change again when they do (PRD § S3A).
+log_iteration() {
+  jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
+     --arg verdict "$1" --arg slice_id "${2:-}" --argjson ticked_delta "${3:-0}" \
+     --arg gate_failed "${4:-none}" --argjson wall_s "${5:-0}" --argjson cost_usd "${6:-0}" \
+     --argjson files_changed "${7:-0}" --argjson verify_s "${8:-0}" --argjson dag_width "${9:-0}" \
+     --argjson parked_count "${10:-0}" --argjson escalated "${11:-false}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:"iteration",model:"-",verdict:$verdict,
+       slice_id:$slice_id,ticked_delta:$ticked_delta,gate_failed:$gate_failed,wall_s:$wall_s,
+       cost_usd:$cost_usd,files_changed:$files_changed,verify_s:$verify_s,dag_width:$dag_width,
+       parked_count:$parked_count,escalated:$escalated}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -249,7 +272,7 @@ write_status() { # state
 # Echoes the assistant result text on stdout; returns claude's exit code.
 run_claude() { # phase model allowed_tools permission_mode prompt_text
   local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5"
-  local t0 t1 dur out cost intok outtok rc
+  local t0 t1 dur out cost intok outtok rc turns cache_read cache_creation
   t0="$(now_epoch)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
@@ -265,8 +288,15 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
   cost="$(printf '%s' "$out" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)"
   intok="$(printf '%s' "$out" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)"
   outtok="$(printf '%s' "$out" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)"
+  # S3A: still --output-format json (never stream-json), just two more `.usage`
+  # reads. num_turns and the cache fields are absent from a plain "ok"/dry-run
+  # stub result, hence the `// 0` defaults — never a hard requirement on shape.
+  turns="$(printf '%s' "$out" | jq -r '.num_turns // 0' 2>/dev/null || echo 0)"
+  cache_read="$(printf '%s' "$out" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)"
+  cache_creation="$(printf '%s' "$out" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)"
   TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${cost:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
-  logline "$phase" "$model" "$dur" "${cost:-0}" "${intok:-0}" "${outtok:-0}" "$rc" ""
+  logline "$phase" "$model" "$dur" "${cost:-0}" "${intok:-0}" "${outtok:-0}" "$rc" "" 0 \
+    "${turns:-0}" "${cache_read:-0}" "${cache_creation:-0}"
   printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null || echo ""
   return $rc
 }
@@ -471,6 +501,21 @@ parse_holdout_ids() {
   printf '%s' "$obj" | jq -r '(.holdout.failed // []) | join(",")' 2>/dev/null || true
 }
 
+# parse_violations <raw> -> compact JSON array of shortcut numbers from
+# .violations[].shortcut, e.g. "[2,7]", or "[]". S3A: the verify_agent log
+# line records which shortcuts fired, not just pass/fail. Same tolerant
+# extraction as parse_verdict/parse_holdout_ids (fenced or bare JSON); a
+# non-numeric or missing .shortcut is dropped rather than crashing the line.
+parse_violations() {
+  local raw="$1" obj
+  obj="$(printf '%s' "$raw" | jq -c 'if type=="object" then . else empty end' 2>/dev/null)"
+  if [[ -z "$obj" ]]; then
+    obj="$(printf '%s' "$raw" | sed -e 's/```json//g' -e 's/```//g' \
+            | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
+  fi
+  printf '%s' "$obj" | jq -c '[(.violations // [])[].shortcut | select(type=="number")]' 2>/dev/null || echo "[]"
+}
+
 secret_scan() { # returns 0 clean, 1 hit; echoes hits
   local diff hits
   diff="$(git diff HEAD 2>/dev/null || true)"
@@ -533,6 +578,11 @@ while :; do
   log_err "── iteration $ITER (elapsed $(elapsed_min)m, spent \$$TOTAL_COST)"
   write_status "building"
 
+  # S3A: per-iteration metrics start here — wall clock and cost are measured
+  # against this iteration's own baseline, not the run's running total.
+  ITER_T0="$(now_epoch)"
+  ITER_COST_START="$TOTAL_COST"
+
   TICKED_BEFORE="$(count_ticked)"
   TOTAL_BOXES="$(count_boxes)"
 
@@ -578,6 +628,17 @@ while :; do
       ;;
   esac
 
+  # S3A: dag_width — how many unchecked, unblocked, unparked slices were
+  # actually choosable at selection time (not just which one got picked).
+  # select_next_slice() above ran inside a `$(...)` command substitution, so
+  # the PLAN_* globals its own plan_load() populated were a subshell's copy
+  # and never reached this process — re-parse the (unchanged) plan file
+  # directly, not via a subshell, so plan_dag_width() has something to read.
+  # Parked ids land with S4A; until then this is always evaluated against
+  # none parked.
+  plan_load "$PLAN_FILE"
+  DAG_WIDTH="$(plan_dag_width "")"
+
   # BUILD
   run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE")" >/dev/null
 
@@ -589,10 +650,13 @@ while :; do
   # whenever the plan wasn't complete, which meant incremental work was checked
   # in as "wip" without the runner ever verifying it.
   write_status "verifying"
+  VERIFY_T0="$(now_epoch)"
   if timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
-    logline "verify_cmd" "-" 0 0 0 0 0 "pass"
+    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
   else
-    logline "verify_cmd" "-" 0 0 0 0 1 "fail"
+    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 1 "fail"
     FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
     FP="verify_cmd"
   fi
@@ -633,7 +697,11 @@ while :; do
     HOLDOUT_FAILED_IDS="$(parse_holdout_ids "$VOUT")"
     HOLDOUT_FAILED_COUNT=0
     [[ -n "$HOLDOUT_FAILED_IDS" ]] && HOLDOUT_FAILED_COUNT="$(printf '%s' "$HOLDOUT_FAILED_IDS" | tr ',' '\n' | grep -c .)"
-    logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT" "$HOLDOUT_FAILED_COUNT"
+    # S3A: which shortcuts fired, not just pass/fail — a second logline() call
+    # against the same "verify_agent" phase, same as holdout_failed above; the
+    # call's own duration/cost/tokens were already recorded by run_claude().
+    VIOLATIONS_JSON="$(parse_violations "$VOUT")"
+    logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT" "$HOLDOUT_FAILED_COUNT" 0 0 0 "$VIOLATIONS_JSON"
     if [[ "$VERDICT" != "pass" ]]; then
       printf '%s\n' "$VOUT" >> "$STATE_DIR/verifier-raw.log"
       if [[ "$VERDICT" == "no_verdict" ]]; then
@@ -663,6 +731,23 @@ while :; do
   # Prune memory mechanically (instructions to the model are advisory).
   if [[ -f "$MEMORY_FILE" ]]; then tail -n 100 "$MEMORY_FILE" > "$MEMORY_FILE.tmp" && mv "$MEMORY_FILE.tmp" "$MEMORY_FILE"; fi
 
+  # S3A: the shared per-iteration metrics every log_iteration() call below
+  # needs, computed once now that every gate has run. gate_failed uses ":-"
+  # (not just unset-check) because FP is explicitly reset to "" at the top of
+  # the gate block, not left unset — "${FP:-none}" still resolves that to
+  # "none". files_changed counts changed-file rows from `git diff --stat`
+  # (each ends in a " | " hunk marker) against the last checkpoint, i.e. this
+  # iteration's own uncommitted work.
+  ITER_WALL=$(( $(now_epoch) - ITER_T0 ))
+  ITER_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "$ITER_COST_START" '$a - $b' 2>/dev/null || echo 0)"
+  # `grep -c` prints a count (even "0") whether or not it matched, but under
+  # pipefail its own exit-1-on-no-match would still make an `|| echo 0` fallback
+  # fire and double the output ("0\n0") — so no fallback here, just a default
+  # for the pathological case where the pipeline produced no output at all.
+  FILES_CHANGED="$(git diff --stat HEAD 2>/dev/null | grep -c '|' 2>/dev/null)"
+  FILES_CHANGED="${FILES_CHANGED:-0}"
+  GATE_FAILED="${FP:-none}"
+
   # STATUS: done is now the run-completion signal ONLY — never a per-iteration
   # pass/fail gate.
   PLAN_DONE=0
@@ -671,7 +756,8 @@ while :; do
   if [[ -z "$FAIL_REASON" && "$PLAN_DONE" -eq 1 ]]; then
     # SUCCESS — plan complete and every gate green.
     git add -A && git commit -q -m "autopilot: iteration $ITER (green)" 2>/dev/null || true
-    logline "iteration" "-" 0 0 0 0 0 "done"
+    log_iteration "done" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
     log_err "✅ all gates green at iteration $ITER — run complete."
     : > "$FEEDBACK_FILE"
     write_status "done"
@@ -684,7 +770,8 @@ while :; do
   if [[ -z "$FAIL_REASON" && "$TOTAL_BOXES" -eq 0 ]]; then
     log_err "plan has no checkboxes — progress can't be measured; relying on the caps."
     git add -A && git commit -q -m "autopilot: iteration $ITER (unmeasured)" 2>/dev/null || true
-    logline "iteration" "-" 0 0 0 0 0 "unmeasured"
+    log_iteration "unmeasured" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
     : > "$FEEDBACK_FILE"
     continue
   fi
@@ -693,7 +780,8 @@ while :; do
     # PROGRESS — an incomplete plan that moved forward with every gate green is
     # exactly what a slice-by-slice run looks like. Not a failure.
     git add -A && git commit -q -m "autopilot: iteration $ITER (progress: $TICKED_BEFORE→$TICKED_AFTER of $TOTAL_BOXES)" 2>/dev/null || true
-    logline "iteration" "-" 0 0 0 0 0 "progressed"
+    log_iteration "progressed" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
     LAST_FP=""; REPEAT=0
@@ -705,6 +793,7 @@ while :; do
   if [[ -z "$FAIL_REASON" ]]; then
     FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
     FP="no-progress"
+    GATE_FAILED="$FP"
   fi
 
   # FAILURE — feed back, reset sentinel, checkpoint WIP, maybe replan.
@@ -712,6 +801,8 @@ while :; do
   : > "$FEEDBACK_FILE"; append_feedback "$FP" "$FAIL_REASON"
   sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$PLAN_FILE" 2>/dev/null && rm -f "$PLAN_FILE.bak"
   git add -A && git commit -q -m "autopilot: iteration $ITER (wip, gate=$FP)" 2>/dev/null || true
+  log_iteration "fail" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
 
   # Stuck detection.
   if [[ "$FP" == "$LAST_FP" ]]; then

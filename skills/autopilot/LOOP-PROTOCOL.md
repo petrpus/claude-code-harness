@@ -248,12 +248,17 @@ push-from-main and `.env`/secret guards stay live.
 
 ## Log format
 
-Each line of `run-<id>.jsonl`:
+Two shapes share `run-<id>.jsonl`: one row per `claude -p` **call**, and one
+summary row per **iteration** (S3A). Both carry `ts`/`run_id`/`iter`/`phase`,
+which is enough to tell them apart (`phase:"iteration"` vs. anything else).
+
+Per-call row:
 
 ```json
 {"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
- "exit_code":0,"verdict":"pass|fail|no_verdict|","holdout_failed":0}
+ "exit_code":0,"verdict":"pass|fail|no_verdict|","holdout_failed":0,
+ "turns":6,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"violations":[]}
 ```
 
 `runner_reload` (R1) is logged once, immediately before the `exec` that
@@ -265,6 +270,35 @@ monotonic sequence.
 `holdout_failed` (S2) is the count of ids in that call's `holdout.failed[]` —
 0 on every phase except `verify_agent`, and 0 there too whenever no holdout
 file was given or every scenario held.
+
+`turns`/`cache_read_input_tokens`/`cache_creation_input_tokens` (S3A) come
+straight out of `claude -p --output-format json`'s `.num_turns`/`.usage` —
+still plain `json`, never `stream-json`; the budget cap's only cost source
+stays `total_cost_usd`. `violations` (S3A) is only ever non-empty on a
+`verify_agent` row: the `shortcut` numbers the verdict's `violations[]`
+named, e.g. `[2,7]`.
+
+Per-iteration row (S3A) — written once per iteration, after every gate has
+run, in addition to (not instead of) the per-call rows above:
+
+```json
+{"ts":"…","run_id":"…","iter":3,"phase":"iteration","model":"-",
+ "verdict":"done|unmeasured|progressed|fail","slice_id":"S3A","ticked_delta":1,
+ "gate_failed":"verify_cmd|secret|verify_agent|holdout|plan_dag|no_verdict|none",
+ "wall_s":180,"cost_usd":0.42,"files_changed":4,"verify_s":12,"dag_width":2,
+ "parked_count":0,"escalated":false}
+```
+
+`slice_id` is the id `select_next_slice()` assigned that iteration (S1B), or
+`""` on an unannotated plan. `gate_failed` mirrors the fingerprint the stuck
+ladder tracked for that iteration, or `"none"` when every gate passed —
+`plan_dag`/`plan_parked` iterations bypass the ladder entirely (they `continue`
+before BUILD ever runs) and so never reach this row. `dag_width` is how many
+unchecked, unblocked, unparked slices `select_next_slice()` could have picked
+from, not just the one it did — a chain reads `1` every iteration, a wide plan
+reads higher. `parked_count` and `escalated` are logged `0`/`false` until
+S4A/S4B implement parking and escalation, so the schema doesn't change again
+when they land.
 
 `/usage-report` reads these to attribute cost per run.
 

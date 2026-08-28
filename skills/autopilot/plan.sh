@@ -196,6 +196,39 @@ select_next_slice() {
   return 1
 }
 
+# plan_dag_width [parked-ids]
+#   S3A metric: how many unchecked, unblocked, unparked slices were actually
+#   choosable at selection time — not just which one select_next_slice()
+#   picked. Reads the PLAN_* globals left behind by the most recent
+#   plan_load() (select_next_slice() already calls it, so a caller invokes
+#   this right after selection without re-parsing the file). Same readiness
+#   test as select_next_slice()'s loop, just counted instead of returned on
+#   the first hit. An unannotated plan has no after: edges, so every
+#   unchecked row counts — width degrades to "boxes left" exactly as 0.4.0
+#   would report it.
+plan_dag_width() {
+  local parked_csv="${1:-}"
+  local -A parked=()
+  local p
+  for p in $(printf '%s' "$parked_csv" | tr ',' ' '); do
+    [[ -n "$p" ]] && parked["$p"]=1
+  done
+
+  local i n="${#PLAN_IDS[@]}" id ready b width=0
+  for (( i=0; i<n; i++ )); do
+    id="${PLAN_IDS[$i]}"
+    [[ -n "$id" ]] || continue
+    [[ "${PLAN_ROW_TICKED[$i]}" == "1" ]] && continue
+    [[ -n "${parked[$id]:-}" ]] && continue
+    ready=1
+    for b in ${PLAN_ROW_AFTER[$i]}; do
+      [[ "${PLAN_ID_TICKED[$b]:-0}" == "1" ]] || { ready=0; break; }
+    done
+    [[ "$ready" -eq 1 ]] && width=$(( width + 1 ))
+  done
+  echo "$width"
+}
+
 # plan_selected_line <id>
 #   Echoes the raw line text of the first *unticked* row carrying <id>, so a
 #   caller that just got an id back from select_next_slice() can hand the

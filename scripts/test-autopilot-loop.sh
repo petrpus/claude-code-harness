@@ -18,6 +18,19 @@
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 
+# R1's runner-reload handoff (AUTOPILOT_RUN_ID/ITER/TOTAL_COST/LOCK_OWNED) is
+# meant to travel from one loop.sh process to its own re-exec, never further.
+# When THIS test script itself runs as part of a live autopilot iteration
+# (verify.sh invoked from inside skills/autopilot/loop.sh's own BUILD phase —
+# exactly the run developing this harness), those vars are already exported
+# in the ambient shell and would otherwise leak into every "fresh run" fixture
+# below, making it silently adopt the live run's id/iter/cost instead of
+# starting clean. Every fixture here is a deliberately fresh run (or hand-
+# crafts the resume state it wants via --resume-run / a planted run-*.jsonl),
+# so strip the ambient handoff once, up front, rather than patch every call
+# site that shells out to loop.sh.
+unset AUTOPILOT_RUN_ID AUTOPILOT_ITER AUTOPILOT_TOTAL_COST AUTOPILOT_LOCK_OWNED
+
 FAIL=0
 note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }
@@ -545,6 +558,77 @@ grep -q "retrying once" "$WORK/r15.err" 2>/dev/null \
 [[ ! -s "$R15/tmp/autopilot/FEEDBACK.md" ]] \
   && ok "FEEDBACK.md is empty once every iteration recovered on retry" \
   || note "FEEDBACK.md still holds stale content: $(cat "$R15/tmp/autopilot/FEEDBACK.md" 2>/dev/null)"
+
+# --- 16. S3A: per-call and per-iteration metrics land in the run log -------
+# A three-slice annotated plan run to completion, then type-check every new
+# field on both a "build" row (per-call: turns, cache tokens) and an
+# "iteration" row (per-iteration: slice_id, ticked_delta, gate_failed, wall_s,
+# cost_usd, files_changed, verify_s, dag_width, parked_count, escalated) —
+# PRD § S3A. jq's `type` check catches a field that's missing (type "null")
+# same as one with the wrong shape.
+R16="$WORK/r16"; new_repo "$R16"
+cat > "$R16/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] T1 — first (after: —)
+- [ ] T2 — second (after: T1)
+- [ ] T3 — third (after: T2)
+
+STATUS: in-progress
+EOF
+run_loop "$R16" progress true
+RC16=$?
+[[ "$RC16" -eq 0 ]] \
+  && ok "the three-slice metrics fixture runs to completion (exit 0)" \
+  || note "metrics fixture exited $RC16 — expected 0"
+
+build_field_type() { # field
+  cat "$R16"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+    | jq -r --arg f "$1" 'select(.phase=="build") | .[$f] | type' 2>/dev/null | sort -u | tr '\n' ','
+}
+iter_field_type() { # field
+  cat "$R16"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+    | jq -r --arg f "$1" 'select(.phase=="iteration") | .[$f] | type' 2>/dev/null | sort -u | tr '\n' ','
+}
+
+for f in turns cache_read_input_tokens cache_creation_input_tokens; do
+  got="$(build_field_type "$f")"
+  [[ "$got" == "number," ]] \
+    && ok "build rows carry a numeric '$f'" \
+    || note "build rows' '$f' type(s): '$got', want 'number,'"
+done
+
+for f in ticked_delta wall_s cost_usd files_changed verify_s dag_width parked_count; do
+  got="$(iter_field_type "$f")"
+  [[ "$got" == "number," ]] \
+    && ok "iteration rows carry a numeric '$f'" \
+    || note "iteration rows' '$f' type(s): '$got', want 'number,'"
+done
+
+got="$(iter_field_type "slice_id")"
+[[ "$got" == "string," ]] \
+  && ok "iteration rows carry a string 'slice_id'" \
+  || note "iteration rows' 'slice_id' type(s): '$got', want 'string,'"
+
+got="$(iter_field_type "gate_failed")"
+[[ "$got" == "string," ]] \
+  && ok "iteration rows carry a string 'gate_failed'" \
+  || note "iteration rows' 'gate_failed' type(s): '$got', want 'string,'"
+
+got="$(iter_field_type "escalated")"
+[[ "$got" == "boolean," ]] \
+  && ok "iteration rows carry a boolean 'escalated' (false until S4B)" \
+  || note "iteration rows' 'escalated' type(s): '$got', want 'boolean,'"
+
+SLICE_SEQ_16="$(cat "$R16"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="iteration") | .slice_id' 2>/dev/null | tr '\n' ',')"
+[[ "$SLICE_SEQ_16" == "T1,T2,T3," ]] \
+  && ok "iteration rows record the selected slice_id in dependency order (T1,T2,T3)" \
+  || note "iteration rows' slice_id sequence was '$SLICE_SEQ_16', want T1,T2,T3,"
+
+DAG_WIDTH_SEQ_16="$(cat "$R16"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="iteration") | .dag_width' 2>/dev/null | tr '\n' ',')"
+[[ "$DAG_WIDTH_SEQ_16" == "1,1,1," ]] \
+  && ok "dag_width reflects a linear chain (exactly one slice choosable per iteration: $DAG_WIDTH_SEQ_16)" \
+  || note "dag_width sequence was '$DAG_WIDTH_SEQ_16', want 1,1,1, for a linear after: chain"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then
