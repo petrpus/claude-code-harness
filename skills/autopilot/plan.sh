@@ -65,6 +65,15 @@ plan_parse_line() {
 #   only on annotated plans, where ids are unique by convention. An
 #   unannotated 0.4.0 plan can repeat "first tokens" freely (e.g. every line
 #   starting "- [ ] slice N") because nothing ever looks such an id up.
+# Readers below (plan_dag_width, plan_selected_line) address these globals
+# directly. Under `set -u` an unset array is a fatal "unbound variable", and a
+# reader that dies mid-`$(...)` echoes nothing — DAG_WIDTH would silently
+# become empty instead of a number. Declaring them at file scope makes a
+# caller that forgot plan_load() get an honest empty answer rather than a
+# crash, so a wrong metric can never masquerade as a missing one.
+declare -a PLAN_IDS=() PLAN_ROW_TICKED=() PLAN_ROW_AFTER=() PLAN_ROW_RAW=()
+declare -A PLAN_ID_TICKED=() PLAN_ID_KNOWN=()
+
 plan_load() {
   local file="$1" line parsed id ticked after
   PLAN_IDS=(); PLAN_ROW_TICKED=(); PLAN_ROW_AFTER=(); PLAN_ROW_RAW=()

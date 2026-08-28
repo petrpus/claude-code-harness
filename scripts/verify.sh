@@ -422,6 +422,43 @@ EOF
   [[ "$(printf '%s' "$TICKEDAFTER" | cut -f2)" == "1" ]] \
     && ok "malformed: after: on an already-ticked line parses without error" \
     || note "malformed: ticked line with after: mis-parsed, got '$TICKEDAFTER'"
+
+  # -- the two readers that address PLAN_* globals directly -------------------
+  # Both were the only uncovered functions in plan.sh and both died under
+  # `set -u` when called before any plan_load(). A reader that dies inside
+  # `$(...)` echoes nothing, so DAG_WIDTH would have gone silently empty
+  # rather than loudly wrong. Called in a fresh `bash -u` so a plan_load()
+  # earlier in THIS file cannot mask a regression.
+  COLD_W="$(bash -uo pipefail -c '. skills/autopilot/plan.sh; plan_dag_width ""' 2>/dev/null)"
+  [[ "$COLD_W" == "0" ]] \
+    && ok "plan_dag_width without plan_load: answers 0, does not crash under set -u" \
+    || note "plan_dag_width before plan_load should echo 0, got '$COLD_W'"
+
+  bash -uo pipefail -c '. skills/autopilot/plan.sh; plan_selected_line S1' >/dev/null 2>&1; RC=$?
+  [[ "$RC" -eq 1 ]] \
+    && ok "plan_selected_line without plan_load: rc=1 (not found), does not crash" \
+    || note "plan_selected_line before plan_load should exit 1, got $RC"
+
+  # -- plan_dag_width counts what select_next_slice() could have chosen -------
+  cat > "$PLAN_TEST_DIR/width.md" <<'WEOF'
+- [x] W1 — root (after: —)
+- [ ] W2 — left (after: W1)
+- [ ] W3 — right (after: W1)
+- [ ] W4 — join (after: W2, W3)
+WEOF
+  plan_load "$PLAN_TEST_DIR/width.md"
+  [[ "$(plan_dag_width "")" == "2" ]] \
+    && ok "plan_dag_width: diamond with the root ticked offers 2 candidates" \
+    || note "plan_dag_width: expected 2 unblocked candidates, got '$(plan_dag_width "")'"
+  [[ "$(plan_dag_width "W2")" == "1" ]] \
+    && ok "plan_dag_width: parking one sibling drops the width to 1" \
+    || note "plan_dag_width: parking W2 should leave 1, got '$(plan_dag_width "W2")'"
+  [[ "$(plan_selected_line W3)" == *"right"* ]] \
+    && ok "plan_selected_line: returns the unticked row's own wording" \
+    || note "plan_selected_line W3 did not return its row"
+  plan_selected_line W1 >/dev/null 2>&1 \
+    && note "plan_selected_line should not return a ticked row (W1)" \
+    || ok "plan_selected_line: a ticked row is not selectable"
 else
   note "skills/autopilot/plan.sh is missing"
 fi
