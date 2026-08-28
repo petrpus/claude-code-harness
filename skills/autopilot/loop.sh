@@ -14,7 +14,7 @@
 #           [--plan-model opus] [--build-model sonnet] [--verify-model haiku]
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
 #           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
-#           [--resume-run] [--dry-run]
+#           [--no-repo-map] [--resume-run] [--dry-run]
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
 #             cap · 1 runner error (bad preconditions, missing deps).
@@ -58,6 +58,7 @@ RESUME=0
 DRY_RUN=0
 EXTRA_ALLOWED_TOOLS=""
 HOLDOUT_ARG=""
+REPO_MAP_ENABLED=1
 
 BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
@@ -77,9 +78,10 @@ while [[ $# -gt 0 ]]; do
     --per-call-timeout) PER_CALL_TIMEOUT="$2"; shift 2 ;;
     --extra-allowed-tools) EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
     --holdout)           HOLDOUT_ARG="$2"; shift 2 ;;
+    --no-repo-map)       REPO_MAP_ENABLED=0; shift ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
-    -h|--help)          sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)          sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) log_err "unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -241,22 +243,27 @@ logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_fai
 
 # log_iteration <verdict> <slice_id> <ticked_delta> <gate_failed> <wall_s>
 #               <cost_usd> <files_changed> <verify_s> <dag_width>
-#               <parked_count> <escalated>
+#               <parked_count> <escalated> <repo_map>
 #   S3A: one summary row per ITERATION (as opposed to logline()'s one row per
 #   `claude -p` CALL) — the fields a run-level report (S3B, /usage-report)
 #   needs without re-deriving them from the per-call rows. parked_count and
 #   escalated are logged 0/false until S4A/S4B implement parking/escalation,
-#   so the schema doesn't change again when they do (PRD § S3A).
+#   so the schema doesn't change again when they do (PRD § S3A). repo_map
+#   (S5) is whether this iteration's BUILD prompt actually carried a repo-map
+#   digest — false both when --no-repo-map was given and when the digest
+#   generator failed/produced nothing, so the field answers "did BUILD see
+#   one", not "was the flag on".
 log_iteration() {
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
      --arg verdict "$1" --arg slice_id "${2:-}" --argjson ticked_delta "${3:-0}" \
      --arg gate_failed "${4:-none}" --argjson wall_s "${5:-0}" --argjson cost_usd "${6:-0}" \
      --argjson files_changed "${7:-0}" --argjson verify_s "${8:-0}" --argjson dag_width "${9:-0}" \
      --argjson parked_count "${10:-0}" --argjson escalated "${11:-false}" \
+     --argjson repo_map "${12:-false}" \
      '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:"iteration",model:"-",verdict:$verdict,
        slice_id:$slice_id,ticked_delta:$ticked_delta,gate_failed:$gate_failed,wall_s:$wall_s,
        cost_usd:$cost_usd,files_changed:$files_changed,verify_s:$verify_s,dag_width:$dag_width,
-       parked_count:$parked_count,escalated:$escalated}' \
+       parked_count:$parked_count,escalated:$escalated,repo_map:$repo_map}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -382,8 +389,8 @@ Do not implement anything yet. Only write the plan file.
 EOF
 }
 
-build_prompt() { # [selected_id] [selected_line]
-  local sel_id="${1:-}" sel_line="${2:-}" item_instr
+build_prompt() { # [selected_id] [selected_line] [repo_map_digest]
+  local sel_id="${1:-}" sel_line="${2:-}" digest="${3:-}" item_instr digest_section=""
   if [[ -n "$sel_id" ]]; then
     item_instr="$(cat <<ITEM
 Do exactly the plan item \`$sel_id\` selected by the runner (its line in
@@ -392,6 +399,19 @@ ITEM
 )"
   else
     item_instr="Do exactly ONE unchecked plan item."
+  fi
+  # S5 (ADR-0004 item 7): a navigational hint only, never ground truth — the
+  # grep backend's phantom edges make it unsafe to feed PLAN or the verifier
+  # (see skills/repo-map/digest.sh's header), but BUILD can discount a wrong
+  # hint by just opening the file.
+  if [[ -n "$digest" ]]; then
+    digest_section="$(cat <<DIGEST
+
+---
+## Repo map (navigational hint, not ground truth)
+$digest
+DIGEST
+)"
   fi
   cat <<EOF
 You are ONE iteration of an autonomous BUILD loop. Fresh context — all state is
@@ -413,6 +433,7 @@ write a docs/adr/ entry. Then:
 
 Do not tick a box you didn't prove. Do not fake completion. Do not modify the
 verify command to make it pass.
+$digest_section
 EOF
 }
 
@@ -639,8 +660,19 @@ while :; do
   plan_load "$PLAN_FILE"
   DAG_WIDTH="$(plan_dag_width "")"
 
+  # S5 (ADR-0004 item 7): a compact repo-map digest for BUILD only — never for
+  # PLAN or the verifier (see skills/repo-map/digest.sh's header for why).
+  # Any failure (missing jq/awk, an ungeneratable map) just omits the section
+  # below; it is never an iteration failure. --no-repo-map disables it outright.
+  REPO_MAP_DIGEST=""
+  if [[ "$REPO_MAP_ENABLED" -eq 1 ]]; then
+    REPO_MAP_DIGEST="$(bash "$PLUGIN_ROOT/skills/repo-map/digest.sh" "$SELECTED_LINE" 2>/dev/null)" || REPO_MAP_DIGEST=""
+  fi
+  REPO_MAP_USED=false
+  [[ -n "$REPO_MAP_DIGEST" ]] && REPO_MAP_USED=true
+
   # BUILD
-  run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE")" >/dev/null
+  run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
 
   TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
@@ -757,7 +789,7 @@ while :; do
     # SUCCESS — plan complete and every gate green.
     git add -A && git commit -q -m "autopilot: iteration $ITER (green)" 2>/dev/null || true
     log_iteration "done" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
     log_err "✅ all gates green at iteration $ITER — run complete."
     : > "$FEEDBACK_FILE"
     write_status "done"
@@ -771,7 +803,7 @@ while :; do
     log_err "plan has no checkboxes — progress can't be measured; relying on the caps."
     git add -A && git commit -q -m "autopilot: iteration $ITER (unmeasured)" 2>/dev/null || true
     log_iteration "unmeasured" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
     : > "$FEEDBACK_FILE"
     continue
   fi
@@ -781,7 +813,7 @@ while :; do
     # exactly what a slice-by-slice run looks like. Not a failure.
     git add -A && git commit -q -m "autopilot: iteration $ITER (progress: $TICKED_BEFORE→$TICKED_AFTER of $TOTAL_BOXES)" 2>/dev/null || true
     log_iteration "progressed" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
     LAST_FP=""; REPEAT=0
@@ -802,7 +834,7 @@ while :; do
   sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$PLAN_FILE" 2>/dev/null && rm -f "$PLAN_FILE.bak"
   git add -A && git commit -q -m "autopilot: iteration $ITER (wip, gate=$FP)" 2>/dev/null || true
   log_iteration "fail" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
-    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false
+    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" 0 false "$REPO_MAP_USED"
 
   # Stuck detection.
   if [[ "$FP" == "$LAST_FP" ]]; then

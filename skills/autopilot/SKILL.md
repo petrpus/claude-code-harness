@@ -56,7 +56,10 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    (R1) instead of starting over at iteration 0 / cost 0. `--holdout <path>`
    overrides the default holdout location
    (`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`);
-   omit it and a missing file just disables gate (e).
+   omit it and a missing file just disables gate (e). Every BUILD prompt also
+   carries a compact repo-map digest (`skills/repo-map/digest.sh`) — stats,
+   top hotspots, and deps/rdeps for any file the selected slice names — as a
+   navigational hint, not ground truth; `--no-repo-map` turns it off.
 
    If this repo *is* the autopilot harness's own source, a slice can
    legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh` — the runner

@@ -39,6 +39,12 @@ LOOP="skills/autopilot/loop.sh"
 [[ -f "$LOOP" ]] || { note "$LOOP is missing"; echo; echo "test-autopilot-loop: $FAIL failure(s)"; exit 1; }
 LOOP_ABS="$(cd "$(dirname "$LOOP")" && pwd)/$(basename "$LOOP")"
 
+# S5: repo-map digest.sh, exercised both through the loop (as loop.sh itself
+# invokes it) and directly (for the line-cap unit check below).
+DIGEST="skills/repo-map/digest.sh"
+[[ -f "$DIGEST" ]] || { note "$DIGEST is missing"; echo; echo "test-autopilot-loop: $FAIL failure(s)"; exit 1; }
+DIGEST_ABS="$(cd "$(dirname "$DIGEST")" && pwd)/$(basename "$DIGEST")"
+
 command -v jq >/dev/null 2>&1 || { note "jq is required"; echo; echo "test-autopilot-loop: $FAIL failure(s)"; exit 1; }
 
 WORK="$(mktemp -d)"
@@ -629,6 +635,89 @@ DAG_WIDTH_SEQ_16="$(cat "$R16"/tmp/autopilot/run-*.jsonl 2>/dev/null \
 [[ "$DAG_WIDTH_SEQ_16" == "1,1,1," ]] \
   && ok "dag_width reflects a linear chain (exactly one slice choosable per iteration: $DAG_WIDTH_SEQ_16)" \
   || note "dag_width sequence was '$DAG_WIDTH_SEQ_16', want 1,1,1, for a linear after: chain"
+
+# --- 17. Repo-map digest into BUILD (S5): digest.sh, --no-repo-map ---------
+# ADR-0004 item 7 / PRD § S5. digest.sh emits <= 40 lines via query.sh only;
+# build_prompt() appends it under a fixed heading when a map can be produced,
+# --no-repo-map disables the whole thing, and the run log records repo_map
+# per iteration.
+R17="$WORK/r17"; new_repo "$R17"
+mkdir -p "$R17/src"
+printf "import './b.js';\n" > "$R17/src/a.js"
+: > "$R17/src/b.js"
+git -C "$R17" add -A >/dev/null 2>&1
+git -C "$R17" -c user.email=t@t.est -c user.name=test commit -q -m "add source files"
+cat > "$R17/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] S1 — work on src/a.js and src/b.js (after: —)
+
+STATUS: in-progress
+EOF
+run_loop "$R17" progress true
+RC17=$?
+[[ "$RC17" -eq 0 ]] \
+  && ok "repo-map fixture run completes (exit 0)" \
+  || note "repo-map fixture run exited $RC17 — expected 0"
+
+grep -q "Repo map (navigational hint, not ground truth)" "$WORK/r17.calls" 2>/dev/null \
+  && ok "BUILD prompt carries the repo-map digest heading when a map can be produced" \
+  || note "BUILD prompt is missing the repo-map digest heading"
+
+REPO_MAP_SEQ_17="$(cat "$R17"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="iteration") | .repo_map' 2>/dev/null | tr '\n' ',')"
+[[ "$REPO_MAP_SEQ_17" == "true," ]] \
+  && ok "the run log records repo_map: true for the iteration that got a digest" \
+  || note "iteration rows' repo_map was '$REPO_MAP_SEQ_17', want true,"
+
+R17B="$WORK/r17b"; new_repo "$R17B"
+mkdir -p "$R17B/src"
+printf "import './b.js';\n" > "$R17B/src/a.js"
+: > "$R17B/src/b.js"
+git -C "$R17B" add -A >/dev/null 2>&1
+git -C "$R17B" -c user.email=t@t.est -c user.name=test commit -q -m "add source files"
+cat > "$R17B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] S1 — work on src/a.js and src/b.js (after: —)
+
+STATUS: in-progress
+EOF
+run_loop "$R17B" progress true --no-repo-map
+RC17B=$?
+[[ "$RC17B" -eq 0 ]] \
+  && ok "repo-map fixture run completes under --no-repo-map (exit 0)" \
+  || note "--no-repo-map run exited $RC17B — expected 0"
+
+grep -q "Repo map (navigational hint, not ground truth)" "$WORK/r17b.calls" 2>/dev/null \
+  && note "--no-repo-map still injected the digest heading into BUILD" \
+  || ok "--no-repo-map omits the digest heading from BUILD"
+
+REPO_MAP_SEQ_17B="$(cat "$R17B"/tmp/autopilot/run-*.jsonl 2>/dev/null \
+  | jq -r 'select(.phase=="iteration") | .repo_map' 2>/dev/null | tr '\n' ',')"
+[[ "$REPO_MAP_SEQ_17B" == "false," ]] \
+  && ok "the run log records repo_map: false under --no-repo-map" \
+  || note "iteration rows' repo_map under --no-repo-map was '$REPO_MAP_SEQ_17B', want false,"
+
+# digest.sh's own line cap, exercised directly against a fixture with many
+# real files — the per-file block alone (3 lines each) blows past 40 lines
+# without the cap, so this proves the cap actually bites, not just that a
+# small fixture happens to stay under it.
+R17C="$WORK/r17c"; mkdir -p "$R17C/tmp"
+git -C "$R17C" init -q >/dev/null 2>&1
+printf 'tmp/\n' > "$R17C/.gitignore"
+mkdir -p "$R17C/src"
+HINT_FILES=""
+for i in $(seq 1 15); do
+  n="$(printf '%02d' "$i")"; nn="$(printf '%02d' "$((i + 1))")"
+  printf 'import "./f%s.js";\n' "$nn" > "$R17C/src/f$n.js"
+  HINT_FILES="$HINT_FILES src/f$n.js"
+done
+: > "$R17C/src/f16.js"
+git -C "$R17C" add -A >/dev/null 2>&1
+git -C "$R17C" -c user.email=t@t.est -c user.name=test commit -q -m init >/dev/null 2>&1
+
+DIGEST_OUT="$(cd "$R17C" && bash "$DIGEST_ABS" "$HINT_FILES" 2>/dev/null)"
+DIGEST_LINES="$(printf '%s\n' "$DIGEST_OUT" | grep -c '.')" || DIGEST_LINES=0
+[[ "${DIGEST_LINES:-0}" -le 40 ]] \
+  && ok "digest.sh caps its output at <= 40 lines even with many file hints ($DIGEST_LINES)" \
+  || note "digest.sh emitted ${DIGEST_LINES:-0} lines with 15 file hints, want <= 40"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

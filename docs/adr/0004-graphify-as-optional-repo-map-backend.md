@@ -68,3 +68,12 @@ phantom edges inflate `fan_in`, the metric `hotspots` ranks on, so the cheap
 backend's output is a navigational hint, not ground truth. Rather than chase
 parsing accuracy we do not want to own, we accept that ceiling for the
 zero-dependency tier and let projects that need precision run Graphify.
+
+**Footnote (0.5.0, S5):** item 7 above — "autopilot gets a compact digest, not
+the whole graph" — is implemented as `skills/repo-map/digest.sh`, wired into
+`skills/autopilot/loop.sh`'s `build_prompt()` only (behind `--no-repo-map`).
+Consistent with the accuracy note just above, it is deliberately kept out of
+the PLAN and verifier prompts: BUILD can shrug off a phantom edge by opening
+the file anyway, but PLAN would freeze one into a hard `after:` edge that
+`select_next_slice()` (ADR-0005) then enforces as real ordering. See PRD 0002
+§ S5 for the full rationale.

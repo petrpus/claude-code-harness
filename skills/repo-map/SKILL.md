@@ -201,3 +201,16 @@ otherwise match the harness's conventions.
   Usage: `query.sh <deps|rdeps|hotspots|entry-points|stats> [args]`. Set
   `REPO_MAP_ROOT` to point it at a tree other than the current git toplevel
   (used by `scripts/test-repo-map.sh`'s fixture tests).
+- `digest.sh [slice-hint]` — the compact digest `skills/autopilot/loop.sh`
+  feeds BUILD (ADR-0004 item 7, closed in 0.5.0's S5): `stats`, the top-10
+  `hotspots`, and, for each file path found in `slice-hint` (autopilot passes
+  the selected plan slice's own line), its `deps`/`rdeps` (capped at 8 each).
+  Calls `query.sh` only — never reads `tmp/repo-map.json` directly, so
+  staleness/regeneration stays single-sourced there — and emits at most 40
+  lines total, truncating rather than growing past it. Deliberately **not**
+  wired into the PLAN or verifier prompts: BUILD can discount a wrong hint by
+  opening the file anyway, but PLAN would freeze a phantom grep-backend edge
+  into a hard `after:` ordering that `select_next_slice()` then enforces.
+  Never a hard error — a missing map or any `query.sh` failure means "no
+  digest" (exit 1, nothing on stdout); the caller omits the whole section
+  rather than inject a partial one.

@@ -142,6 +142,26 @@ text. A holdout failure is fingerprinted `holdout`, distinct from a generic
 `verify_agent` failure, so the stuck ladder (and a human skimming the log)
 can tell "missed a hidden scenario" apart from "cut some other corner."
 
+### Repo-map digest (S5, ADR-0004 item 7)
+
+Every BUILD prompt gets a compact `skills/repo-map/digest.sh` digest appended
+under a fixed heading ("Repo map (navigational hint, not ground truth)"):
+`stats`, the top-10 `hotspots`, and, for each file path found in the selected
+slice's own line, its `deps`/`rdeps` (capped at 8 each) — at most 40 lines
+total. `digest.sh` calls `query.sh` only, so staleness/regeneration stays
+single-sourced there; any failure (missing `jq`/`awk`, an ungeneratable map)
+just omits the section — never an iteration failure. `--no-repo-map` disables
+it outright, and the per-iteration log row (see § Log format) records whether
+BUILD actually got one that iteration.
+
+This is deliberately BUILD-only. `plan_prompt()` and `verify_prompt()` never
+see it: the grep backend's phantom edges (a specifier that only *looks* like
+an import, quoted inside a string) are safe for BUILD to discount by opening
+the file anyway, but PLAN would freeze one into a hard `after:` edge that
+`select_next_slice()` then enforces as real ordering — narrowing the Plan DAG
+with an invented dependency, the opposite of what parking (S4A) needs a wide
+DAG for. The verifier judges the diff, not the map.
+
 ### Why completion is not a per-iteration gate
 
 BUILD is told to do exactly **one** plan item per iteration, so on any plan
@@ -286,7 +306,7 @@ run, in addition to (not instead of) the per-call rows above:
  "verdict":"done|unmeasured|progressed|fail","slice_id":"S3A","ticked_delta":1,
  "gate_failed":"verify_cmd|secret|verify_agent|holdout|plan_dag|no_verdict|none",
  "wall_s":180,"cost_usd":0.42,"files_changed":4,"verify_s":12,"dag_width":2,
- "parked_count":0,"escalated":false}
+ "parked_count":0,"escalated":false,"repo_map":true}
 ```
 
 `slice_id` is the id `select_next_slice()` assigned that iteration (S1B), or
@@ -298,7 +318,10 @@ unchecked, unblocked, unparked slices `select_next_slice()` could have picked
 from, not just the one it did — a chain reads `1` every iteration, a wide plan
 reads higher. `parked_count` and `escalated` are logged `0`/`false` until
 S4A/S4B implement parking and escalation, so the schema doesn't change again
-when they land.
+when they land. `repo_map` (S5) is whether BUILD's prompt actually carried a
+repo-map digest that iteration — `false` both under `--no-repo-map` and when
+the digest generator produced nothing (missing `jq`/`awk`, an ungeneratable
+map), so it answers "did BUILD see one," not "was the flag on."
 
 `/usage-report` reads these to attribute cost per run.
 
