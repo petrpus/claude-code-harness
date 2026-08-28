@@ -40,3 +40,11 @@ Verification must be adversarial and independent — a fresh cheap model that
 assumes the code is broken catches shortcuts the author's own model rationalizes
 away. That is why the gate is haiku running `agents/verifier.md`, not the build
 model checking its own work.
+
+**Open question (2026-08-28, loopkit survey).** Loopkit's `model-routing` claims the
+opposite corner of the grid: a *cheap executor + frontier judge* beats a frontier
+executor with no judge, arguing a weak judge is worse than no judge and that judge
+cost stays low because it only reads the diff. Our tiering (sonnet build, haiku
+judge) sits on the other diagonal. Not adopted — but it is an empirical question,
+and PRD 0002 S3's metrics (holdout failures, gate-fail rates, per-shortcut verdict
+distribution) are what an answer would be made of. Revisit with data.
