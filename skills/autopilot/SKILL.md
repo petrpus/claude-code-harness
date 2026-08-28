@@ -62,6 +62,13 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    top hotspots, and deps/rdeps for any file the selected slice names — as a
    navigational hint, not ground truth; `--no-repo-map` turns it off.
 
+   Other flags: `--verify-cmd <cmd>` overrides the project verify command the
+   runner detects; `--max-turns <n>` caps turns per `claude -p` call;
+   `--per-call-timeout <seconds>` (default 1200) wraps every call and the
+   verify command in `timeout` so one hang can't defeat `--max-minutes`;
+   `--extra-allowed-tools <list>` appends to BUILD's `--allowedTools`
+   allowlist for a project that needs one more command.
+
    If this repo *is* the autopilot harness's own source, a slice can
    legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — the runner
    notices its own sourced files changed on disk and re-execs itself under the

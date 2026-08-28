@@ -28,10 +28,17 @@ safety:
 ${CLAUDE_PLUGIN_ROOT}/skills/autopilot/loop.sh --max-iterations 10 --budget-usd 10
 ```
 
-Each iteration is a fresh `claude -p` with state on disk; the runner enforces
-hard gates (machine verify + secret scan + adversarial haiku verifier), caps
-(iteration/time/budget), git checkpoints, and a JSONL run log. Cheap models
-verify, mid implements, top plans — see `docs/model-policy.md`.
+Each iteration is a fresh `claude -p` with state on disk. Before building, the
+runner walks the plan as a **Plan DAG** (`(after: id, id)` edges on a slice's
+checkbox — plain unannotated plans behave exactly as before) and picks the one
+unblocked, unparked slice to build. The runner then enforces four Iteration
+gates — machine verify, secret scan, an adversarial haiku verifier, and
+(optionally) hidden holdout scenarios the build model never sees — plus caps
+(iteration/time/budget), git checkpoints, and a JSONL run log. A slice that
+keeps failing climbs a five-rung stuck ladder: retry → escalate to a stronger
+model (`--escalate-model`) → park it for a sibling to run → replan once
+everything is parked → abort. Cheap models verify, mid implements, top plans —
+see `docs/model-policy.md` and `skills/autopilot/LOOP-PROTOCOL.md`.
 
 ## Install
 

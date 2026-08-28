@@ -90,11 +90,25 @@ Three layers, each owning its rule kind — don't duplicate a rule across them:
 `skills/autopilot/` runs long autonomous work as a loop of **fresh `claude -p`
 sessions** with all state on disk under `tmp/autopilot/` (`PROMPT.md` charter,
 `IMPLEMENTATION_PLAN.md` + `STATUS:` sentinel, `MEMORY.md`, `FEEDBACK.md`,
-`status.json`, `run-<id>.jsonl`, `lock`). The **runner** — not the model —
-enforces the gates: it re-runs the verify command itself, scans the diff for
-secrets, and has a cheap haiku `verifier` agent adversarially check the diff
-before an iteration counts as done. See `skills/autopilot/LOOP-PROTOCOL.md` and
-`docs/model-policy.md`.
+`status.json`, `run-<id>.jsonl`, `lock`, `slices.json`). Before each iteration
+the runner — pure logic, no model call — walks the plan as a **Plan DAG**
+(optional `(after: id, id)` edges on a slice's checkbox line, `plan.sh`) and
+selects the one unblocked, unparked slice to build. A broken DAG (a cycle, or
+an edge naming an unknown id) is a **Plan-dependency failure**, not a gate — it
+bypasses the stuck ladder entirely and replans immediately.
+
+Once BUILD runs, the **runner** — not the model — enforces four **Iteration
+gates** in order: (b) machine verify (re-runs the verify command itself), (c)
+a secret scan of the diff, (d) a cheap haiku `verifier` agent adversarially
+checking the diff (fail-closed; a reply that isn't a parseable verdict is a
+**gate malfunction**, fingerprinted `no_verdict`, retried once rather than
+blamed on the slice), and (e) holdout — Given/When/Then scenarios from an
+optional `HOLDOUT.md` (outside the worktree, never read by BUILD) inlined into
+the verifier prompt only. A slice that keeps failing climbs a five-rung stuck
+ladder tracked per-slice in `slices.json`: retry → escalate (`--escalate-model`,
+rung 2) → park (rung 3, a sibling runs instead) → one replan once everything
+unblocked is parked (rung 4, unparks everything) → abort on the next failure
+(rung 5). See `skills/autopilot/LOOP-PROTOCOL.md` and `docs/model-policy.md`.
 
 ## Decomposition doctrine (when to reach for subagents)
 
