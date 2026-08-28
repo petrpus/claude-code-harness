@@ -51,10 +51,18 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 
    Defaults: plan=opus, build=sonnet, verify=haiku (override with
    `--plan-model` / `--build-model` / `--verify-model`). `--dry-run` prints the
-   plan of calls without spending. `--resume-run` continues an interrupted run
-   from disk state. `--holdout <path>` overrides the default holdout location
+   plan of calls without spending. `--resume-run` continues an interrupted run,
+   adopting its prior run id, iteration count and accumulated cost from disk
+   (R1) instead of starting over at iteration 0 / cost 0. `--holdout <path>`
+   overrides the default holdout location
    (`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`);
    omit it and a missing file just disables gate (e).
+
+   If this repo *is* the autopilot harness's own source, a slice can
+   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh` — the runner
+   notices its own sourced files changed on disk and re-execs itself under the
+   same run id before the next iteration (R1), so a live run picks up the fix
+   without a human restart. See `LOOP-PROTOCOL.md` § Runner self-reload.
 
 ## What you get
 

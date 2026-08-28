@@ -21,6 +21,11 @@
 
 set -uo pipefail
 
+# Preserve the original argv before the option-parsing loop below consumes it
+# via `shift` — R1 needs it unmodified to re-exec itself (plus --resume-run)
+# when a slice edits the runner mid-run.
+ORIG_ARGV=("$@")
+
 # ---------------------------------------------------------------------------
 # Resolve plugin root from THIS script's location. Do NOT rely on
 # $CLAUDE_PLUGIN_ROOT — that is only set for hook processes, and loop.sh runs
@@ -29,6 +34,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERIFIER_AGENT="$PLUGIN_ROOT/agents/verifier.md"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 STATE_DIR="tmp/autopilot"
 PROMPT_FILE="$STATE_DIR/PROMPT.md"
@@ -119,6 +125,24 @@ fi
 # unit-testable without a run (scripts/verify.sh exercises it directly).
 # shellcheck source=plan.sh
 . "$SCRIPT_DIR/plan.sh"
+
+# R1: bash parses this script's function bodies once, at startup — a slice
+# whose job is to fix loop.sh/plan.sh/allowlist.sh therefore never changes the
+# behaviour of the very process running it, only the next run a human starts
+# by hand. runner_files_hash() lets each iteration notice its own sourced
+# files changed on disk since startup and re-exec itself (see the check at
+# the top of the main loop) so the fix applies within the same run. Hashing
+# content (not mtime) means an edit that doesn't change the bytes — or a
+# clock skew — never triggers a spurious reload.
+runner_files_hash() {
+  local f
+  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh"; do
+      [[ -f "$f" ]] && cat "$f"
+    done
+  } | cksum
+}
+STARTUP_RUNNER_HASH="$(runner_files_hash)"
+
 BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},$(verify_grants "$VERIFY_CMD")"
 if verify_grants_are_narrow "$VERIFY_CMD"; then
   log_err "verify command starts with an interpreter ('${VERIFY_CMD%% *}'); granting only the exact command."
@@ -133,20 +157,57 @@ if [[ -n "$(git status --porcelain 2>/dev/null)" ]] && [[ "$RESUME" -eq 0 ]]; th
   exit 1
 fi
 
-# Concurrency lock (with stale detection).
-if [[ -f "$LOCK_FILE" ]]; then
-  LOCK_PID="$(head -1 "$LOCK_FILE" 2>/dev/null | cut -d' ' -f1)"
-  if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
-    log_err "another run holds the lock (pid $LOCK_PID). Abort or wait."
-    exit 1
+# Concurrency lock (with stale detection). A runner reload (R1) already owns
+# this lock — `exec` keeps the PID, so re-checking it here would find this
+# same process's own lock entry and mistake itself for a competing run.
+if [[ "${AUTOPILOT_LOCK_OWNED:-0}" -ne 1 ]]; then
+  if [[ -f "$LOCK_FILE" ]]; then
+    LOCK_PID="$(head -1 "$LOCK_FILE" 2>/dev/null | cut -d' ' -f1)"
+    if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
+      log_err "another run holds the lock (pid $LOCK_PID). Abort or wait."
+      exit 1
+    fi
+    log_err "removing stale lock (pid $LOCK_PID no longer running)."
+    rm -f "$LOCK_FILE"
   fi
-  log_err "removing stale lock (pid $LOCK_PID no longer running)."
-  rm -f "$LOCK_FILE"
 fi
 
 mkdir -p "$STATE_DIR"
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-echo "$$ $RUN_ID" > "$LOCK_FILE"
+
+# Run identity: fresh, resumed (--resume-run — a human restarting a killed or
+# stopped process), or reloaded (R1 — this exact process re-exec'ing itself
+# after a slice edited loop.sh/plan.sh/allowlist.sh; the AUTOPILOT_* vars are
+# its own handoff to itself, set right before the exec at the top of the main
+# loop below). A reload always wins when both are present, since it also
+# appends --resume-run to argv.
+if [[ -n "${AUTOPILOT_RUN_ID:-}" ]]; then
+  RUN_ID="$AUTOPILOT_RUN_ID"
+  ITER="${AUTOPILOT_ITER:-0}"
+  TOTAL_COST="${AUTOPILOT_TOTAL_COST:-0}"
+elif [[ "$RESUME" -eq 1 ]]; then
+  # Adopt the most recent run's identity instead of silently starting a new
+  # run at iteration 0 / cost 0 — until this fix, `--resume-run` only relaxed
+  # the dirty-tree check below and reset both clocks to zero, which is why
+  # the operator note calls a manual restart "picks up the fix" rather than
+  # "resumes the run": before R1 it couldn't do both at once.
+  LATEST_LOG="$(ls -t "$STATE_DIR"/run-*.jsonl 2>/dev/null | head -1)"
+  if [[ -n "$LATEST_LOG" ]]; then
+    RUN_ID="$(basename "$LATEST_LOG" .jsonl)"; RUN_ID="${RUN_ID#run-}"
+    ITER="$(jq -s 'map(.iter // 0) | max // 0' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
+    TOTAL_COST="$(jq -s '[.[].cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+  else
+    # No prior log to resume from — missing state is never an error
+    # (contract item 8), so this behaves like a fresh run.
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    ITER=0
+    TOTAL_COST=0
+  fi
+else
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  ITER=0
+  TOTAL_COST=0
+fi
+[[ "${AUTOPILOT_LOCK_OWNED:-0}" -eq 1 ]] || echo "$$ $RUN_ID" > "$LOCK_FILE"
 RUN_LOG="$STATE_DIR/run-$RUN_ID.jsonl"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
@@ -166,7 +227,6 @@ HOLDOUT_NOTICE_SHOWN=0
 # ---------------------------------------------------------------------------
 now_epoch() { date +%s 2>/dev/null || echo 0; }
 START_EPOCH="$(now_epoch)"
-TOTAL_COST=0
 
 logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
@@ -425,13 +485,28 @@ write_status "starting"
 
 # PLAN phase — only if no plan exists yet.
 if [[ ! -f "$PLAN_FILE" ]]; then
-  ITER=0
   run_claude "plan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" "$(plan_prompt)" >/dev/null
 fi
 
-ITER=0
 while :; do
   ITER=$(( ITER + 1 ))
+
+  # R1: a prior iteration's BUILD phase may have edited loop.sh, plan.sh or
+  # allowlist.sh — bash already parsed their function bodies for this
+  # process, so a fix just committed to disk would otherwise never apply
+  # until a human restarts the run. Catch it before this iteration's SELECT
+  # runs and re-exec ourselves; RUN_ID/iteration count/cost hand across via
+  # env so nothing about the run resets. At most one reload happens here per
+  # iteration — the new process computes its own baseline hash at startup, so
+  # an unchanged file can never spin.
+  if [[ "$(runner_files_hash)" != "$STARTUP_RUNNER_HASH" ]]; then
+    log_err "loop.sh/plan.sh/allowlist.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
+    logline "runner_reload" "-" 0 0 0 0 0 "reload"
+    write_status "reloading"
+    AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
+      AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_LOCK_OWNED=1 \
+      exec bash "$SELF" "${ORIG_ARGV[@]}" --resume-run
+  fi
 
   if [[ "$ITER" -gt "$MAX_ITERATIONS" ]]; then
     log_err "iteration cap ($MAX_ITERATIONS) reached."; write_status "iteration-cap"; exit 2

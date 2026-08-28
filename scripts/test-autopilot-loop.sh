@@ -42,7 +42,7 @@ cat > "$STUB_DIR/claude" <<'STUB'
 [[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
 prompt="$*"
 plan="tmp/autopilot/IMPLEMENTATION_PLAN.md"
-emit() { printf '{"result":%s,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1"; }
+emit() { printf '{"result":%s,"total_cost_usd":%s,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1" "${STUB_COST_PER_CALL:-0}"; }
 
 case "$prompt" in
   *"PLAN phase"*|*"autonomous run is stuck"*)
@@ -62,6 +62,13 @@ case "$prompt" in
     if [[ -n "${STUB_HOLDOUT_SENTINEL:-}" ]] \
        && printf '%s' "$prompt" | grep -qF "$STUB_HOLDOUT_SENTINEL"; then
       printf 'LEAK: holdout sentinel reached the BUILD prompt\n' >> "${STUB_LEAK_FILE:-/dev/null}"
+    fi
+    # R1 (runner self-reload): simulate a slice whose own job is to edit
+    # loop.sh, exactly once, guarded by a flag file so it doesn't keep
+    # editing on every subsequent iteration (which would never converge).
+    if [[ -n "${STUB_EDIT_RUNNER:-}" && ! -f "${STUB_EDIT_RUNNER_FLAG:-/dev/null}" ]]; then
+      printf '# stub: simulated runner edit %s\n' "$(date +%s%N)" >> "$STUB_EDIT_RUNNER"
+      touch "$STUB_EDIT_RUNNER_FLAG"
     fi
     if [[ "${STUB_MODE:-progress}" == "progress" ]]; then
       # touch a tracked file so the iteration has something to checkpoint
@@ -343,6 +350,110 @@ NOTICE_COUNT="$(grep -c "no HOLDOUT.md — holdout gate disabled" "$WORK/r9.err"
 [[ "${NOTICE_COUNT:-0}" -eq 1 ]] \
   && ok "the missing-holdout notice logs exactly once per run, not every iteration" \
   || note "missing-holdout notice logged ${NOTICE_COUNT:-0} times, expected exactly 1"
+
+# --- 10-11. Runner self-reload (R1) ----------------------------------------
+# bash parses loop.sh's (and plan.sh's/allowlist.sh's) function bodies once,
+# at startup, so a slice whose job is to fix the runner never changes the
+# process running it — only a run a human starts afterwards. These tests
+# drive an isolated COPY of the runner (never the repo's own loop.sh), since
+# the stub deliberately mutates it mid-run to simulate exactly that slice.
+PLUGIN_COPY="$WORK/plugin-copy"
+mkdir -p "$PLUGIN_COPY/skills/autopilot" "$PLUGIN_COPY/agents"
+LOOP_SRC_DIR="$(dirname "$LOOP_ABS")"
+cp "$LOOP_ABS" "$PLUGIN_COPY/skills/autopilot/loop.sh"
+cp "$LOOP_SRC_DIR/plan.sh" "$PLUGIN_COPY/skills/autopilot/plan.sh"
+cp "$LOOP_SRC_DIR/allowlist.sh" "$PLUGIN_COPY/skills/autopilot/allowlist.sh"
+cp agents/verifier.md "$PLUGIN_COPY/agents/verifier.md"
+COPY_LOOP="$PLUGIN_COPY/skills/autopilot/loop.sh"
+
+run_loop_copy() { # dir mode verify-cmd extra...
+  local dir="$1" mode="$2" vcmd="$3"; shift 3
+  ( cd "$dir" && PATH="$STUB_DIR:$PATH" STUB_MODE="$mode" \
+      STUB_CALL_LOG="$WORK/$(basename "$dir").calls" \
+      bash "$COPY_LOOP" --verify-cmd "$vcmd" --max-iterations 12 --max-minutes 30 --budget-usd 5 "$@" \
+      >"$WORK/$(basename "$dir").out" 2>"$WORK/$(basename "$dir").err" )
+}
+
+# --- 10. A slice that edits loop.sh takes effect within the same run -------
+R10="$WORK/r10"; new_repo "$R10"
+EDIT_FLAG="$WORK/r10-edit.flag"; rm -f "$EDIT_FLAG"
+( cd "$R10" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    STUB_CALL_LOG="$WORK/r10.calls" \
+    STUB_EDIT_RUNNER="$COPY_LOOP" STUB_EDIT_RUNNER_FLAG="$EDIT_FLAG" \
+    bash "$COPY_LOOP" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r10.out" 2>"$WORK/r10.err" )
+RC10=$?
+[[ "$RC10" -eq 0 ]] \
+  && ok "a run whose BUILD phase edits loop.sh still completes (exit 0)" \
+  || note "runner-self-edit run exited $RC10 — expected 0"
+
+RELOAD_COUNT="$(grep -c "reloading" "$WORK/r10.err" 2>/dev/null)" || RELOAD_COUNT=0
+[[ "${RELOAD_COUNT:-0}" -eq 1 ]] \
+  && ok "the runner reloads itself exactly once" \
+  || note "expected exactly one reload, saw ${RELOAD_COUNT:-0} (see $WORK/r10.err)"
+
+RUN_LOG_COUNT="$(find "$R10/tmp/autopilot" -maxdepth 1 -name 'run-*.jsonl' 2>/dev/null | grep -c .)" || RUN_LOG_COUNT=0
+[[ "$RUN_LOG_COUNT" -eq 1 ]] \
+  && ok "the reload keeps the same run id (a single run-*.jsonl file)" \
+  || note "expected exactly one run-*.jsonl file, found $RUN_LOG_COUNT"
+
+MAX_ITER="$(cat "$R10"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -s 'map(.iter // 0) | max // 0' 2>/dev/null)"
+[[ "${MAX_ITER:-0}" -ge 5 ]] \
+  && ok "iteration numbering kept increasing across the reload (max iter $MAX_ITER)" \
+  || note "iteration count looks reset across the reload (max iter ${MAX_ITER:-0})"
+
+# --- 11. An untouched runner never reloads ----------------------------------
+R11="$WORK/r11"; new_repo "$R11"
+run_loop_copy "$R11" progress true
+RC11=$?
+[[ "$RC11" -eq 0 ]] \
+  && ok "an untouched runner still completes normally (exit 0)" \
+  || note "untouched-runner run exited $RC11 — expected 0"
+grep -q "reloading" "$WORK/r11.err" 2>/dev/null \
+  && note "the runner reloaded even though nothing edited it" \
+  || ok "no spurious reload when loop.sh/plan.sh/allowlist.sh are untouched"
+
+# c: neither test 10 nor test 11 tripped the concurrency lock or the
+# dirty-tree guard — both already assert exit 0 above, which those guards
+# would have prevented (exit 1) had the reload mishandled either one.
+[[ "$RC10" -eq 0 && "$RC11" -eq 0 ]] \
+  && ok "the reload trips neither the concurrency lock nor the dirty-tree guard" \
+  || note "a reload run hit a guard instead of completing (rc10=$RC10, rc11=$RC11)"
+
+# --- 12. --resume-run adopts the prior run's id, iter and cost -------------
+# Hand-craft a prior run's log rather than orchestrating one, so the
+# expected id/iter/cost are known exactly instead of inferred.
+R12="$WORK/r12"; new_repo "$R12"
+cat > "$R12/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID="20260101T000000Z-999999"
+cat > "$R12/tmp/autopilot/run-$PRIOR_RUN_ID.jsonl" <<EOF
+{"ts":"2026-01-01T00:00:00Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"2026-01-01T00:00:01Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+{"ts":"2026-01-01T00:00:02Z","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12.out" 2>"$WORK/r12.err" )
+RC12=$?
+[[ "$RC12" -eq 2 ]] \
+  && ok "--resume-run adopts the prior iteration count (hits the iteration cap immediately)" \
+  || note "--resume-run run exited $RC12 — expected 2 (iteration cap, proving iter=2 was adopted)"
+
+RESUMED_RUN_ID="$(jq -r '.run_id' "$R12/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$RESUMED_RUN_ID" == "$PRIOR_RUN_ID" ]] \
+  && ok "--resume-run adopts the prior run's id ($PRIOR_RUN_ID)" \
+  || note "--resume-run started run '$RESUMED_RUN_ID' instead of resuming '$PRIOR_RUN_ID'"
+
+RESUMED_COST="$(jq -r '.total_cost_usd // -1' "$R12/tmp/autopilot/status.json" 2>/dev/null)"
+COST_IS_TWO="$(jq -n --argjson v "${RESUMED_COST:--1}" '$v == 2' 2>/dev/null)"
+[[ "$COST_IS_TWO" == "true" ]] \
+  && ok "--resume-run's cost total starts from the prior run's \$2 (1.25+0.75), not \$0" \
+  || note "--resume-run's cost total is '$RESUMED_COST', expected 2 (summed from the prior log)"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

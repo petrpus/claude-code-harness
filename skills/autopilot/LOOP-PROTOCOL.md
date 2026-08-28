@@ -12,9 +12,31 @@ model pinning. autopilot keeps the insight and adds the enforcement.
 
 **Fresh context each iteration.** `loop.sh` never passes the CLI `--resume`/
 `--continue` — every `claude -p` starts clean. The `--resume-run` *flag on
-loop.sh* is different: it only re-reads `tmp/autopilot/` disk state so a killed
-run can pick up where it left off. Continuity comes from disk, not from a
-growing window.
+loop.sh* is different: it re-reads `tmp/autopilot/` disk state, adopting the
+most recent `run-<id>.jsonl`'s run id, iteration count and summed `cost_usd`
+(R1), so a killed run picks up its identity and both clocks instead of
+silently starting a new run at iteration 0 / cost 0. Continuity comes from
+disk, not from a growing window.
+
+### Runner self-reload (R1)
+
+Bash parses `loop.sh`'s (and `plan.sh`'s/`allowlist.sh`'s) function bodies
+once, at process startup. If this repo *is* the autopilot harness's own
+source, a slice's job can legitimately be to fix the runner itself — but a
+fix a BUILD phase just committed to disk never changes the behaviour of the
+process that committed it, only a run a human starts afterwards by hand.
+Before each iteration's SELECT, the loop hashes its own sourced files
+(`runner_files_hash()`, a `cksum` of their concatenated content) and compares
+against the hash taken at startup. On a mismatch it logs a `runner_reload`
+line, writes `status.json`, and `exec`s itself with the original argv plus
+`--resume-run` — `exec` keeps the PID, so the concurrency lock and the
+dirty-tree guard must not re-trip on the process's own prior state.
+`RUN_ID`/iteration count/accumulated cost hand across via
+`AUTOPILOT_RUN_ID`/`AUTOPILOT_ITER`/`AUTOPILOT_TOTAL_COST`/
+`AUTOPILOT_LOCK_OWNED`, which the startup block adopts ahead of the
+`--resume-run` disk-based path above. At most one reload happens per
+iteration — the new process computes its own baseline hash fresh at startup,
+so an unchanged file can never spin.
 
 ## State files (`tmp/autopilot/`)
 
@@ -190,10 +212,16 @@ push-from-main and `.env`/secret guards stay live.
 Each line of `run-<id>.jsonl`:
 
 ```json
-{"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan",
+{"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
  "exit_code":0,"verdict":"pass|fail|","holdout_failed":0}
 ```
+
+`runner_reload` (R1) is logged once, immediately before the `exec` that
+re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh` — it costs nothing and
+carries no tokens, but marks exactly where a run's identity carried across a
+process replacement, which matters when reading `iter` back out as a
+monotonic sequence.
 
 `holdout_failed` (S2) is the count of ids in that call's `holdout.failed[]` —
 0 on every phase except `verify_agent`, and 0 there too whenever no holdout
@@ -213,6 +241,13 @@ file was given or every scenario held.
 ## Recovery
 
 A killed run leaves `tmp/autopilot/` intact and the lock is stale-detected on the
-next start. Re-run with `--resume-run`. WIP checkpoints (`autopilot: iteration N
-(wip, gate=…)`) let you `git reset` to any clean point. On abort, `FEEDBACK.md`
-holds the last failure for a human to read.
+next start. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
+iteration count and accumulated cost from its `run-<id>.jsonl` instead of starting
+a new run at iteration 0 / cost 0 — a missing log behaves like a fresh run
+(contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let
+you `git reset` to any clean point. On abort, `FEEDBACK.md` holds the last
+failure for a human to read.
+
+A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`
+does not need a manual restart at all — see Runner self-reload (R1) above; it
+re-execs itself under the same run id automatically.
