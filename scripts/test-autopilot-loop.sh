@@ -191,6 +191,12 @@ chmod +x "$STUB_DIR/claude"
 new_repo() { # dir
   mkdir -p "$1/tmp/autopilot"
   git -C "$1" init -q
+  # Identity in the REPO config, not just -c on setup commits: the checkpoint
+  # commits under test are made by loop.sh itself, whose plain `git commit`
+  # has no identity on a fresh CI runner and is swallowed by `|| true` —
+  # locally the global gitconfig masked this (caught by the first Actions run).
+  git -C "$1" config user.email t@t.est
+  git -C "$1" config user.name test
   printf 'tmp/\n' > "$1/.gitignore"
   printf '# app\n' > "$1/README.md"
   git -C "$1" add -A >/dev/null 2>&1
