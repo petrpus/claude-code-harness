@@ -144,6 +144,14 @@ text. A holdout failure is fingerprinted `holdout`, distinct from a generic
 `verify_agent` failure, so the stuck ladder (and a human skimming the log)
 can tell "missed a hidden scenario" apart from "cut some other corner."
 
+S2 also shipped two more general shortcuts to `agents/verifier.md`, checked on
+every iteration regardless of whether a holdout file is present: **#16 —
+tautological test** (the assertion recomputes the expected value the same way
+the code under test does, so it can never fail — a hollow test, distinct from
+#2's *hardcoded* value) and **#17 — off-spec done** (the change works and its
+own tests pass, but it solves a different goal than `PROMPT.md`'s charter —
+distinct from #9, which is doing *less* than asked, not something *else*).
+
 ### The stuck ladder (S4A, `docs/adr/0005-*.md` decision 6)
 
 Counting changed from **fingerprint repetition** to **per-slice failures**. A
@@ -282,6 +290,16 @@ Gate (b) executes the verify command in the runner's own shell and reads the
 exit code. The build model's *claim* that verify passed is never trusted —
 shortcut #5 (modifying the verify command) and #10 ("done" without running it)
 are exactly the failures a self-reported gate misses.
+
+When a run's own target repo is this harness, gate (b) is `bash
+scripts/verify.sh`, which runs `scripts/check-consistency.sh` as one of its
+sections (S0) — including that script's `.github/workflows/verify.yml`
+existence/content check and, as of S6, two more invariants: every `--flag`
+`loop.sh`'s `case` block parses is named in `skills/autopilot/SKILL.md`, and
+`docs/*.html` stay free of external resource references (`src=`, `<link`,
+`@import`, `url(http...)`). A run building this harness therefore gets its own
+doc/flag drift caught by the same gate (b) that checks everything else — no
+separate mechanism.
 
 ### Why a separate cheap verifier
 
