@@ -1,0 +1,101 @@
+# The Plan DAG lives inside IMPLEMENTATION_PLAN.md, and the stuck ladder gets a fourth rung
+
+Building on the autopilot loop described in `skills/autopilot/LOOP-PROTOCOL.md`:
+before this slice, BUILD always took "the first unchecked box" — the plan was a
+flat, ordered list, and dependency between slices was expressed only by
+writing them in the right order and hoping BUILD never got ahead of itself.
+That degrades badly the moment a plan is wider than a chain: two independent
+slices that could both start immediately still had to run in file order, and
+a slice that failed repeatedly blocked everything after it even when a
+sibling slice had nothing to do with the failure.
+
+## Decisions
+
+1. **Annotations live inside the checklist, not a second file.** A slice line
+   may carry `(after: <id>, <id>)`. This is one plan artefact — greppable,
+   diffable, survives a fresh-context iteration without the runner having to
+   correlate two files. A separate `plan.json` alongside the checklist was
+   considered and rejected: it invites drift (the human or the model edits
+   the checklist and forgets the JSON, or vice versa), and every consumer of
+   plan state would need to read both.
+2. **Ids are plan-local, not issue numbers.** The id is just the first
+   whitespace-delimited token after the checkbox (`S1`, `M2`, a bare word).
+   A run is commonly derived from one GitHub issue or PRD, and a plan-local id
+   space keeps the plan self-contained — `select_next_slice()` never needs to
+   resolve an id against `gh issue view`, and a plan copied between runs
+   doesn't collide on issue numbers that mean nothing to it.
+3. **A plan with no annotations parses to "everything unblocked."** A line
+   without an `after:` clause has no blockers, so `select_next_slice()`
+   degrades exactly to "first unchecked box" — 0.4.0 behaviour, unchanged
+   (contract item 8). This was the deciding reason to put the DAG in the
+   checklist's own syntax rather than requiring every plan to declare one:
+   the common case (a short linear plan) needs zero new syntax to keep
+   working.
+4. **A broken DAG is a plan bug, not a build bug.** An `after:` clause naming
+   an id that appears nowhere in the plan, or a cycle among `after:` edges,
+   fingerprints as `plan_dag` and goes straight to replan — bypassing the
+   stuck ladder entirely (decision 6). Retrying the same BUILD call, or
+   escalating it to a stronger model, cannot fix a graph the PLAN phase wrote
+   wrong; only rewriting the plan can.
+5. **Parallel execution is out of scope.** `select_next_slice()` returns
+   exactly one id — the runner still executes one `claude -p` BUILD call per
+   iteration. A wider DAG makes parallel execution possible later (multiple
+   worktrees, one per ready slice — tracked as M1), but this slice does not
+   attempt it; the payoff here is scheduling freedom, not concurrency.
+6. **The stuck ladder gains a rung, driven by per-slice state.** Failing the
+   *same slice* now escalates in four steps — retry (same model) → escalate
+   (a stronger model, S4B) → park (skip it, try a sibling) → replan (when
+   nothing unparked remains, unparking everything) → abort if a post-replan
+   attempt still fails. The per-slice `fails` counter that drives this lands
+   in S4A's `tmp/autopilot/slices.json`; this slice only defines where
+   `select_next_slice()` plugs into it (a `parked-ids` argument, default
+   empty) and what the runner does with the two failure shapes it can already
+   produce: a broken DAG (rung-bypassing replan, decision 4) and "every
+   remaining candidate is parked or blocked by a parked one" (also a replan,
+   because parking has run out of room to make progress).
+7. **Parking is worthless on a chain, so plan width is a quality criterion.**
+   Parking a slice only buys the runner anything if some *other* unblocked
+   slice exists to run instead. On a plan shaped as one long chain, parking
+   the one slice at the front makes every slice behind it unreachable too —
+   parking degenerates into an expensive way to reach the same replan a plain
+   retry-then-abort would have reached anyway, just slower and after wasting
+   a park attempt. The PLAN prompt (`loop.sh`, `PLAN.template.md`) therefore
+   asks the plan model to prefer several slices being simultaneously ready
+   over a long dependency chain, and to justify every `after:` edge rather
+   than add one merely to preserve a reading order: an edge should exist only
+   when the later slice genuinely cannot be verified without the earlier one
+   having landed.
+
+## Considered and rejected
+
+**A second `plan.json` next to the checklist.** Rejected per decision 1 — two
+sources of truth for the same information, one of which a human is expected
+to edit by hand (the checklist), invites drift that a single-file design
+doesn't have to defend against.
+
+**Issue numbers as ids.** Rejected per decision 2 — couples plan-local
+scheduling to the GitHub issue tracker's numbering, which is meaningless
+inside a single run and would require a network call (`gh issue view`) just
+to validate the DAG.
+
+**Treating a broken DAG as an ordinary gate failure.** Rejected per decision
+4 — folding `plan_dag` into the existing verify/secret/semantic gate
+fingerprints would let a plan bug consume two retries and an escalation
+before ever reaching a replan, wasting a build model's time on a call that
+cannot possibly fix the actual problem.
+
+## Consequences
+
+`select_next_slice()` (`skills/autopilot/plan.sh`) is pure parsing with no
+`claude` dependency, so it's unit-tested directly (`scripts/verify.sh`) as
+well as exercised end-to-end through `loop.sh` (`scripts/test-autopilot-loop.sh`).
+The two test surfaces cover different things: the unit tests prove the parser
+and the DAG algorithm are correct in isolation (diamond graphs, cycles,
+malformed lines); the loop tests prove the wiring — that the selected id and
+its line actually reach `build_prompt()` in dependency order, and that a
+`plan_dag` failure really does replan immediately rather than waiting for the
+stuck ladder's normal two-strikes rule.
+
+A plan written without ids or `after:` clauses pays no tax: `select_next_slice()`
+walks it exactly as "first unchecked box," so every 0.4.0-era
+`tmp/autopilot/` directory keeps working unmodified.

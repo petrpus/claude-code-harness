@@ -55,6 +55,9 @@ plan_parse_line() {
 #     PLAN_IDS[]          — id per checkbox row (may be "", may repeat)
 #     PLAN_ROW_TICKED[]   — 0|1 per row
 #     PLAN_ROW_AFTER[]    — space-separated blocker ids per row
+#     PLAN_ROW_RAW[]      — the original line text per row, for the caller to
+#                           inject the selected slice's own wording into a
+#                           prompt instead of re-deriving it (loop.sh, S1B)
 #     PLAN_ID_KNOWN{}     — id -> 1, for every non-empty id seen
 #     PLAN_ID_TICKED{}    — id -> 1 if ANY row with that id is ticked, else 0
 #   PLAN_ID_TICKED is an aggregate over possibly-repeated ids, which is only
@@ -64,7 +67,7 @@ plan_parse_line() {
 #   starting "- [ ] slice N") because nothing ever looks such an id up.
 plan_load() {
   local file="$1" line parsed id ticked after
-  PLAN_IDS=(); PLAN_ROW_TICKED=(); PLAN_ROW_AFTER=()
+  PLAN_IDS=(); PLAN_ROW_TICKED=(); PLAN_ROW_AFTER=(); PLAN_ROW_RAW=()
   unset PLAN_ID_TICKED PLAN_ID_KNOWN
   declare -gA PLAN_ID_TICKED=()
   declare -gA PLAN_ID_KNOWN=()
@@ -75,6 +78,7 @@ plan_load() {
     PLAN_IDS+=("$id")
     PLAN_ROW_TICKED+=("$ticked")
     PLAN_ROW_AFTER+=("$after")
+    PLAN_ROW_RAW+=("$line")
     [[ -n "$id" ]] || continue
     PLAN_ID_KNOWN["$id"]=1
     if [[ "$ticked" == "1" ]]; then
@@ -189,5 +193,23 @@ select_next_slice() {
   done
 
   [[ "$work_remains" -eq 1 ]] && return 3
+  return 1
+}
+
+# plan_selected_line <id>
+#   Echoes the raw line text of the first *unticked* row carrying <id>, so a
+#   caller that just got an id back from select_next_slice() can hand the
+#   model the slice's own wording instead of re-deriving it. Reads the
+#   PLAN_ROW_RAW/PLAN_IDS/PLAN_ROW_TICKED globals left behind by the most
+#   recent plan_load (select_next_slice() calls it internally, so this works
+#   immediately after a successful selection). Echoes nothing if not found.
+plan_selected_line() {
+  local id="$1" i n="${#PLAN_IDS[@]}"
+  for (( i=0; i<n; i++ )); do
+    if [[ "${PLAN_IDS[$i]}" == "$id" && "${PLAN_ROW_TICKED[$i]}" != "1" ]]; then
+      printf '%s\n' "${PLAN_ROW_RAW[$i]}"
+      return 0
+    fi
+  done
   return 1
 }

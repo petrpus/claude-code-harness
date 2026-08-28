@@ -1,7 +1,7 @@
 # PRD 0002 — Harness upgrade to 0.5.0 (plan DAG, holdout verify, run metrics, CI) + 0.6.x parallelism
 
 Status: **grilled — issues cut** (#31–#45; map #45) · Date: 2026-08-28 · Analysis: this PRD's § Background (no separate research doc; the July analysis in [docs/research/2026-07-harness-upgrade.md](../research/2026-07-harness-upgrade.md) still applies)
-ADRs: [0001](../adr/0001-repo-map-as-file-not-mcp.md) · [0002](../adr/0002-opt-in-stop-gate-exception.md) · [0004](../adr/0004-graphify-as-optional-repo-map-backend.md) · **new: [0006](../adr/0006-holdout-scenarios-hidden-by-location.md) (holdout — written in grill), 0005 (plan DAG — to be written by S1)**
+ADRs: [0001](../adr/0001-repo-map-as-file-not-mcp.md) · [0002](../adr/0002-opt-in-stop-gate-exception.md) · [0004](../adr/0004-graphify-as-optional-repo-map-backend.md) · **new: [0005](../adr/0005-plan-dag-in-implementation-plan.md) (plan DAG — written by S1), [0006](../adr/0006-holdout-scenarios-hidden-by-location.md) (holdout — written in grill)**
 Glossary: [CONTEXT.md](../../CONTEXT.md) — this PRD uses its terms. The grill already added **Gate** (genus), **Iteration gate**, **Plan-dependency failure**, **Holdout**, **Plan DAG**, **Escalation** and **Parked slice**, and corrected the premature "gate resolved" entry in § Flagged ambiguities. No slice needs to add vocabulary; slices must *use* it.
 
 ## Background

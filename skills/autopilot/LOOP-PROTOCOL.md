@@ -21,7 +21,7 @@ growing window.
 | File | Role |
 |---|---|
 | `PROMPT.md` | Immutable charter for the run. Derived from a PRD or issue; must carry a source link + acceptance criteria. Never edited by the loop. |
-| `IMPLEMENTATION_PLAN.md` | Checklist of independently verifiable vertical slices + a final `STATUS: in-progress\|done` line. Written by PLAN, ticked by BUILD, sentinel-checked by the gate. |
+| `IMPLEMENTATION_PLAN.md` | Checklist of independently verifiable vertical slices + a final `STATUS: in-progress\|done` line. Written by PLAN, ticked by BUILD, sentinel-checked by the gate. Slice lines may carry `(after: <id>, <id>)` — the **Plan DAG** the runner selects from each iteration (`plan.sh`, `docs/adr/0005-*.md`). |
 | `MEMORY.md` | Durable cross-iteration notes. Mechanically pruned to the last 100 lines every iteration — instructions to the model are advisory; the cap is enforced by the runner. |
 | `FEEDBACK.md` | Why the last gate failed. The next BUILD iteration must address it first. Cleared when consumed. |
 | `status.json` | Live run state, iterations done, accumulated cost, HEAD sha. |
@@ -32,11 +32,16 @@ growing window.
 
 ```
 PLAN  (once, if no plan)   opus     acceptEdits, write-only tools
-  └─ writes IMPLEMENTATION_PLAN.md as verifiable vertical slices
+  └─ writes IMPLEMENTATION_PLAN.md as verifiable vertical slices, ids +
+     optional (after: ...) edges — a Plan DAG (docs/adr/0005-*.md)
 loop:
+  SELECT  select_next_slice()  runner   pure parsing (plan.sh), no `claude` call
+    └─ picks the one unblocked, unparked slice to build this iteration
+    └─ broken DAG (cycle / unknown after: id) → Plan-dependency failure,
+       fingerprint plan_dag, straight to replan — bypasses the ladder below
   BUILD                    sonnet   acceptEdits + explicit --allowedTools
-    └─ one plan item, TDD (red-green-refactor), ADR if architectural,
-       run verify, tick box, append MEMORY, set STATUS
+    └─ exactly the selected plan item, TDD (red-green-refactor), ADR if
+       architectural, run verify, tick box, append MEMORY, set STATUS
   GATE b  machine verify   runner    executes the verify command itself
   GATE c  secret scan      runner    greps the diff for keys/tokens
   GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict
@@ -46,6 +51,33 @@ loop:
     nothing moved         → no-progress failure
   any gate red            → FEEDBACK.md, reset sentinel, checkpoint WIP, maybe replan
 ```
+
+### Slice selection (S1B)
+
+Before BUILD runs, the runner calls `select_next_slice()` (`plan.sh`, sourced
+by `loop.sh`) over `IMPLEMENTATION_PLAN.md`'s Plan DAG and injects the chosen
+id and its exact line into `build_prompt()`: "Do exactly the plan item `<id>`
+selected by the runner … do not start any other item." On a plan with no
+`after:` annotations at all, every slice is unblocked, so selection reduces
+to "first unchecked box in file order" — 0.4.0 behaviour, unchanged.
+
+A **Plan-dependency failure** (`select_next_slice()` returns 2: an `after:`
+clause names an id that doesn't exist anywhere in the plan, or the `after:`
+edges cycle) is explicitly **not** one of gates (b)–(d) above and is not
+fingerprinted the same way a gate failure is: it feeds `FEEDBACK.md` and goes
+straight to a replan pass every time it recurs, never through the
+retry/park/abort ladder — a broken DAG is a defect in the plan the PLAN phase
+wrote, and no amount of retrying or escalating the BUILD call can fix it.
+"Every remaining candidate is parked, or blocked by a parked one" (return 3)
+is handled the same way — replan, which also unparks everything (S4A); this
+path is unreachable until S4A's per-slice state exists, since nothing calls
+`select_next_slice()` with any parked ids yet.
+
+`agents/verifier.md` gained shortcut **#14 — ticked a slice other than the
+one assigned**: the verifier is told which id was selected this iteration
+(`verify_prompt()`) and treats a checkbox change to any other slice as a
+violation, even if that other slice is genuinely done — its diff wasn't
+reviewed this iteration.
 
 ### Why completion is not a per-iteration gate
 

@@ -59,9 +59,20 @@ case "$prompt" in
     if [[ "${STUB_MODE:-progress}" == "progress" ]]; then
       # touch a tracked file so the iteration has something to checkpoint
       mkdir -p src && date +%s%N >> src/work.txt
-      # tick the first unticked box
-      awk 'BEGIN{done=0} { if (!done && $0 ~ /^- \[ \]/) { sub(/^- \[ \]/, "- [x]"); done=1 } print }' \
-        "$plan" > "$plan.tmp" && mv "$plan.tmp" "$plan"
+      # S1B: the runner now injects "plan item `<id>`" when it picked a
+      # specific slice via select_next_slice(). Tick THAT line, not merely
+      # "the first unticked box" — this is what actually proves the loop
+      # walks a diamond DAG in dependency order instead of file order.
+      # id-less plans (no annotations at all) carry no such phrase, so fall
+      # back to "first unticked box", which is 0.4.0 behaviour.
+      sel_id="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
+      if [[ -n "$sel_id" ]]; then
+        awk -v id="$sel_id" 'BEGIN{done=0} { if (!done && $0 ~ ("^- \\[ \\] " id "([[:space:]]|$)")) { sub(/^- \[ \]/, "- [x]"); done=1 } print }' \
+          "$plan" > "$plan.tmp" && mv "$plan.tmp" "$plan"
+      else
+        awk 'BEGIN{done=0} { if (!done && $0 ~ /^- \[ \]/) { sub(/^- \[ \]/, "- [x]"); done=1 } print }' \
+          "$plan" > "$plan.tmp" && mv "$plan.tmp" "$plan"
+      fi
       if ! grep -q '^- \[ \]' "$plan"; then
         sed -i 's/^STATUS: in-progress/STATUS: done/' "$plan"
       fi
@@ -111,6 +122,9 @@ runlog_verdicts() { # dir verdict
 }
 
 # --- 1. a five-slice plan must finish -------------------------------------
+# This plan carries no id/after: annotations at all — a 0.4.0-era plan file,
+# unchanged by S1B's Plan DAG wiring (contract item 8) — so it doubles as
+# loop-test (e) from docs/prd/0002-harness-upgrade.md § S1.
 R1="$WORK/r1"; new_repo "$R1"
 run_loop "$R1" progress true
 RC1=$?
@@ -196,6 +210,68 @@ RC4=$?
 [[ "$RC4" -eq 2 ]] \
   && ok "a plan with no checkboxes is bounded by the iteration cap (exit 2)" \
   || note "unmeasurable plan exited $RC4 — expected 2 (iteration cap)"
+
+# --- 5. Plan DAG (S1B): the runner walks a diamond in dependency order -----
+# select_next_slice() itself is unit-tested directly against plan.sh in
+# scripts/verify.sh; this exercises the actual wiring into loop.sh — that the
+# selected id/line reach build_prompt() and are honoured in order, not just
+# that the parser is correct in isolation.
+R5="$WORK/r5"; new_repo "$R5"
+cat > "$R5/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] S1 — root (after: —)
+- [ ] S2 — left (after: S1)
+- [ ] S3 — right (after: S1)
+- [ ] S4 — join (after: S2, S3)
+
+STATUS: in-progress
+EOF
+run_loop "$R5" progress true
+RC5=$?
+[[ "$RC5" -eq 0 ]] \
+  && ok "a diamond Plan DAG runs to completion through loop.sh (exit 0)" \
+  || note "diamond DAG run exited $RC5 — expected 0"
+
+SELECTED_SEQ="$(grep -oE 'plan item `[^`]+`' "$WORK/r5.calls" 2>/dev/null \
+  | sed -E 's/plan item `([^`]+)`/\1/' | tr '\n' ',')"
+[[ "$SELECTED_SEQ" == "S1,S2,S3,S4," ]] \
+  && ok "runner selected S1, S2, S3, S4 in that order (dependency order, not file order alone)" \
+  || note "selection order was '$SELECTED_SEQ', want S1,S2,S3,S4,"
+
+# --- 6. Plan DAG (S1B): a cycle is a plan_dag failure, replans immediately -
+R6="$WORK/r6"; new_repo "$R6"
+cat > "$R6/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] A — (after: B)
+- [ ] B — (after: A)
+
+STATUS: in-progress
+EOF
+run_loop "$R6" progress true
+RC6=$?
+[[ "$RC6" -eq 0 ]] \
+  && ok "a cyclic plan self-heals via replan and the run still completes (exit 0)" \
+  || note "cyclic-plan run exited $RC6 — expected 0 (replan should have fixed it)"
+grep -q "plan_dag" "$WORK/r6.err" 2>/dev/null \
+  && ok "the cycle is fingerprinted as plan_dag" \
+  || note "cycle failure was not fingerprinted as plan_dag"
+grep -q "stuck on 'plan_dag'" "$WORK/r6.err" 2>/dev/null \
+  && note "plan_dag went through the stuck ladder instead of bypassing it" \
+  || ok "plan_dag replans immediately, without going through escalate/park"
+
+# --- 7. Plan DAG (S1B): an unknown after: id is the same plan_dag failure --
+R7="$WORK/r7"; new_repo "$R7"
+cat > "$R7/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] X — (after: GHOST)
+
+STATUS: in-progress
+EOF
+run_loop "$R7" progress true
+RC7=$?
+[[ "$RC7" -eq 0 ]] \
+  && ok "an unknown blocker id self-heals via replan and the run still completes (exit 0)" \
+  || note "unknown-blocker-id run exited $RC7 — expected 0 (replan should have fixed it)"
+grep -q "plan_dag" "$WORK/r7.err" 2>/dev/null \
+  && ok "the unknown blocker id is fingerprinted as plan_dag" \
+  || note "unknown-blocker-id failure was not fingerprinted as plan_dag"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

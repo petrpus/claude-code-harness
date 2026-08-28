@@ -64,11 +64,21 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 2. **Machine verify** — the runner executes the verify command itself.
 3. **Secret scan** — the iteration diff is grepped for keys/tokens/private keys.
 4. **Semantic verify** — haiku runs `agents/verifier.md` adversarially against
-   the diff (the 11-shortcuts checklist).
+   the diff (the 14-shortcuts checklist).
 
 Any failure appends to `FEEDBACK.md`, resets the sentinel, checkpoints WIP, and
 feeds the next iteration. Same failure twice → one automatic replan; three times
 → abort. Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
+
+Each iteration, the runner first picks which plan item to build:
+`select_next_slice()` (`plan.sh`) walks `IMPLEMENTATION_PLAN.md` as a **Plan
+DAG** — optional `(after: <id>, <id>)` annotations on a slice's checkbox line
+— and hands BUILD the one unblocked, unparked slice it selected (a plan with
+no annotations degrades to "first unchecked box," unchanged from 0.4.0). A
+broken DAG (a cycle, or an `after:` naming an id that doesn't exist) is a
+**Plan-dependency failure**, not a gate: it replans immediately and never
+goes through the retry/escalate/park ladder above — a plan bug can't be fixed
+by retrying the same build. See `docs/adr/0005-*.md`.
 
 ## Safety
 

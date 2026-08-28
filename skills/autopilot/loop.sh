@@ -112,6 +112,10 @@ fi
 # see allowlist.sh, which owns the derivation so it can be tested on its own.
 # shellcheck source=allowlist.sh
 . "$SCRIPT_DIR/allowlist.sh"
+# select_next_slice() over the Plan DAG (docs/adr/0005-*.md) — own file so it's
+# unit-testable without a run (scripts/verify.sh exercises it directly).
+# shellcheck source=plan.sh
+. "$SCRIPT_DIR/plan.sh"
 BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},$(verify_grants "$VERIFY_CMD")"
 if verify_grants_are_narrow "$VERIFY_CMD"; then
   log_err "verify command starts with an interpreter ('${VERIFY_CMD%% *}'); granting only the exact command."
@@ -232,11 +236,21 @@ charter, derived from a PRD or GitHub issue with acceptance criteria).
 
 Write $PLAN_FILE as a checklist of INDEPENDENTLY VERIFIABLE vertical slices —
 each item, when done, leaves the app working and is provable by the verify
-command. Order them so each builds on the last.
+command on its own.
 
 Every slice MUST be a markdown checkbox at the start of its line: "- [ ] ...".
 The runner measures progress by counting ticked boxes, so a plan without them
 cannot be measured and the run falls back to its caps.
+
+Give each slice a short id as the first token after the checkbox (e.g. "S1",
+"S2"), and where a slice genuinely cannot be verified without an earlier one
+having landed, add "(after: <id>, <id>)" naming its blockers — the runner
+selects any unblocked slice, not just the next line, so prefer a WIDE plan
+DAG (several slices ready at once) over a long chain: a slice deep in a chain
+cannot be set aside if it keeps failing without also blocking everything
+behind it. State an after: edge only when it's genuinely required, not merely
+to preserve a reading order — a slice with no after: clause is unblocked from
+the start.
 
 End the file with the exact line:
 
@@ -246,7 +260,17 @@ Do not implement anything yet. Only write the plan file.
 EOF
 }
 
-build_prompt() {
+build_prompt() { # [selected_id] [selected_line]
+  local sel_id="${1:-}" sel_line="${2:-}" item_instr
+  if [[ -n "$sel_id" ]]; then
+    item_instr="$(cat <<ITEM
+Do exactly the plan item \`$sel_id\` selected by the runner (its line in
+$PLAN_FILE reads: "$sel_line"); do not start any other item.
+ITEM
+)"
+  else
+    item_instr="Do exactly ONE unchecked plan item."
+  fi
   cat <<EOF
 You are ONE iteration of an autonomous BUILD loop. Fresh context — all state is
 on disk.
@@ -255,7 +279,7 @@ Read, in order: $PROMPT_FILE (charter + acceptance criteria), $PLAN_FILE
 (checklist + STATUS line), $MEMORY_FILE (durable notes), $FEEDBACK_FILE (why the
 last iteration's gate failed — address it FIRST if non-empty).
 
-Do exactly ONE unchecked plan item. Follow the harness 'tdd' skill:
+$item_instr Follow the harness 'tdd' skill:
 red-green-refactor — write a failing test, make it pass, refactor. If you make
 an architectural decision (new module boundary, dependency, data-model change),
 write a docs/adr/ entry. Then:
@@ -272,14 +296,22 @@ EOF
 
 verify_prompt() {
   # Strip frontmatter from the agent file; the checklist body is single-sourced.
-  local body
+  local body assigned
   body="$(sed '1{/^---$/!q;};1,/^---$/d' "$VERIFIER_AGENT" 2>/dev/null)"
+  if [[ -n "${SELECTED_ID:-}" ]]; then
+    assigned="Assigned slice this iteration: \`$SELECTED_ID\` — $SELECTED_LINE
+Checking shortcut #14 means confirming the diff's checkbox changes are
+confined to this id."
+  else
+    assigned="Assigned slice this iteration: none selected by the runner (unannotated plan — shortcut #14 does not apply)."
+  fi
   cat <<EOF
 $body
 
 ---
 Charter: $PROMPT_FILE
 Plan: $PLAN_FILE
+$assigned
 Inspect the diff since the last checkpoint: run \`git diff HEAD\` and
 \`git log --oneline -5\`. Output ONLY the JSON verdict object.
 EOF
@@ -305,6 +337,16 @@ secret_scan() { # returns 0 clean, 1 hit; echoes hits
   hits="$(printf '%s' "$diff" | grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[po]_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[bap]-[A-Za-z0-9-]+|(password|secret|token)\s*=\s*["'"'"'][^"'"'"']{6,}' 2>/dev/null || true)"
   [[ -z "$hits" ]] && return 0
   echo "$hits"; return 1
+}
+
+replan_prompt() { # reason
+  cat <<EOF
+The autonomous run is stuck: $1
+
+Read $PROMPT_FILE, $PLAN_FILE, and $FEEDBACK_FILE. Revise $PLAN_FILE to unblock
+it. Keep the STATUS line 'STATUS: in-progress'. Do not implement — only revise
+the plan.
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -339,8 +381,50 @@ while :; do
   TICKED_BEFORE="$(count_ticked)"
   TOTAL_BOXES="$(count_boxes)"
 
+  # Select the next slice from the Plan DAG (docs/adr/0005-*.md). Parked ids
+  # land with S4A's tmp/autopilot/slices.json; until then every call passes
+  # none, which is exactly 0.4.0 behaviour: select_next_slice() degrades to
+  # "first unchecked box" on a plan with no after: annotations.
+  SELECTED_ID=""; SELECTED_LINE=""
+  SELECT_OUT="$(select_next_slice "$PLAN_FILE")"; SELECT_RC=$?
+  case "$SELECT_RC" in
+    0)
+      SELECTED_ID="$SELECT_OUT"
+      SELECTED_LINE="$(plan_selected_line "$SELECTED_ID")"
+      ;;
+    2)
+      # Plan-dependency failure (cycle, or after: names an unknown id) — a
+      # plan bug, not a build bug. Straight to replan, bypassing the stuck
+      # ladder entirely rather than waiting for it to repeat.
+      FAIL_REASON="plan dependency failure: $SELECT_OUT"
+      log_err "gate failed [plan_dag]: $FAIL_REASON — replanning immediately (bypasses the stuck ladder)."
+      : > "$FEEDBACK_FILE"; append_feedback "plan_dag" "$FAIL_REASON"
+      run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
+        "$(replan_prompt "$FAIL_REASON")" >/dev/null
+      LAST_FP=""; REPEAT=0
+      continue
+      ;;
+    3)
+      # Every remaining candidate is parked, or blocked by one — replan, which
+      # also unparks everything (S4A). Unreachable until then: with no caller
+      # ever passing parked ids, select_next_slice() can't return 3 yet.
+      FAIL_REASON="every remaining slice is parked or blocked by a parked slice"
+      log_err "gate failed [plan_parked]: $FAIL_REASON — replanning immediately (bypasses the stuck ladder)."
+      : > "$FEEDBACK_FILE"; append_feedback "plan_parked" "$FAIL_REASON"
+      run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
+        "$(replan_prompt "$FAIL_REASON")" >/dev/null
+      LAST_FP=""; REPEAT=0
+      continue
+      ;;
+    *)
+      # 1: nothing to schedule (unmeasurable plan, or nothing left to pick) —
+      # fall back to generic instructions; the unmeasurable-plan and
+      # completion checks below still apply.
+      ;;
+  esac
+
   # BUILD
-  run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt)" >/dev/null
+  run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE")" >/dev/null
 
   TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
@@ -451,6 +535,6 @@ while :; do
   if [[ "$REPEAT" -eq 1 ]]; then
     log_err "same failure twice — one REPLAN pass with $PLAN_MODEL."
     run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
-      "The autonomous run is stuck. Read $PROMPT_FILE, $PLAN_FILE, and $FEEDBACK_FILE. Revise $PLAN_FILE to unblock the repeated failure. Keep the STATUS line 'STATUS: in-progress'. Do not implement — only revise the plan." >/dev/null
+      "$(replan_prompt "repeated failure ($FP): $FAIL_REASON")" >/dev/null
   fi
 done
