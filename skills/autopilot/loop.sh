@@ -298,13 +298,19 @@ run_aggregates() {
     echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
     return
   fi
+  # $widths drops unmeasured iterations rather than reading them as zero. A
+  # `.dag_width // 0` keeps a missing measurement in the array, so iterations
+  # from before this metric existed (or any the runner could not measure) pull
+  # the mean toward 0 — this run reported 0.67 for six iterations that all
+  # measured 1. An average must be taken over what was actually measured;
+  # `// 0` is right for the sums and the max below, wrong for a mean.
   jq -sc --argjson total_cost "$TOTAL_COST" '
     (map(select(.phase=="iteration"))) as $it
     | ($it | length) as $n
     | (map(select(.phase=="replan")) | length) as $replans
     | ($it | map(select(.gate_failed != "none" and .gate_failed != null)) | length) as $failed
     | ($it | map(.ticked_delta // 0) | add // 0) as $ticked
-    | ($it | map(.dag_width // 0)) as $widths
+    | ($it | map(.dag_width) | map(select(. != null))) as $widths
     | ($it | map(.parked_count // 0) | (max // 0)) as $parked_total
     | ($it | map(select(.escalated == true)) | length) as $escalations
     | {
@@ -438,13 +444,26 @@ cannot be measured and the run falls back to its caps.
 
 Give each slice a short id as the first token after the checkbox (e.g. "S1",
 "S2"), and where a slice genuinely cannot be verified without an earlier one
-having landed, add "(after: <id>, <id>)" naming its blockers — the runner
-selects any unblocked slice, not just the next line, so prefer a WIDE plan
-DAG (several slices ready at once) over a long chain: a slice deep in a chain
-cannot be set aside if it keeps failing without also blocking everything
-behind it. State an after: edge only when it's genuinely required, not merely
-to preserve a reading order — a slice with no after: clause is unblocked from
-the start.
+having landed, add "(after: <id>, <id>)" naming its blockers. The clause must
+be the LAST thing on the line and hold ids only — prose inside it parses as
+bogus ids and fails the run.
+
+The runner selects any unblocked slice, not just the next line, so prefer a
+WIDE plan DAG (several slices ready at once) over a long chain: a slice deep
+in a chain cannot be set aside if it keeps failing without also blocking
+everything behind it. A slice with no after: clause is unblocked from the
+start.
+
+The test for an edge is CONSUMPTION, not order: X gets "after: Y" only when X
+reads a file, field, function or flag that Y creates. In the slice's body,
+name what it consumes ("needs S3's slice_id field"). If you cannot name it,
+delete the edge — an edge you cannot justify costs real parallelism and buys
+nothing, and "it reads better in this order" is not a dependency. Two slices
+that touch different files almost never need an edge between them.
+
+Slices that document or release the work are naturally terminal — they depend
+on the features they describe. That is expected, and it is not a reason to
+also chain the feature slices to each other.
 
 End the file with the exact line:
 

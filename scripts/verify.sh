@@ -463,6 +463,46 @@ else
   note "skills/autopilot/plan.sh is missing"
 fi
 
+section "autopilot run aggregates (run_aggregates)"
+# mean_dag_width is an average, so an iteration that never measured width must
+# leave the sample rather than enter it as 0. The real 0.5.0 run reported 0.67
+# across six iterations that every one measured 1, because three earlier
+# iterations predating the metric were read as zeros. The loop test's own plan
+# is width 1 throughout, so only a MIXED log exposes this.
+AGG_DIR="$(mktemp -d)"
+AGG_LOG="$AGG_DIR/run-test.jsonl"
+{
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none"}'
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none"}'
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none","dag_width":2}'
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none","dag_width":4}'
+} > "$AGG_LOG"
+
+AGG_OUT="$(RUN_LOG="$AGG_LOG" TOTAL_COST=8 bash -c '
+  RUN_LOG="$1"; TOTAL_COST="$2"
+  eval "$(sed -n "/^run_aggregates() {/,/^}$/p" skills/autopilot/loop.sh)"
+  run_aggregates' _ "$AGG_LOG" 8 2>/dev/null)"
+
+AGG_MEAN="$(printf '%s' "$AGG_OUT" | jq -r '.mean_dag_width' 2>/dev/null)"
+[[ "$AGG_MEAN" == "3" ]] \
+  && ok "mean_dag_width averages only measured iterations (2,4 -> 3, not 1.5)" \
+  || note "mean_dag_width over a mixed log should be 3, got '$AGG_MEAN'"
+
+AGG_ITERS="$(printf '%s' "$AGG_OUT" | jq -r '.iterations' 2>/dev/null)"
+[[ "$AGG_ITERS" == "4" ]] \
+  && ok "iterations still counts every iteration, measured or not" \
+  || note "iterations should be 4, got '$AGG_ITERS'"
+
+: > "$AGG_LOG"
+EMPTY_AGG="$(RUN_LOG="$AGG_LOG" bash -c '
+  RUN_LOG="$1"; TOTAL_COST=0
+  eval "$(sed -n "/^run_aggregates() {/,/^}$/p" skills/autopilot/loop.sh)"
+  run_aggregates' _ "$AGG_LOG" 2>/dev/null | jq -r '.mean_dag_width' 2>/dev/null)"
+[[ "$EMPTY_AGG" == "0" ]] \
+  && ok "an empty run log still aggregates to 0, never an error" \
+  || note "empty log should give mean_dag_width 0, got '$EMPTY_AGG'"
+rm -rf "$AGG_DIR"
+
 # ---------------------------------------------------------------------------
 section "autopilot per-slice ladder state (slices.sh)"
 if [[ -f skills/autopilot/slices.sh ]]; then

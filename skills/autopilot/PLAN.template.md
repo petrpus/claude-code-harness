@@ -9,10 +9,17 @@ docs/adr/0005-*.md).
 
 Give each slice a short id as the first token after the checkbox, and add
 "(after: <id>, <id>)" only when the later slice genuinely cannot be verified
-without the earlier one having landed. No id / no after: clause = unblocked
-from the start — prefer several slices being ready at once (a WIDE Plan DAG)
-over one long chain: a slice deep in a chain can't be set aside when it fails
-without also blocking everything behind it.
+without the earlier one having landed. The clause must be LAST on the line and
+hold ids only — prose inside it parses as bogus ids and fails the run. No id /
+no after: clause = unblocked from the start — prefer several slices being
+ready at once (a WIDE Plan DAG) over one long chain: a slice deep in a chain
+can't be set aside when it fails without also blocking everything behind it.
+
+The test for an edge is CONSUMPTION, not order: X gets "after: Y" only when X
+reads a file, field, function or flag that Y creates. Name that in the slice's
+body; if you can't name it, delete the edge. Slices that document or release
+the work are naturally terminal — that's expected, and it's no reason to also
+chain the feature slices to each other.
 
 The final STATUS line is the sentinel gate — the loop sets it to `done` only
 when every box is ticked and verify is green.

@@ -59,6 +59,13 @@ across however many runs are on disk. See
 `skills/autopilot/LOOP-PROTOCOL.md` § Per-run aggregates for field
 definitions.
 
+**How we measure (0.5.0).** `run_aggregates` in `skills/autopilot/loop.sh` writes
+per-run figures into `tmp/autopilot/status.json`; `/usage-report` renders them across
+runs. Two cautions learned from the first run: an average must be taken over what was
+actually *measured* — reading a missing metric as `0` put `mean_dag_width` below the
+minimum any measured iteration could produce — and a metric added mid-run only covers
+the iterations after it landed, so early figures are partial by construction, not wrong.
+
 **Open question (2026-08-28, loopkit survey).** Loopkit's `model-routing` claims the
 opposite corner of the grid: a *cheap executor + frontier judge* beats a frontier
 executor with no judge, arguing a weak judge is worse than no judge and that judge
