@@ -2,6 +2,22 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [0.5.1] — 2026-08-29
+
+Guard fix found while tagging 0.5.0 — the release step blocked itself.
+
+### Fixed
+
+- `hooks/pre-bash.sh`: a redirection is shell plumbing, not a ref name.
+  `seg_is_tag_only_push()` counted every non-flag word after `push` as an
+  operand, so `2>&1` and `>/dev/null` landed among the ref names and the guard
+  asked git to resolve a tag called `2>&1`. It cannot, so a tag-only push was
+  classified as a branch push and blocked — meaning the release step documented
+  in `CLAUDE.md` failed in the form nearly everyone writes it. Dropping
+  redirections cannot weaken the guard: a redirection can never name a branch.
+  The whole tag-push matrix had been written without redirections, so it passed
+  a guard that blocked the real command; both directions are now covered.
+
 ## [0.5.0] — 2026-08-28
 
 CI for the harness itself, dependency-aware autopilot plans, a holdout gate
