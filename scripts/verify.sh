@@ -162,6 +162,23 @@ else
   assert_hook "pre-bash still blocks force-pushing a tag from main" 2 hooks/pre-bash.sh \
     "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force origin refs/tags/v9.9.9\"}}"
 
+  # Redirections are shell plumbing, not refs. Every test above was written
+  # without one, so the guard shipped reading `2>&1` as a ref name: it counted
+  # as an operand, git could not resolve a tag called "2>&1", and the release
+  # step blocked in the form nearly everyone writes it. Caught by the v0.5.0
+  # release, not by this matrix.
+  assert_hook "pre-bash allows a tag push carrying 2>&1" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin v9.9.9 2>&1\"}}"
+  assert_hook "pre-bash allows a tag push carrying 2>&1 and a pipe" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin v9.9.9 2>&1 | tail -2\"}}"
+  assert_hook "pre-bash allows a tag push redirected to /dev/null" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin refs/tags/v9.9.9 >/dev/null\"}}"
+  # …and dropping redirections must not let a branch push through with one.
+  assert_hook "pre-bash still blocks a branch push carrying 2>&1" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin main 2>&1\"}}"
+  assert_hook "pre-bash still blocks a bare push carrying 2>&1" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push 2>&1 | tail -2\"}}"
+
   # pre-edit: blocks
   assert_hook "pre-edit blocks .env" 2 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/.env"}}'

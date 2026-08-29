@@ -106,6 +106,14 @@ seg_is_tag_only_push() {
     case "$word" in
       --tags)      tags_flag=1; continue ;;
       -*)          continue ;;
+      # Redirections are shell plumbing, not refs. Without this they fall
+      # through as operands and land in names[], so `git push origin v1.2.3
+      # 2>&1` asks git to resolve a tag called "2>&1", fails, and blocks the
+      # release step in the form nearly everyone writes it. Dropping them is
+      # safe: a redirection can never name a branch, so it cannot smuggle a
+      # branch push past a tag-only check. A pipe or `&&` never reaches here —
+      # the caller splits segments on those first.
+      [0-9]'>'*|'>'*|'<'*|'&>'*) continue ;;
       *:*)         return 1 ;;
     esac
     operands=$(( operands + 1 ))
