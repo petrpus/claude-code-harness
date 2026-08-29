@@ -267,7 +267,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section class="hero" id="thesis" style="border-top:none">
     <div class="hero-grid">
       <div>
-        <p class="eyebrow">Claude Code plugin · v0.4.0</p>
+        <p class="eyebrow">Claude Code plugin · v0.5.1</p>
         <h1>A harness for safe, cost-conscious autonomous development.</h1>
         <p class="lead">Curated skills, two review agents, and git/dev guard hooks — plus a loop engine that runs long unattended sessions behind hard verify gates and real cost caps. Install once; every project gets the same disciplined toolkit.</p>
         <div class="pillrow">
@@ -495,7 +495,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section id="autopilot">
     <p class="eyebrow">Autopilot · the loop engine</p>
     <h2>The runner picks the slice, then every iteration passes four gates and has to show progress.</h2>
-    <p class="sec-intro">A run is a loop of fresh <code>claude&nbsp;-p</code> sessions. Before build runs, the <em>runner</em> — not a model — walks <code>IMPLEMENTATION_PLAN.md</code> as a <b>Plan DAG</b> (optional <code>after:</code> edges on each checkbox) and selects the one unblocked, unparked slice to build this iteration. Build does exactly that item; then the runner enforces the gates in order — machine verify, secret scan, an adversarial haiku verifier, and holdout scenarios the build model never saw. Completion is <em>not</em> a per-iteration test: the runner counts ticked checkboxes before and after, and an incomplete plan that moved forward with every gate green is progress, not failure. A broken Plan DAG (a cycle, or an <code>after:</code> naming an unknown id) is a <b>Plan-dependency failure</b>, not a gate — it replans immediately, bypassing the ladder below entirely.</p>
+    <p class="sec-intro">A run is a loop of fresh <code>claude&nbsp;-p</code> sessions. Before build runs, the <em>runner</em> — not a model — walks <code>IMPLEMENTATION_PLAN.md</code> as a <b>Plan DAG</b> (optional <code>after:</code> edges on each checkbox) and selects the one unblocked, unparked slice to build this iteration. Build does exactly that item; then the runner enforces four <b>Iteration gates</b> in order — machine verify, secret scan, an adversarial haiku verifier, and holdout scenarios the build model never saw. (An <i>Iteration gate</i> stops one iteration and feeds it back; it is not the <i>Verify gate</i> that stops a turn, nor a <i>Guard</i> that stops a tool call.) Completion is <em>not</em> a per-iteration test: the runner counts ticked checkboxes before and after, and an incomplete plan that moved forward with every gate green is progress, not failure. A broken Plan DAG (a cycle, or an <code>after:</code> naming an unknown id) is a <b>Plan-dependency failure</b>, not a gate — it replans immediately, bypassing the ladder below entirely.</p>
 
     <div class="pipe">
       <div class="pipe-row">
@@ -592,7 +592,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 
 <footer>
   <div class="wrap">
-    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.4.0 · MIT</span>
+    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.5.1 · MIT</span>
     <span class="muted">press <span class="kbd">t</span> to flip theme</span>
   </div>
 </footer>
