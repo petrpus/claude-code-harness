@@ -37,6 +37,10 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    link and acceptance criteria (these are mandatory; they're what the verifier
    checks against). Leave `IMPLEMENTATION_PLAN.md` absent — the PLAN phase writes
    it — or seed it from `PLAN.template.md`.
+   Optionally, write acceptance scenarios the build model must never see from
+   `HOLDOUT.template.md`, saved **outside the worktree** (default location
+   below, or point `--holdout <path>` at your own) — never under
+   `tmp/autopilot/`, which BUILD already reads freely.
 3. **Be on a feature branch with a clean tree.**
 4. **Start the run:**
 
@@ -45,30 +49,92 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
      --max-iterations 10 --max-minutes 120 --budget-usd 10
    ```
 
-   Defaults: plan=opus, build=sonnet, verify=haiku (override with
-   `--plan-model` / `--build-model` / `--verify-model`). `--dry-run` prints the
-   plan of calls without spending. `--resume-run` continues an interrupted run
-   from disk state.
+   Defaults: plan=opus, build=sonnet, verify=haiku, escalate=opus (override with
+   `--plan-model` / `--build-model` / `--verify-model` / `--escalate-model`,
+   the last accepting `none` to disable escalation outright). `--dry-run` prints the
+   plan of calls without spending. `--resume-run` continues an interrupted run,
+   adopting its prior run id, iteration count and accumulated cost from disk
+   (R1) instead of starting over at iteration 0 / cost 0. `--holdout <path>`
+   overrides the default holdout location
+   (`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`);
+   omit it and a missing file just disables gate (e). Every BUILD prompt also
+   carries a compact repo-map digest (`skills/repo-map/digest.sh`) — stats,
+   top hotspots, and deps/rdeps for any file the selected slice names — as a
+   navigational hint, not ground truth; `--no-repo-map` turns it off.
+
+   Other flags: `--verify-cmd <cmd>` overrides the project verify command the
+   runner detects; `--max-turns <n>` caps turns per `claude -p` call;
+   `--per-call-timeout <seconds>` (default 1200) wraps every call and the
+   verify command in `timeout` so one hang can't defeat `--max-minutes`;
+   `--extra-allowed-tools <list>` appends to BUILD's `--allowedTools`
+   allowlist for a project that needs one more command.
+
+   If this repo *is* the autopilot harness's own source, a slice can
+   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — the runner
+   notices its own sourced files changed on disk and re-execs itself under the
+   same run id before the next iteration (R1), so a live run picks up the fix
+   without a human restart. See `LOOP-PROTOCOL.md` § Runner self-reload.
 
 ## What you get
 
-- `tmp/autopilot/status.json` — live state, iterations, accumulated `$` cost.
+- `tmp/autopilot/status.json` — live state, iterations, accumulated `$` cost,
+  plus per-run aggregates (S3B): `iterations`, `gate_fail_rate`,
+  `cost_per_ticked_slice`, `replans`, `mean_dag_width`, `parked_total`,
+  `escalations` — recomputed from the run's own log on every write, not
+  accumulated separately.
 - `tmp/autopilot/run-<id>.jsonl` — one line per phase (model, duration, cost,
-  tokens, verdict) — feed it to `/usage-report`.
+  tokens, verdict) — feed it to `/usage-report`, or render it directly with
+  `skills/usage-report/report.sh [state-dir]` (per-run table, per-shortcut
+  violation histogram, repo-map on/off comparison).
 - A git checkpoint commit per iteration (`autopilot: iteration N (...)`) for
   clean rollback.
 
 ## Gates (all must pass to finish)
 
 1. `STATUS: done` sentinel in the plan.
-2. **Machine verify** — the runner executes the verify command itself.
-3. **Secret scan** — the iteration diff is grepped for keys/tokens/private keys.
-4. **Semantic verify** — haiku runs `agents/verifier.md` adversarially against
-   the diff (the 11-shortcuts checklist).
+2. **Machine verify** (gate b) — the runner executes the verify command itself.
+3. **Secret scan** (gate c) — the iteration diff is grepped for keys/tokens/private keys.
+4. **Semantic verify** (gate d) — haiku runs `agents/verifier.md` adversarially
+   against the diff (the 17-shortcuts checklist).
+5. **Holdout** (gate e) — when `--holdout <path>` (or its default location) points
+   at a `HOLDOUT.md`, the runner inlines its content into the verifier prompt
+   only (never into BUILD's) and the verifier independently checks each
+   Given/When/Then scenario against the diff. A missing file disables this
+   gate with a one-line notice, not an error — see `docs/adr/0006-*.md`.
 
 Any failure appends to `FEEDBACK.md`, resets the sentinel, checkpoints WIP, and
-feeds the next iteration. Same failure twice → one automatic replan; three times
-→ abort. Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
+feeds the next iteration. A holdout failure is fingerprinted `holdout`, distinct
+from a generic semantic-verify failure (`verify_agent`), so stuck detection can
+tell them apart. Stuck detection is the five-rung ladder (S4A/S4B, `slices.sh`,
+`docs/adr/0005-*.md`): a slice retries on its 1st failure, runs its next BUILD
+on `--escalate-model` after its 2nd (back to `--build-model` once it ticks;
+`--escalate-model none` skips straight to another retry), is parked on its
+3rd (a sibling runs instead), and once every remaining slice is parked or
+blocked a single replan unparks everything — a second failure after that
+replan aborts. A plan with no real slice ids falls back to the pre-S4A rule
+verbatim (same fingerprint twice → replan, third time → abort).
+Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
+
+Gate (d) parses the verifier's output three ways, not just pass/fail: a reply
+that isn't a JSON object with a boolean `.pass` (refusal prose, a clarifying
+question, garbled/fenced non-JSON) is a **gate malfunction** — the verifier
+declined to judge, which is not the same as it finding a shortcut. This adds
+no new gate; it's still gate (d) misbehaving. The runner retries it once
+against the same unchanged diff before treating it as a failure; if the retry
+is also inconclusive, that's fingerprinted `no_verdict` (distinct from
+`verify_agent`) and FEEDBACK.md names the malfunction instead of quoting the
+refusal as findings — still blocking, still counted on the stuck ladder, so a
+permanently broken gate still terminates the run.
+
+Each iteration, the runner first picks which plan item to build:
+`select_next_slice()` (`plan.sh`) walks `IMPLEMENTATION_PLAN.md` as a **Plan
+DAG** — optional `(after: <id>, <id>)` annotations on a slice's checkbox line
+— and hands BUILD the one unblocked, unparked slice it selected (a plan with
+no annotations degrades to "first unchecked box," unchanged from 0.4.0). A
+broken DAG (a cycle, or an `after:` naming an id that doesn't exist) is a
+**Plan-dependency failure**, not a gate: it replans immediately and never
+goes through the retry/escalate/park ladder above — a plan bug can't be fixed
+by retrying the same build. See `docs/adr/0005-*.md`.
 
 ## Safety
 

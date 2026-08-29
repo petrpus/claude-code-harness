@@ -2,6 +2,99 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [0.5.0] — 2026-08-28
+
+CI for the harness itself, dependency-aware autopilot plans, a holdout gate
+hidden by location, run metrics that make repo-map and model tiering
+measurable, and the five-rung stuck ladder with per-slice state (PRD 0002,
+slices S0–S6).
+
+### Added
+- **CI for the harness** (S0) — `.github/workflows/verify.yml` runs `bash
+  scripts/verify.sh` on `pull_request` and `push` to `main`, installing `jq`
+  so the hook test matrix doesn't fail open in CI (no `pull_request_target`,
+  no secrets). `check-consistency.sh` gained the invariant that the workflow
+  exists and invokes `scripts/verify.sh`.
+- **Plan DAG** (S1A/S1B, `docs/adr/0005-plan-dag-in-implementation-plan.md`)
+  — `IMPLEMENTATION_PLAN.md` checklist lines may carry plan-local ids and
+  `(after: <id>, ...)` blocking edges; new `skills/autopilot/plan.sh`'s
+  `select_next_slice()` picks the first unblocked, unparked slice each
+  iteration and injects its id + line into the BUILD prompt ("do exactly
+  this item; do not start any other"). A cycle, or an `after:` naming an
+  unknown id, is a **Plan-dependency failure** — fingerprinted `plan_dag`,
+  replans immediately, bypassing the stuck ladder entirely, since no amount
+  of retrying fixes a broken plan. A plan with no annotations behaves
+  exactly as 0.4.0 ("first unchecked box"). `agents/verifier.md` gained
+  shortcut #14 (ticked a slice other than the one assigned).
+- **Holdout scenarios** (S2, `docs/adr/0006-holdout-scenarios-hidden-by-location.md`)
+  — `--holdout <path>` (default outside the worktree, at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`)
+  inlines Given/When/Then scenarios into the verifier prompt only; BUILD's
+  `--allowedTools` allowlist is completely unchanged (no new denial, no
+  `Grep` narrowing, no `pre-edit.sh` rule). A missed scenario is shortcut
+  #15, fingerprinted `holdout`, distinct from `verify_agent`.
+  `agents/verifier.md` also gained #16 (tautological test) and #17
+  (off-spec done).
+- **Runner self-reload** (R1) — a slice whose own job is to fix `loop.sh`,
+  `plan.sh`, `allowlist.sh` or `slices.sh` now takes effect on the run that
+  committed it: the loop hashes its sourced files each iteration and
+  re-`exec`s itself with `--resume-run` on a change, handing run id,
+  iteration count and accumulated cost across via env vars so the
+  concurrency lock and dirty-tree guard don't re-trip. `--resume-run` also
+  now correctly adopts a killed run's iteration count and summed cost from
+  its `run-*.jsonl` instead of silently resetting both to zero.
+- **Five-rung stuck ladder** (S4A/S4B) — retry → escalate
+  (`--escalate-model`, default `opus`, `none` disables) → park → replan
+  (once, unparking everything) → abort, driven by a per-slice `fails`
+  counter in the new runner-owned `tmp/autopilot/slices.json` (never named
+  in any prompt). Escalation is never applied to the verifier and doesn't
+  reset stuck detection.
+- **Run metrics** (S3A/S3B) — per-call `turns`, `cache_read_input_tokens`,
+  `cache_creation_input_tokens`; per-iteration `slice_id`, `gate_failed`,
+  `wall_s`, `cost_usd`, `files_changed`, `verify_s`, `dag_width`,
+  `parked_count`, `escalated`, `repo_map`; `verify_agent` rows record
+  violation shortcut numbers. `status.json` gains run aggregates
+  (`iterations`, `gate_fail_rate`, `cost_per_ticked_slice`, `replans`,
+  `mean_dag_width`, `parked_total`, `escalations`). Still plain
+  `--output-format json`, no `stream-json` anywhere — the budget cap's only
+  cost source stays `total_cost_usd`.
+- **Repo-map digest into BUILD** (S5, ADR-0004 item 7) — new
+  `skills/repo-map/digest.sh` emits a ≤40-line `stats` / top-10 `hotspots` /
+  per-file `deps`+`rdeps` digest appended to `build_prompt()` only, never to
+  PLAN or the verifier (a grep-backend phantom edge would otherwise freeze
+  into a hard `after:` dependency `select_next_slice()` then enforces).
+  `--no-repo-map` disables it; whether BUILD actually got one is logged per
+  iteration.
+- **`no_verdict` gate malfunction** (R2) — `parse_verdict()` now
+  distinguishes a real `{"pass": false}` verdict from a verifier that
+  declined to render one at all (refusal prose, an unanswerable clarifying
+  question). The latter retries gate (d) once against the unchanged diff
+  before it's held against the slice; the raw refusal text is never quoted
+  into `FEEDBACK.md` as a finding. Adds no new gate.
+- New `skills/usage-report/report.sh` — a per-run table, a per-shortcut
+  violation histogram, and a repo-map on/off token comparison, rendered
+  straight from the JSONL run logs and read by `/usage-report`.
+- `scripts/check-consistency.sh` gained two more invariants: every `--flag`
+  parsed in `loop.sh`'s `case` block is documented in
+  `skills/autopilot/SKILL.md`, and `docs/*.html` stay free of external
+  resource references (`src=`, `<link`, `@import`, `url(http...)`).
+
+### Changed
+- README, `docs/architecture.md`, `skills/autopilot/SKILL.md`,
+  `LOOP-PROTOCOL.md`, `docs/guide.html` and `docs/index.html` refreshed for
+  0.5.0, settling on **four Iteration gates** (verify, secret, semantic,
+  holdout) with a **Plan-dependency failure** as a distinct, non-gate defect
+  in the plan itself, not a fifth gate. The guide's pipeline diagram now
+  shows slice selection by the runner as an explicit stage before BUILD.
+- `agents/verifier.md` restructured from "11 shortcuts + two harness
+  invariants" into one flat, renumbered list, now 17 shortcuts.
+
+### Compatibility
+- A 0.4.0-era `tmp/autopilot/` still loads unchanged: a plan with no `after:`
+  annotations keeps the old "first unchecked box" selection, and a missing
+  `HOLDOUT.md` or `slices.json` means that gate is disabled / that state is
+  empty — never an error.
+
 ## [0.4.0] — 2026-08-01
 
 The repo-map layer (PRD 0001, M-slices M1–M2) plus a round of hardening on the

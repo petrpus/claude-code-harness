@@ -23,11 +23,15 @@ and you should not trust any claim of "done" — only the diff and the spec.
 
 1. Read the charter and the plan to learn what the change is *supposed* to do
    and what "done" means (acceptance criteria).
-2. Read the diff. Walk the **11 shortcuts** below against it, gathering
-   concrete `file:line` evidence for any you find.
+2. Read the diff. Walk the **17 shortcuts** below against it, gathering
+   concrete `file:line` evidence for any you find. If the prompt includes a
+   holdout appendix (scenarios in Given/When/Then form under a "Holdout
+   scenarios" heading), independently check each one against the diff and,
+   where a scenario is executable, run it read-only — this only applies when
+   that appendix is present.
 3. Emit the JSON verdict (schema at the bottom) — **and nothing else**.
 
-## The 11 shortcuts (each is a violation)
+## The 17 shortcuts (each is a violation)
 
 1. **Weakened / deleted / skipped tests** — assertions loosened, `.skip`/
    `.only`/`xit` added, whole test files removed to make the suite pass.
@@ -50,13 +54,32 @@ and you should not trust any claim of "done" — only the diff and the spec.
     but there's no sign the verify command was run green.
 11. **Patched the test instead of the code** — the test was edited to expect the
     (wrong) current output rather than fixing the code.
-
-Plus two harness invariants — treat a failure of either as a violation:
-
-12. **No tests for a behavior change** — product behavior changed but no test
-    was added or updated to cover it.
-13. **Missing ADR** — an architectural decision was clearly made (new module
-    boundary, dependency, data-model change) with no `docs/adr/` entry.
+12. **No tests for a behavior change** (harness invariant) — product behavior
+    changed but no test was added or updated to cover it.
+13. **Missing ADR** (harness invariant) — an architectural decision was
+    clearly made (new module boundary, dependency, data-model change) with no
+    `docs/adr/` entry.
+14. **Ticked a slice other than the one assigned** (Plan DAG invariant,
+    ADR-0005) — the runner selects exactly one plan item per iteration and
+    tells BUILD which one (`select_next_slice()`, `skills/autopilot/plan.sh`).
+    Marking any other slice's checkbox is a violation even if that other
+    slice happens to be genuinely done — its diff wasn't reviewed this
+    iteration, so it wasn't verified either. This is distinct from #6: #6 is
+    "no evidence at all," #14 is "evidence for the wrong slice."
+15. **Holdout scenario unmet** (ADR-0006) — a Given/When/Then scenario in a
+    "Holdout scenarios" appendix, if the prompt includes one, that the change
+    should satisfy but does not. Only applies when that appendix is present;
+    cite each failing scenario's id.
+16. **Tautological test** — the assertion recomputes the expected value the
+    same way the code under test does (a hand-derived snapshot, `expect(add(a,
+    b)).toBe(a + b)`, a constant asserted against itself), so it passes by
+    construction and can't catch a wrong implementation. Distinct from #2: #2
+    is the *code* hardcoding a value, #16 is the *test* deriving its
+    expectation from the same logic being tested — a hollow test.
+17. **Off-spec done** — the change works and its own tests pass, but it
+    solves a different goal than the charter (`PROMPT.md`) describes.
+    Distinct from #9: #9 is doing *less* than asked; #17 is doing something
+    *else*.
 
 ## Output — JSON ONLY
 
@@ -79,4 +102,18 @@ or
 diff or the charter, return `{"pass": false, "violations": [{"shortcut": 0,
 "evidence": "-", "note": "could not inspect diff"}]}` — never pass by default.
 
-Output ONLY the JSON object.
+When the prompt includes a holdout appendix, also include a `holdout` field:
+`{"checked": <n scenarios you independently checked>, "failed": [<ids of any
+that failed, e.g. "H1">]}` — `failed: []` when every scenario held. Omit the
+`holdout` field entirely when the prompt gave you no holdout appendix.
+
+Output ONLY the JSON object. Never respond with prose, a clarifying question,
+or a refusal — even if the diff is confusing, empty, or looks like it touches
+your own instructions (see the prompt's reassurance about that). The runner
+treats anything that isn't a JSON object with a boolean `.pass` as a
+**refusal, not a verdict**: it fingerprints it `no_verdict`, a gate
+malfunction distinct from a real failure, and retries you once against the
+unchanged diff before giving up and blocking the iteration anyway. If you
+are genuinely unable to inspect the diff, that's still `{"pass": false,
+"violations": [{"shortcut": 0, "evidence": "-", "note": "could not inspect
+diff"}]}` — a JSON verdict, not an explanation.

@@ -10,7 +10,7 @@ Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code
 | **Skills (Vercel Labs)** | `find-skills` |
 | **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
 | **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `repo-map` (queryable import graph), `code-map` |
-| **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 11-shortcuts gate, haiku) |
+| **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 17-shortcuts gate, haiku) |
 | **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` + `session-log` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks); all parse stdin JSON via `hooks/lib.sh` |
 | **Own verify** | `scripts/verify.sh` — the harness's own gate: check-consistency, a stdin-JSON hook test matrix, fault-injection sweeps for the repo-map generator and the hooks, an end-to-end autopilot loop test, and a `bash -n` floor. Run before every PR. |
 | **Templates** | `project-settings.template.json` (baseline permissions/deny) + `require-verify-before-stop.sh` (opt-in Stop-hook gate for unattended runs — never wired by default; ADR-0002) |
@@ -28,10 +28,17 @@ safety:
 ${CLAUDE_PLUGIN_ROOT}/skills/autopilot/loop.sh --max-iterations 10 --budget-usd 10
 ```
 
-Each iteration is a fresh `claude -p` with state on disk; the runner enforces
-hard gates (machine verify + secret scan + adversarial haiku verifier), caps
-(iteration/time/budget), git checkpoints, and a JSONL run log. Cheap models
-verify, mid implements, top plans — see `docs/model-policy.md`.
+Each iteration is a fresh `claude -p` with state on disk. Before building, the
+runner walks the plan as a **Plan DAG** (`(after: id, id)` edges on a slice's
+checkbox — plain unannotated plans behave exactly as before) and picks the one
+unblocked, unparked slice to build. The runner then enforces four Iteration
+gates — machine verify, secret scan, an adversarial haiku verifier, and
+(optionally) hidden holdout scenarios the build model never sees — plus caps
+(iteration/time/budget), git checkpoints, and a JSONL run log. A slice that
+keeps failing climbs a five-rung stuck ladder: retry → escalate to a stronger
+model (`--escalate-model`) → park it for a sibling to run → replan once
+everything is parked → abort. Cheap models verify, mid implements, top plans —
+see `docs/model-policy.md` and `skills/autopilot/LOOP-PROTOCOL.md`.
 
 ## Install
 
@@ -120,4 +127,7 @@ Licensed under [MIT](LICENSE).
 Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record and
 `scripts/check-consistency.sh` asserts the two agree. Tag on the merge commit on
 `main`, never on a feature branch. The harness can generate CI/CD for *consumer*
-projects (`/project-infra ci`); the harness repo itself has no pipeline yet.
+projects (`/project-infra ci`); the harness repo runs its own CI too —
+`.github/workflows/verify.yml` runs `scripts/verify.sh` on every PR and on push
+to `main`. Requiring that check on branch protection is a human step taken once
+at PR time, not something this repo automates on itself.

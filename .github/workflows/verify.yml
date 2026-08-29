@@ -1,0 +1,36 @@
+# .github/workflows/verify.yml — CI for the harness repo itself.
+#
+# This is deliberately NOT an instance of ci-workflow.template.yml (that
+# template targets an npm/pnpm consumer project). The harness's own verify
+# gate is a single dependency-free bash script (scripts/verify.sh); the only
+# non-builtin tool it needs is jq for the hook test matrix and JSON checks
+# (hooks/lib.sh fails open without it, per docs/architecture.md § Hook
+# contract — CI must not silently pass with the matrix skipped). No secrets,
+# no network calls, no pull_request_target.
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run scripts/verify.sh
+        run: bash scripts/verify.sh
+
+      - name: Upload verify status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: last-verify-status
+          path: tmp/.last-verify-status
+          if-no-files-found: ignore

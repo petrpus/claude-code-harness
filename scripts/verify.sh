@@ -313,6 +313,276 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# select_next_slice() is pure parsing over a checklist file — no `claude`
+# call needed, so it's exercised directly here rather than via the stub-
+# driven scripts/test-autopilot-loop.sh (loop.sh doesn't call it yet; that's
+# S1B). Six shapes: a 0.4.0-era unannotated plan, a diamond DAG walked to
+# completion, a cycle, an unknown blocker id, a parked slice whose dependent
+# becomes unreachable, and the malformed-line corner cases from the S1A spec.
+section "autopilot plan DAG (plan.sh)"
+if [[ -f skills/autopilot/plan.sh ]]; then
+  # shellcheck source=/dev/null
+  . skills/autopilot/plan.sh
+  PLAN_TEST_DIR="$(mktemp -d)"; TMP_GATE_DIRS+=("$PLAN_TEST_DIR")
+
+  # -- linear unannotated plan: degrades to "first unchecked box" -----------
+  cat > "$PLAN_TEST_DIR/linear.md" <<'EOF'
+- [x] alpha task one
+- [x] beta task two
+- [ ] gamma task three
+EOF
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/linear.md")"; RC=$?
+  [[ "$RC" -eq 0 && "$GOT" == "gamma" ]] \
+    && ok "unannotated plan selects the first unchecked box" \
+    || note "unannotated plan: got rc=$RC id='$GOT', want rc=0 id=gamma"
+
+  # -- diamond: S1 -> {S2,S3} -> S4, walked to completion --------------------
+  cat > "$PLAN_TEST_DIR/diamond.md" <<'EOF'
+- [ ] S1 — root (after: —)
+- [ ] S2 — left (after: S1)
+- [ ] S3 — right (after: S1)
+- [ ] S4 — join (after: S2, S3)
+EOF
+  tick_id() { # file id
+    sed -i "s/^- \[ \] $2 /- [x] $2 /" "$1"
+  }
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S1" ]] && ok "diamond: root selected first" \
+    || note "diamond: got '$GOT', want S1"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S1
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S2" ]] && ok "diamond: S2 selected once S1 is ticked (S3 not yet ready to run)" \
+    || note "diamond: got '$GOT', want S2"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S2
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S3" ]] && ok "diamond: S4 stays blocked until S3 also ticks" \
+    || note "diamond: got '$GOT', want S3"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S3
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/diamond.md")"
+  [[ "$GOT" == "S4" ]] && ok "diamond: S4 selected only after both S2 and S3" \
+    || note "diamond: got '$GOT', want S4"
+  tick_id "$PLAN_TEST_DIR/diamond.md" S4
+  select_next_slice "$PLAN_TEST_DIR/diamond.md" >/dev/null; RC=$?
+  [[ "$RC" -eq 1 ]] && ok "diamond: nothing left once every id is ticked (rc=1)" \
+    || note "diamond: expected rc=1 once complete, got $RC"
+
+  # -- cycle: A <-> B --------------------------------------------------------
+  cat > "$PLAN_TEST_DIR/cycle.md" <<'EOF'
+- [ ] A — (after: B)
+- [ ] B — (after: A)
+EOF
+  MSG="$(select_next_slice "$PLAN_TEST_DIR/cycle.md")"; RC=$?
+  [[ "$RC" -eq 2 && "$MSG" == plan_dag:*cycle* ]] \
+    && ok "cycle: plan_dag failure (rc=2), bypassing the stuck ladder" \
+    || note "cycle: got rc=$RC msg='$MSG', want rc=2 and a plan_dag/cycle message"
+
+  # -- unknown blocker id -----------------------------------------------------
+  cat > "$PLAN_TEST_DIR/unknown.md" <<'EOF'
+- [ ] X — (after: GHOST)
+EOF
+  MSG="$(select_next_slice "$PLAN_TEST_DIR/unknown.md")"; RC=$?
+  [[ "$RC" -eq 2 && "$MSG" == plan_dag:*GHOST* ]] \
+    && ok "unknown blocker id: plan_dag failure (rc=2), names the bad id" \
+    || note "unknown blocker: got rc=$RC msg='$MSG', want rc=2 naming GHOST"
+
+  # -- parked slice: skipped, its dependent becomes unreachable --------------
+  cat > "$PLAN_TEST_DIR/parked.md" <<'EOF'
+- [x] S1 — root (after: —)
+- [ ] S2 — parked sibling (after: S1)
+- [ ] S3 — ready sibling (after: S1)
+- [ ] S4 — join (after: S2, S3)
+EOF
+  GOT="$(select_next_slice "$PLAN_TEST_DIR/parked.md" S2)"; RC=$?
+  [[ "$RC" -eq 0 && "$GOT" == "S3" ]] \
+    && ok "parked slice is skipped; its unblocked sibling still runs" \
+    || note "parked: got rc=$RC id='$GOT', want rc=0 id=S3"
+  tick_id "$PLAN_TEST_DIR/parked.md" S3
+  select_next_slice "$PLAN_TEST_DIR/parked.md" S2 >/dev/null; RC=$?
+  [[ "$RC" -eq 3 ]] \
+    && ok "parked slice's dependent is unreachable: replan signal (rc=3)" \
+    || note "parked: expected rc=3 once only the parked chain remains, got $RC"
+
+  # -- malformed lines: never crash, never falsely select ---------------------
+  NOID="$(plan_parse_line '- [ ]')"
+  [[ "$(printf '%s' "$NOID" | cut -f1)" == "" ]] \
+    && ok "malformed: id-less checkbox parses to an empty (unselectable) id" \
+    || note "malformed: '- [ ]' should parse to an empty id, got '$NOID'"
+
+  EMPTYAFTER="$(plan_parse_line '- [ ] T1 (after:)')"
+  [[ "$(printf '%s' "$EMPTYAFTER" | cut -f3)" == "" ]] \
+    && ok "malformed: empty after: clause parses as unblocked" \
+    || note "malformed: '(after:)' should leave no blockers, got '$EMPTYAFTER'"
+
+  WHITESPACE="$(plan_parse_line '-   [ ]   T2   (after:   T1 )')"
+  [[ "$(printf '%s' "$WHITESPACE" | cut -f1)" == "T2" && "$(printf '%s' "$WHITESPACE" | cut -f3)" == "T1" ]] \
+    && ok "malformed: stray whitespace around id/after: is trimmed" \
+    || note "malformed: stray whitespace not trimmed, got '$WHITESPACE'"
+
+  TICKEDAFTER="$(plan_parse_line '- [x] T3 (after: T1)')"
+  [[ "$(printf '%s' "$TICKEDAFTER" | cut -f2)" == "1" ]] \
+    && ok "malformed: after: on an already-ticked line parses without error" \
+    || note "malformed: ticked line with after: mis-parsed, got '$TICKEDAFTER'"
+
+  # -- the two readers that address PLAN_* globals directly -------------------
+  # Both were the only uncovered functions in plan.sh and both died under
+  # `set -u` when called before any plan_load(). A reader that dies inside
+  # `$(...)` echoes nothing, so DAG_WIDTH would have gone silently empty
+  # rather than loudly wrong. Called in a fresh `bash -u` so a plan_load()
+  # earlier in THIS file cannot mask a regression.
+  COLD_W="$(bash -uo pipefail -c '. skills/autopilot/plan.sh; plan_dag_width ""' 2>/dev/null)"
+  [[ "$COLD_W" == "0" ]] \
+    && ok "plan_dag_width without plan_load: answers 0, does not crash under set -u" \
+    || note "plan_dag_width before plan_load should echo 0, got '$COLD_W'"
+
+  bash -uo pipefail -c '. skills/autopilot/plan.sh; plan_selected_line S1' >/dev/null 2>&1; RC=$?
+  [[ "$RC" -eq 1 ]] \
+    && ok "plan_selected_line without plan_load: rc=1 (not found), does not crash" \
+    || note "plan_selected_line before plan_load should exit 1, got $RC"
+
+  # -- plan_dag_width counts what select_next_slice() could have chosen -------
+  cat > "$PLAN_TEST_DIR/width.md" <<'WEOF'
+- [x] W1 — root (after: —)
+- [ ] W2 — left (after: W1)
+- [ ] W3 — right (after: W1)
+- [ ] W4 — join (after: W2, W3)
+WEOF
+  plan_load "$PLAN_TEST_DIR/width.md"
+  [[ "$(plan_dag_width "")" == "2" ]] \
+    && ok "plan_dag_width: diamond with the root ticked offers 2 candidates" \
+    || note "plan_dag_width: expected 2 unblocked candidates, got '$(plan_dag_width "")'"
+  [[ "$(plan_dag_width "W2")" == "1" ]] \
+    && ok "plan_dag_width: parking one sibling drops the width to 1" \
+    || note "plan_dag_width: parking W2 should leave 1, got '$(plan_dag_width "W2")'"
+  [[ "$(plan_selected_line W3)" == *"right"* ]] \
+    && ok "plan_selected_line: returns the unticked row's own wording" \
+    || note "plan_selected_line W3 did not return its row"
+  plan_selected_line W1 >/dev/null 2>&1 \
+    && note "plan_selected_line should not return a ticked row (W1)" \
+    || ok "plan_selected_line: a ticked row is not selectable"
+else
+  note "skills/autopilot/plan.sh is missing"
+fi
+
+section "autopilot run aggregates (run_aggregates)"
+# mean_dag_width is an average, so an iteration that never measured width must
+# leave the sample rather than enter it as 0. The real 0.5.0 run reported 0.67
+# across six iterations that every one measured 1, because three earlier
+# iterations predating the metric were read as zeros. The loop test's own plan
+# is width 1 throughout, so only a MIXED log exposes this.
+AGG_DIR="$(mktemp -d)"
+AGG_LOG="$AGG_DIR/run-test.jsonl"
+{
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none"}'
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none"}'
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none","dag_width":2}'
+  printf '%s\n' '{"phase":"iteration","ticked_delta":1,"gate_failed":"none","dag_width":4}'
+} > "$AGG_LOG"
+
+AGG_OUT="$(RUN_LOG="$AGG_LOG" TOTAL_COST=8 bash -c '
+  RUN_LOG="$1"; TOTAL_COST="$2"
+  eval "$(sed -n "/^run_aggregates() {/,/^}$/p" skills/autopilot/loop.sh)"
+  run_aggregates' _ "$AGG_LOG" 8 2>/dev/null)"
+
+AGG_MEAN="$(printf '%s' "$AGG_OUT" | jq -r '.mean_dag_width' 2>/dev/null)"
+[[ "$AGG_MEAN" == "3" ]] \
+  && ok "mean_dag_width averages only measured iterations (2,4 -> 3, not 1.5)" \
+  || note "mean_dag_width over a mixed log should be 3, got '$AGG_MEAN'"
+
+AGG_ITERS="$(printf '%s' "$AGG_OUT" | jq -r '.iterations' 2>/dev/null)"
+[[ "$AGG_ITERS" == "4" ]] \
+  && ok "iterations still counts every iteration, measured or not" \
+  || note "iterations should be 4, got '$AGG_ITERS'"
+
+: > "$AGG_LOG"
+EMPTY_AGG="$(RUN_LOG="$AGG_LOG" bash -c '
+  RUN_LOG="$1"; TOTAL_COST=0
+  eval "$(sed -n "/^run_aggregates() {/,/^}$/p" skills/autopilot/loop.sh)"
+  run_aggregates' _ "$AGG_LOG" 2>/dev/null | jq -r '.mean_dag_width' 2>/dev/null)"
+[[ "$EMPTY_AGG" == "0" ]] \
+  && ok "an empty run log still aggregates to 0, never an error" \
+  || note "empty log should give mean_dag_width 0, got '$EMPTY_AGG'"
+rm -rf "$AGG_DIR"
+
+# ---------------------------------------------------------------------------
+section "autopilot per-slice ladder state (slices.sh)"
+if [[ -f skills/autopilot/slices.sh ]]; then
+  # shellcheck source=/dev/null
+  . skills/autopilot/slices.sh
+  SLICES_TEST_DIR="$(mktemp -d)"; TMP_GATE_DIRS+=("$SLICES_TEST_DIR")
+  SLICES_TEST_FILE="$SLICES_TEST_DIR/slices.json"
+
+  # -- missing file reconciles to "nothing has failed yet" (contract item 8) -
+  GOT="$(slices_read "$SLICES_TEST_FILE")"
+  [[ "$(printf '%s' "$GOT" | jq -r '.slices')" == "{}" ]] \
+    && ok "a missing slices.json reads as empty state, not an error" \
+    || note "slices_read on a missing file returned '$GOT', want empty .slices"
+
+  # -- reconcile: zero-inits new ids, preserves an existing id's counters ----
+  STATE="$(slices_reconcile "$SLICES_TEST_FILE" A B)"
+  FAILS_A="$(slices_get_fails "$STATE" A)"
+  [[ "$FAILS_A" == "0" ]] \
+    && ok "reconcile zero-inits a brand-new id" \
+    || note "expected A to start at fails=0, got '$FAILS_A'"
+
+  STATE="$(slices_record_fail "$STATE" A)"
+  STATE="$(slices_record_fail "$STATE" A)"
+  FAILS_A="$(slices_get_fails "$STATE" A)"
+  [[ "$FAILS_A" == "2" ]] \
+    && ok "slices_record_fail increments that id's counter (2 calls -> 2)" \
+    || note "expected A to be at fails=2 after two record_fail calls, got '$FAILS_A'"
+
+  slices_write "$SLICES_TEST_FILE" "$STATE"
+  STATE="$(slices_reconcile "$SLICES_TEST_FILE" A B)"
+  FAILS_A="$(slices_get_fails "$STATE" A)"
+  [[ "$FAILS_A" == "2" ]] \
+    && ok "a re-read/reconcile against the same ids preserves the counter (no reset)" \
+    || note "reconcile against unchanged ids reset A's fails to '$FAILS_A', want 2 preserved"
+
+  # -- reconcile: an id no longer passed in (ticked, or dropped by a replan) -
+  #    retires silently, even though it was never explicitly retired --------
+  STATE="$(slices_reconcile "$SLICES_TEST_FILE" A)"
+  HAS_B="$(printf '%s' "$STATE" | jq -r '.slices | has("B")' 2>/dev/null)"
+  [[ "$HAS_B" == "false" ]] \
+    && ok "reconcile drops an id that's no longer passed in (ticked/removed)" \
+    || note "B should have been dropped by reconcile, still present: $STATE"
+
+  # -- park: fails>=3 in loop.sh's own ladder, but slices_park() itself is ---
+  #    a plain setter, exercised directly here -------------------------------
+  STATE="$(slices_park "$STATE" A)"
+  [[ "$(slices_parked_csv "$STATE")" == "A" ]] \
+    && ok "slices_park marks the id parked; slices_parked_csv reflects it" \
+    || note "expected parked_csv 'A', got '$(slices_parked_csv "$STATE")'"
+  [[ "$(slices_parked_count "$STATE")" == "1" ]] \
+    && ok "slices_parked_count counts exactly the parked ids (1)" \
+    || note "expected parked_count 1, got '$(slices_parked_count "$STATE")'"
+
+  # -- retire: an explicit removal, independent of reconcile -----------------
+  STATE="$(slices_retire "$STATE" A)"
+  [[ "$(slices_get_fails "$STATE" A)" == "0" ]] \
+    && ok "slices_retire removes the record outright (a fresh read for A is 0)" \
+    || note "expected A's record gone after retire, still shows fails=$(slices_get_fails "$STATE" A)"
+
+  # -- clear: the whole file is gone, exactly what a rung-4 replan needs -----
+  slices_write "$SLICES_TEST_FILE" "$(slices_reconcile "$SLICES_TEST_FILE" A B C)"
+  [[ -f "$SLICES_TEST_FILE" ]] \
+    && ok "sanity: slices.json exists before slices_clear" \
+    || note "setup for the clear test failed to write $SLICES_TEST_FILE"
+  slices_clear "$SLICES_TEST_FILE"
+  [[ ! -f "$SLICES_TEST_FILE" ]] \
+    && ok "slices_clear removes the file entirely (a replan unparks everything)" \
+    || note "slices.json still exists after slices_clear"
+
+  # -- a corrupt file degrades to empty state, never crashes -----------------
+  printf 'not json' > "$SLICES_TEST_FILE"
+  GOT="$(slices_read "$SLICES_TEST_FILE")"
+  [[ "$(printf '%s' "$GOT" | jq -r '.slices')" == "{}" ]] \
+    && ok "a corrupt slices.json degrades to empty state instead of erroring" \
+    || note "corrupt slices.json produced '$GOT', want empty .slices"
+else
+  note "skills/autopilot/slices.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
 section "code-map renders repo-map"
 CODE_MAP_SKILL="skills/code-map/SKILL.md"
 if [[ -f "$CODE_MAP_SKILL" ]]; then

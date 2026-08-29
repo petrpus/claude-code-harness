@@ -37,10 +37,37 @@ ls tmp/autopilot/run-*.jsonl 2>/dev/null
 ```
 
 Each line is JSON with `ts, run_id, iter, phase, model, duration_s, cost_usd,
-input_tokens, output_tokens, exit_code, verdict`. Filter lines with `ts`
-inside the last X days, then sum `cost_usd`, `input_tokens`, `output_tokens`
-grouped by `(day, model)` and again by run. This source is exact for
-autopilot-driven work — it's the runner's own accounting, not an estimate.
+input_tokens, output_tokens, exit_code, verdict`, plus S3A's `turns`,
+`cache_read_input_tokens`, `cache_creation_input_tokens`, `violations`, and
+(on `phase:"iteration"` rows) `slice_id`, `gate_failed`, `dag_width`,
+`parked_count`, `escalated`, `repo_map`. Filter lines with `ts` inside the
+last X days, then sum `cost_usd`, `input_tokens`, `output_tokens` grouped by
+`(day, model)` and again by run. This source is exact for autopilot-driven
+work — it's the runner's own accounting, not an estimate.
+
+**Per-run aggregates (S3B).** `tmp/autopilot/status.json` carries seven
+run-level aggregates recomputed on every write — `iterations`,
+`gate_fail_rate`, `cost_per_ticked_slice`, `replans`, `mean_dag_width`,
+`parked_total`, `escalations` (see `skills/autopilot/LOOP-PROTOCOL.md` §
+Per-run aggregates for exact definitions). Rather than re-deriving these and
+the cross-run views by hand each invocation, run:
+
+```bash
+bash skills/usage-report/report.sh [state-dir]   # default: tmp/autopilot
+```
+
+It renders, straight from the JSONL logs found there:
+- a **per-run table** (slices ticked, cost/slice, gate-fail rate, mean turns);
+- a **per-shortcut violation histogram** across every run found — a criterion
+  whose fail rate collapses without a spec change is verifier drift, not
+  quality improvement, and this is the cheap way to notice;
+- a **repo-map on/off comparison** of mean `input_tokens +
+  cache_read_input_tokens + cache_creation_input_tokens` per BUILD call,
+  keyed on S5's `repo_map` flag — whichever side has no data in the runs
+  given renders as `—`, not a fabricated number.
+
+Fold its output straight into the report below rather than re-summing the
+JSONL by hand.
 
 ### 3. Transcript fallback (best-effort, approximate)
 

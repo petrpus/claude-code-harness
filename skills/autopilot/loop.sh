@@ -13,12 +13,18 @@
 #   loop.sh [--max-iterations 10] [--max-minutes 120] [--budget-usd 10]
 #           [--plan-model opus] [--build-model sonnet] [--verify-model haiku]
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
-#           [--extra-allowed-tools '<csv>'] [--resume-run] [--dry-run]
+#           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
+#           [--escalate-model opus|none] [--no-repo-map] [--resume-run] [--dry-run]
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
 #             cap · 1 runner error (bad preconditions, missing deps).
 
 set -uo pipefail
+
+# Preserve the original argv before the option-parsing loop below consumes it
+# via `shift` — R1 needs it unmodified to re-exec itself (plus --resume-run)
+# when a slice edits the runner mid-run.
+ORIG_ARGV=("$@")
 
 # ---------------------------------------------------------------------------
 # Resolve plugin root from THIS script's location. Do NOT rely on
@@ -28,6 +34,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERIFIER_AGENT="$PLUGIN_ROOT/agents/verifier.md"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 STATE_DIR="tmp/autopilot"
 PROMPT_FILE="$STATE_DIR/PROMPT.md"
@@ -36,6 +43,9 @@ MEMORY_FILE="$STATE_DIR/MEMORY.md"
 FEEDBACK_FILE="$STATE_DIR/FEEDBACK.md"
 STATUS_FILE="$STATE_DIR/status.json"
 LOCK_FILE="$STATE_DIR/lock"
+# S4A: runner-owned per-slice ladder state — written and read only by
+# loop.sh, never named in any prompt (skills/autopilot/slices.sh).
+SLICES_FILE="$STATE_DIR/slices.json"
 
 # Defaults (all overridable).
 MAX_ITERATIONS=10
@@ -50,6 +60,11 @@ PER_CALL_TIMEOUT=1200   # 20 min per claude -p call
 RESUME=0
 DRY_RUN=0
 EXTRA_ALLOWED_TOOLS=""
+HOLDOUT_ARG=""
+REPO_MAP_ENABLED=1
+# S4B: rung 2 of the stuck ladder. "none" disables escalation outright,
+# reproducing S4A's own "rung 2 is just another retry" behaviour exactly.
+ESCALATE_MODEL=opus
 
 BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
@@ -68,9 +83,12 @@ while [[ $# -gt 0 ]]; do
     --max-turns)        MAX_TURNS="$2"; shift 2 ;;
     --per-call-timeout) PER_CALL_TIMEOUT="$2"; shift 2 ;;
     --extra-allowed-tools) EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
+    --holdout)           HOLDOUT_ARG="$2"; shift 2 ;;
+    --escalate-model)    ESCALATE_MODEL="$2"; shift 2 ;;
+    --no-repo-map)       REPO_MAP_ENABLED=0; shift ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
-    -h|--help)          sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)          sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) log_err "unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -112,6 +130,32 @@ fi
 # see allowlist.sh, which owns the derivation so it can be tested on its own.
 # shellcheck source=allowlist.sh
 . "$SCRIPT_DIR/allowlist.sh"
+# select_next_slice() over the Plan DAG (docs/adr/0005-*.md) — own file so it's
+# unit-testable without a run (scripts/verify.sh exercises it directly).
+# shellcheck source=plan.sh
+. "$SCRIPT_DIR/plan.sh"
+# S4A: per-slice retry/park ladder state (tmp/autopilot/slices.json) — own
+# file, same reasoning as plan.sh/allowlist.sh.
+# shellcheck source=slices.sh
+. "$SCRIPT_DIR/slices.sh"
+
+# R1: bash parses this script's function bodies once, at startup — a slice
+# whose job is to fix loop.sh/plan.sh/allowlist.sh/slices.sh therefore never
+# changes the behaviour of the very process running it, only the next run a
+# human starts by hand. runner_files_hash() lets each iteration notice its own
+# sourced files changed on disk since startup and re-exec itself (see the
+# check at the top of the main loop) so the fix applies within the same run.
+# Hashing content (not mtime) means an edit that doesn't change the bytes — or
+# a clock skew — never triggers a spurious reload.
+runner_files_hash() {
+  local f
+  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh" "$SCRIPT_DIR/slices.sh"; do
+      [[ -f "$f" ]] && cat "$f"
+    done
+  } | cksum
+}
+STARTUP_RUNNER_HASH="$(runner_files_hash)"
+
 BUILD_ALLOWED_TOOLS="${BUILD_ALLOWED_TOOLS},$(verify_grants "$VERIFY_CMD")"
 if verify_grants_are_narrow "$VERIFY_CMD"; then
   log_err "verify command starts with an interpreter ('${VERIFY_CMD%% *}'); granting only the exact command."
@@ -126,22 +170,67 @@ if [[ -n "$(git status --porcelain 2>/dev/null)" ]] && [[ "$RESUME" -eq 0 ]]; th
   exit 1
 fi
 
-# Concurrency lock (with stale detection).
-if [[ -f "$LOCK_FILE" ]]; then
-  LOCK_PID="$(head -1 "$LOCK_FILE" 2>/dev/null | cut -d' ' -f1)"
-  if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
-    log_err "another run holds the lock (pid $LOCK_PID). Abort or wait."
-    exit 1
+# Concurrency lock (with stale detection). A runner reload (R1) already owns
+# this lock — `exec` keeps the PID, so re-checking it here would find this
+# same process's own lock entry and mistake itself for a competing run.
+if [[ "${AUTOPILOT_LOCK_OWNED:-0}" -ne 1 ]]; then
+  if [[ -f "$LOCK_FILE" ]]; then
+    LOCK_PID="$(head -1 "$LOCK_FILE" 2>/dev/null | cut -d' ' -f1)"
+    if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
+      log_err "another run holds the lock (pid $LOCK_PID). Abort or wait."
+      exit 1
+    fi
+    log_err "removing stale lock (pid $LOCK_PID no longer running)."
+    rm -f "$LOCK_FILE"
   fi
-  log_err "removing stale lock (pid $LOCK_PID no longer running)."
-  rm -f "$LOCK_FILE"
 fi
 
 mkdir -p "$STATE_DIR"
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-echo "$$ $RUN_ID" > "$LOCK_FILE"
+
+# Run identity: fresh, resumed (--resume-run — a human restarting a killed or
+# stopped process), or reloaded (R1 — this exact process re-exec'ing itself
+# after a slice edited loop.sh/plan.sh/allowlist.sh/slices.sh; the AUTOPILOT_* vars are
+# its own handoff to itself, set right before the exec at the top of the main
+# loop below). A reload always wins when both are present, since it also
+# appends --resume-run to argv.
+if [[ -n "${AUTOPILOT_RUN_ID:-}" ]]; then
+  RUN_ID="$AUTOPILOT_RUN_ID"
+  ITER="${AUTOPILOT_ITER:-0}"
+  TOTAL_COST="${AUTOPILOT_TOTAL_COST:-0}"
+elif [[ "$RESUME" -eq 1 ]]; then
+  # Adopt the most recent run's identity instead of silently starting a new
+  # run at iteration 0 / cost 0 — until this fix, `--resume-run` only relaxed
+  # the dirty-tree check below and reset both clocks to zero, which is why
+  # the operator note calls a manual restart "picks up the fix" rather than
+  # "resumes the run": before R1 it couldn't do both at once.
+  LATEST_LOG="$(ls -t "$STATE_DIR"/run-*.jsonl 2>/dev/null | head -1)"
+  if [[ -n "$LATEST_LOG" ]]; then
+    RUN_ID="$(basename "$LATEST_LOG" .jsonl)"; RUN_ID="${RUN_ID#run-}"
+    ITER="$(jq -s 'map(.iter // 0) | max // 0' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
+    TOTAL_COST="$(jq -s '[.[].cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+  else
+    # No prior log to resume from — missing state is never an error
+    # (contract item 8), so this behaves like a fresh run.
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    ITER=0
+    TOTAL_COST=0
+  fi
+else
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  ITER=0
+  TOTAL_COST=0
+fi
+[[ "${AUTOPILOT_LOCK_OWNED:-0}" -eq 1 ]] || echo "$$ $RUN_ID" > "$LOCK_FILE"
 RUN_LOG="$STATE_DIR/run-$RUN_ID.jsonl"
 trap 'rm -f "$LOCK_FILE"' EXIT
+
+# Holdout scenarios (docs/adr/0006-*.md): hidden by location, not by tool
+# denial. Default lives outside the worktree, one directory per run, so BUILD
+# (which can freely read tmp/autopilot/) has nothing to find there.
+# tmp/autopilot/HOLDOUT.md is deliberately NOT a supported location — if a
+# file lands there it is a mistake, not a fallback (ADR-0006).
+HOLDOUT_FILE="${HOLDOUT_ARG:-${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/$RUN_ID/HOLDOUT.md}"
+HOLDOUT_NOTICE_SHOWN=0
 
 [[ -f "$MEMORY_FILE" ]]   || echo "# autopilot memory (pruned to last 100 lines each iteration)" > "$MEMORY_FILE"
 [[ -f "$FEEDBACK_FILE" ]] || : > "$FEEDBACK_FILE"
@@ -151,22 +240,99 @@ trap 'rm -f "$LOCK_FILE"' EXIT
 # ---------------------------------------------------------------------------
 now_epoch() { date +%s 2>/dev/null || echo 0; }
 START_EPOCH="$(now_epoch)"
-TOTAL_COST=0
 
-logline() { # phase model duration cost in_tok out_tok exit verdict
+logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
      --arg phase "$1" --arg model "$2" --argjson dur "${3:-0}" \
      --argjson cost "${4:-0}" --argjson intok "${5:-0}" --argjson outtok "${6:-0}" \
-     --argjson exit "${7:-0}" --arg verdict "${8:-}" \
-     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict}' \
+     --argjson exit "${7:-0}" --arg verdict "${8:-}" --argjson holdout_failed "${9:-0}" \
+     --argjson turns "${10:-0}" --argjson cache_read "${11:-0}" --argjson cache_creation "${12:-0}" \
+     --argjson violations "${13:-[]}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed,turns:$turns,cache_read_input_tokens:$cache_read,cache_creation_input_tokens:$cache_creation,violations:$violations}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
+# log_iteration <verdict> <slice_id> <ticked_delta> <gate_failed> <wall_s>
+#               <cost_usd> <files_changed> <verify_s> <dag_width>
+#               <parked_count> <escalated> <repo_map>
+#   S3A: one summary row per ITERATION (as opposed to logline()'s one row per
+#   `claude -p` CALL) — the fields a run-level report (S3B, /usage-report)
+#   needs without re-deriving them from the per-call rows. parked_count (S4A)
+#   is the number of ids slices.json marks parked at this iteration's
+#   selection time — real as of S4A. escalated (S4B) is true only for the one
+#   iteration whose BUILD call actually ran on --escalate-model, real as of
+#   this slice (PRD § S3A/S4B). repo_map
+#   (S5) is whether this iteration's BUILD prompt actually carried a repo-map
+#   digest — false both when --no-repo-map was given and when the digest
+#   generator failed/produced nothing, so the field answers "did BUILD see
+#   one", not "was the flag on".
+log_iteration() {
+  jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
+     --arg verdict "$1" --arg slice_id "${2:-}" --argjson ticked_delta "${3:-0}" \
+     --arg gate_failed "${4:-none}" --argjson wall_s "${5:-0}" --argjson cost_usd "${6:-0}" \
+     --argjson files_changed "${7:-0}" --argjson verify_s "${8:-0}" --argjson dag_width "${9:-0}" \
+     --argjson parked_count "${10:-0}" --argjson escalated "${11:-false}" \
+     --argjson repo_map "${12:-false}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:"iteration",model:"-",verdict:$verdict,
+       slice_id:$slice_id,ticked_delta:$ticked_delta,gate_failed:$gate_failed,wall_s:$wall_s,
+       cost_usd:$cost_usd,files_changed:$files_changed,verify_s:$verify_s,dag_width:$dag_width,
+       parked_count:$parked_count,escalated:$escalated,repo_map:$repo_map}' \
+     >> "$RUN_LOG" 2>/dev/null || true
+}
+
+# S3B: per-run aggregates derived from THIS run's own JSONL log — recomputed
+# fresh on every write_status() call rather than accumulated in bash
+# variables, so a run interrupted mid-iteration (or read by a human via
+# status.json while still in progress) always reflects exactly what the log
+# on disk records, and a reload (R1) / --resume-run picks up the same run's
+# earlier rows for free since RUN_LOG is keyed by RUN_ID, not by process.
+# Missing/empty log = all-zero aggregates, never an error (contract item 8 —
+# before the first iteration's log_iteration() call, nothing has happened
+# yet, same posture as a fresh run). `parked_total` is the PEAK number of
+# slices.json marked as parked at any one iteration's selection time this
+# run — parked_count itself resets to 0 across a replan (slices_clear), so a
+# running total would double-count a slice parked, unparked, and parked
+# again; the max is the "how bad did it get" read /usage-report wants.
+run_aggregates() {
+  if [[ ! -s "$RUN_LOG" ]]; then
+    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+    return
+  fi
+  # $widths drops unmeasured iterations rather than reading them as zero. A
+  # `.dag_width // 0` keeps a missing measurement in the array, so iterations
+  # from before this metric existed (or any the runner could not measure) pull
+  # the mean toward 0 — this run reported 0.67 for six iterations that all
+  # measured 1. An average must be taken over what was actually measured;
+  # `// 0` is right for the sums and the max below, wrong for a mean.
+  jq -sc --argjson total_cost "$TOTAL_COST" '
+    (map(select(.phase=="iteration"))) as $it
+    | ($it | length) as $n
+    | (map(select(.phase=="replan")) | length) as $replans
+    | ($it | map(select(.gate_failed != "none" and .gate_failed != null)) | length) as $failed
+    | ($it | map(.ticked_delta // 0) | add // 0) as $ticked
+    | ($it | map(.dag_width) | map(select(. != null))) as $widths
+    | ($it | map(.parked_count // 0) | (max // 0)) as $parked_total
+    | ($it | map(select(.escalated == true)) | length) as $escalations
+    | {
+        iterations: $n,
+        gate_fail_rate: (if $n > 0 then ($failed / $n) else 0 end),
+        cost_per_ticked_slice: (if $ticked > 0 then ($total_cost / $ticked) else null end),
+        replans: $replans,
+        mean_dag_width: (if ($widths|length) > 0 then (($widths|add) / ($widths|length)) else 0 end),
+        parked_total: $parked_total,
+        escalations: $escalations
+      }
+  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+}
+
 write_status() { # state
+  local agg
+  agg="$(run_aggregates)"
   jq -cn --arg run "$RUN_ID" --arg state "$1" --argjson iter "${ITER:-0}" \
      --argjson cost "$TOTAL_COST" --arg branch "$BRANCH" \
      --arg sha "$(git rev-parse --short HEAD 2>/dev/null || echo '')" \
-     '{run_id:$run,state:$state,iterations_done:$iter,total_cost_usd:$cost,branch:$branch,head:$sha}' \
+     --argjson agg "$agg" \
+     '{run_id:$run,state:$state,iterations_done:$iter,total_cost_usd:$cost,branch:$branch,head:$sha} + $agg' \
      > "$STATUS_FILE" 2>/dev/null || true
 }
 
@@ -174,7 +340,7 @@ write_status() { # state
 # Echoes the assistant result text on stdout; returns claude's exit code.
 run_claude() { # phase model allowed_tools permission_mode prompt_text
   local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5"
-  local t0 t1 dur out cost intok outtok rc
+  local t0 t1 dur out cost intok outtok rc turns cache_read cache_creation
   t0="$(now_epoch)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
@@ -190,8 +356,15 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
   cost="$(printf '%s' "$out" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)"
   intok="$(printf '%s' "$out" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)"
   outtok="$(printf '%s' "$out" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)"
+  # S3A: still --output-format json (never stream-json), just two more `.usage`
+  # reads. num_turns and the cache fields are absent from a plain "ok"/dry-run
+  # stub result, hence the `// 0` defaults — never a hard requirement on shape.
+  turns="$(printf '%s' "$out" | jq -r '.num_turns // 0' 2>/dev/null || echo 0)"
+  cache_read="$(printf '%s' "$out" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)"
+  cache_creation="$(printf '%s' "$out" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)"
   TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${cost:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
-  logline "$phase" "$model" "$dur" "${cost:-0}" "${intok:-0}" "${outtok:-0}" "$rc" ""
+  logline "$phase" "$model" "$dur" "${cost:-0}" "${intok:-0}" "${outtok:-0}" "$rc" "" 0 \
+    "${turns:-0}" "${cache_read:-0}" "${cache_creation:-0}"
   printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null || echo ""
   return $rc
 }
@@ -201,8 +374,39 @@ elapsed_min() { echo $(( ( $(now_epoch) - START_EPOCH ) / 60 )); }
 
 append_feedback() { printf '\n## Iteration %s — %s\n%s\n' "${ITER:-0}" "$1" "$2" >> "$FEEDBACK_FILE"; }
 
-# Stuck detection: same gate-failure fingerprint twice → one replan; third → abort.
+# Echoes $HOLDOUT_FILE's content, or nothing if it doesn't exist. Missing file
+# is not an error (docs/adr/0006-*.md, contract item 8: 0.4.0 runs never had
+# one) — the caller logs a one-line notice, once per run (see
+# holdout_notice_once() below — it must run OUTSIDE a subshell, unlike this
+# function, so the "shown" flag actually persists across iterations).
+holdout_content() {
+  [[ -f "$HOLDOUT_FILE" ]] || return 0
+  cat "$HOLDOUT_FILE" 2>/dev/null
+}
+
+# Logs the disabled-gate notice at most once per run. Must be called directly
+# (never via `$(...)`, which forks a subshell — HOLDOUT_NOTICE_SHOWN=1 set
+# there is invisible to the parent, and the notice would fire every
+# iteration instead of once).
+holdout_notice_once() {
+  [[ -f "$HOLDOUT_FILE" ]] && return 0
+  [[ "$HOLDOUT_NOTICE_SHOWN" -eq 0 ]] || return 0
+  log_err "no HOLDOUT.md — holdout gate disabled"
+  HOLDOUT_NOTICE_SHOWN=1
+}
+
+# Stuck detection. Two mechanisms coexist:
+#  - LAST_FP/REPEAT: the pre-S4A fingerprint-repetition ladder, kept as the
+#    fallback for iterations where no slice id was selected (an id-less or
+#    otherwise unmeasurable plan line) — see the FAILURE branch below.
+#  - PARK_REPLAN_DONE (S4A): the fifth rung. Rung 4's replan (every remaining
+#    candidate parked or blocked by one) is a ONE-TIME reprieve per stuck
+#    episode; once it has fired, the next failure of any kind aborts rather
+#    than replanning again — "the run fails again after a replan" (ADR-0005
+#    decision 6 / PRD § S4). Reset to 0 whenever the run makes real progress,
+#    so a later, unrelated slice getting stuck still gets its own one replan.
 LAST_FP=""; REPEAT=0
+PARK_REPLAN_DONE=0
 
 # Progress is measured from the plan's checkboxes, not claimed by the model.
 # BUILD is told to do exactly ONE item per iteration, so on any plan longer than
@@ -232,11 +436,34 @@ charter, derived from a PRD or GitHub issue with acceptance criteria).
 
 Write $PLAN_FILE as a checklist of INDEPENDENTLY VERIFIABLE vertical slices —
 each item, when done, leaves the app working and is provable by the verify
-command. Order them so each builds on the last.
+command on its own.
 
 Every slice MUST be a markdown checkbox at the start of its line: "- [ ] ...".
 The runner measures progress by counting ticked boxes, so a plan without them
 cannot be measured and the run falls back to its caps.
+
+Give each slice a short id as the first token after the checkbox (e.g. "S1",
+"S2"), and where a slice genuinely cannot be verified without an earlier one
+having landed, add "(after: <id>, <id>)" naming its blockers. The clause must
+be the LAST thing on the line and hold ids only — prose inside it parses as
+bogus ids and fails the run.
+
+The runner selects any unblocked slice, not just the next line, so prefer a
+WIDE plan DAG (several slices ready at once) over a long chain: a slice deep
+in a chain cannot be set aside if it keeps failing without also blocking
+everything behind it. A slice with no after: clause is unblocked from the
+start.
+
+The test for an edge is CONSUMPTION, not order: X gets "after: Y" only when X
+reads a file, field, function or flag that Y creates. In the slice's body,
+name what it consumes ("needs S3's slice_id field"). If you cannot name it,
+delete the edge — an edge you cannot justify costs real parallelism and buys
+nothing, and "it reads better in this order" is not a dependency. Two slices
+that touch different files almost never need an edge between them.
+
+Slices that document or release the work are naturally terminal — they depend
+on the features they describe. That is expected, and it is not a reason to
+also chain the feature slices to each other.
 
 End the file with the exact line:
 
@@ -246,7 +473,30 @@ Do not implement anything yet. Only write the plan file.
 EOF
 }
 
-build_prompt() {
+build_prompt() { # [selected_id] [selected_line] [repo_map_digest]
+  local sel_id="${1:-}" sel_line="${2:-}" digest="${3:-}" item_instr digest_section=""
+  if [[ -n "$sel_id" ]]; then
+    item_instr="$(cat <<ITEM
+Do exactly the plan item \`$sel_id\` selected by the runner (its line in
+$PLAN_FILE reads: "$sel_line"); do not start any other item.
+ITEM
+)"
+  else
+    item_instr="Do exactly ONE unchecked plan item."
+  fi
+  # S5 (ADR-0004 item 7): a navigational hint only, never ground truth — the
+  # grep backend's phantom edges make it unsafe to feed PLAN or the verifier
+  # (see skills/repo-map/digest.sh's header), but BUILD can discount a wrong
+  # hint by just opening the file.
+  if [[ -n "$digest" ]]; then
+    digest_section="$(cat <<DIGEST
+
+---
+## Repo map (navigational hint, not ground truth)
+$digest
+DIGEST
+)"
+  fi
   cat <<EOF
 You are ONE iteration of an autonomous BUILD loop. Fresh context — all state is
 on disk.
@@ -255,7 +505,7 @@ Read, in order: $PROMPT_FILE (charter + acceptance criteria), $PLAN_FILE
 (checklist + STATUS line), $MEMORY_FILE (durable notes), $FEEDBACK_FILE (why the
 last iteration's gate failed — address it FIRST if non-empty).
 
-Do exactly ONE unchecked plan item. Follow the harness 'tdd' skill:
+$item_instr Follow the harness 'tdd' skill:
 red-green-refactor — write a failing test, make it pass, refactor. If you make
 an architectural decision (new module boundary, dependency, data-model change),
 write a docs/adr/ entry. Then:
@@ -267,36 +517,108 @@ write a docs/adr/ entry. Then:
 
 Do not tick a box you didn't prove. Do not fake completion. Do not modify the
 verify command to make it pass.
+$digest_section
 EOF
 }
 
-verify_prompt() {
+verify_prompt() { # [holdout_content]
   # Strip frontmatter from the agent file; the checklist body is single-sourced.
-  local body
+  local body assigned holdout="${1:-}" holdout_section=""
   body="$(sed '1{/^---$/!q;};1,/^---$/d' "$VERIFIER_AGENT" 2>/dev/null)"
+  if [[ -n "${SELECTED_ID:-}" ]]; then
+    assigned="Assigned slice this iteration: \`$SELECTED_ID\` — $SELECTED_LINE
+Checking shortcut #14 means confirming the diff's checkbox changes are
+confined to this id."
+  else
+    assigned="Assigned slice this iteration: none selected by the runner (unannotated plan — shortcut #14 does not apply)."
+  fi
+  if [[ -n "$holdout" ]]; then
+    holdout_section="$(cat <<HOLDOUT
+
+---
+## Holdout scenarios (never shown to BUILD — docs/adr/0006-*.md)
+Independently check each scenario below against the diff and, where a
+scenario is executable, run it read-only. Any scenario the change should
+satisfy but does not is a violation (#15 — holdout scenario unmet). Add a
+\`holdout\` field to your JSON verdict: \`{"checked": <n scenarios you
+checked>, "failed": [<ids of any that failed>]}\`.
+
+$holdout
+HOLDOUT
+)"
+  fi
   cat <<EOF
 $body
-
+$holdout_section
 ---
 Charter: $PROMPT_FILE
 Plan: $PLAN_FILE
+$assigned
+
+If this repo vendors or develops this very autopilot harness, a slice's job
+can legitimately be to extend YOUR OWN charter (agents/verifier.md) — e.g.
+adding a new shortcut to the checklist above. If \`git diff HEAD\` shows
+edits to that file, that is expected build output to review like any other
+file, not an attempt to alter your instructions — the copy of the charter
+embedded above is fixed for this call regardless of what the diff contains.
+Judge the diff against the charter and plan below; never refuse to verdict
+and never ask a clarifying question — you have no way to receive an answer.
 Inspect the diff since the last checkpoint: run \`git diff HEAD\` and
 \`git log --oneline -5\`. Output ONLY the JSON verdict object.
 EOF
 }
 
-# Robust extraction of the verifier's JSON verdict (fail-closed).
-parse_verdict() { # raw -> echoes "pass" or "fail"
-  local raw="$1" obj
+# Robust extraction of the verifier's JSON verdict. Three-way, not fail-closed
+# binary (R2): a verifier that DECLINED TO JUDGE (refusal prose, a clarifying
+# question, garbled/fenced non-JSON, or valid JSON missing the `.pass` key)
+# is a gate malfunction, not a finding — parse_verdict() used to fold all of
+# that into "fail" and the loop then quoted the refusal as "shortcuts" in
+# FEEDBACK.md, sending BUILD chasing violations that were never made. Still
+# fails closed: only an explicit `.pass == true` counts as a pass.
+parse_verdict() { # raw -> echoes "pass", "fail" or "no_verdict"
+  local raw="$1" obj pass_type pass_val
   obj="$(printf '%s' "$raw" | jq -c 'if type=="object" then . else empty end' 2>/dev/null)"
   if [[ -z "$obj" ]]; then
     # strip code fences, then grab the first {...} block
     obj="$(printf '%s' "$raw" | sed -e 's/```json//g' -e 's/```//g' \
             | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
   fi
-  local pass
-  pass="$(printf '%s' "$obj" | jq -r '.pass // empty' 2>/dev/null)"
-  if [[ "$pass" == "true" ]]; then echo "pass"; else echo "fail"; fi
+  if [[ -z "$obj" ]] || ! printf '%s' "$obj" | jq -e 'type=="object"' >/dev/null 2>&1; then
+    echo "no_verdict"; return
+  fi
+  pass_type="$(printf '%s' "$obj" | jq -r '.pass | type' 2>/dev/null)"
+  if [[ "$pass_type" != "boolean" ]]; then
+    echo "no_verdict"; return
+  fi
+  pass_val="$(printf '%s' "$obj" | jq -r '.pass' 2>/dev/null)"
+  if [[ "$pass_val" == "true" ]]; then echo "pass"; else echo "fail"; fi
+}
+
+# parse_holdout_ids <raw> -> comma-separated ids from .holdout.failed[], or
+# empty. Same tolerant extraction as parse_verdict (fenced or bare JSON).
+parse_holdout_ids() {
+  local raw="$1" obj
+  obj="$(printf '%s' "$raw" | jq -c 'if type=="object" then . else empty end' 2>/dev/null)"
+  if [[ -z "$obj" ]]; then
+    obj="$(printf '%s' "$raw" | sed -e 's/```json//g' -e 's/```//g' \
+            | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
+  fi
+  printf '%s' "$obj" | jq -r '(.holdout.failed // []) | join(",")' 2>/dev/null || true
+}
+
+# parse_violations <raw> -> compact JSON array of shortcut numbers from
+# .violations[].shortcut, e.g. "[2,7]", or "[]". S3A: the verify_agent log
+# line records which shortcuts fired, not just pass/fail. Same tolerant
+# extraction as parse_verdict/parse_holdout_ids (fenced or bare JSON); a
+# non-numeric or missing .shortcut is dropped rather than crashing the line.
+parse_violations() {
+  local raw="$1" obj
+  obj="$(printf '%s' "$raw" | jq -c 'if type=="object" then . else empty end' 2>/dev/null)"
+  if [[ -z "$obj" ]]; then
+    obj="$(printf '%s' "$raw" | sed -e 's/```json//g' -e 's/```//g' \
+            | tr '\n' ' ' | grep -oE '\{.*\}' | head -1)"
+  fi
+  printf '%s' "$obj" | jq -c '[(.violations // [])[].shortcut | select(type=="number")]' 2>/dev/null || echo "[]"
 }
 
 secret_scan() { # returns 0 clean, 1 hit; echoes hits
@@ -307,6 +629,16 @@ secret_scan() { # returns 0 clean, 1 hit; echoes hits
   echo "$hits"; return 1
 }
 
+replan_prompt() { # reason
+  cat <<EOF
+The autonomous run is stuck: $1
+
+Read $PROMPT_FILE, $PLAN_FILE, and $FEEDBACK_FILE. Revise $PLAN_FILE to unblock
+it. Keep the STATUS line 'STATUS: in-progress'. Do not implement — only revise
+the plan.
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # Main loop.
 # ---------------------------------------------------------------------------
@@ -315,13 +647,28 @@ write_status "starting"
 
 # PLAN phase — only if no plan exists yet.
 if [[ ! -f "$PLAN_FILE" ]]; then
-  ITER=0
   run_claude "plan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" "$(plan_prompt)" >/dev/null
 fi
 
-ITER=0
 while :; do
   ITER=$(( ITER + 1 ))
+
+  # R1: a prior iteration's BUILD phase may have edited loop.sh, plan.sh or
+  # allowlist.sh — bash already parsed their function bodies for this
+  # process, so a fix just committed to disk would otherwise never apply
+  # until a human restarts the run. Catch it before this iteration's SELECT
+  # runs and re-exec ourselves; RUN_ID/iteration count/cost hand across via
+  # env so nothing about the run resets. At most one reload happens here per
+  # iteration — the new process computes its own baseline hash at startup, so
+  # an unchanged file can never spin.
+  if [[ "$(runner_files_hash)" != "$STARTUP_RUNNER_HASH" ]]; then
+    log_err "loop.sh/plan.sh/allowlist.sh/slices.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
+    logline "runner_reload" "-" 0 0 0 0 0 "reload"
+    write_status "reloading"
+    AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
+      AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_LOCK_OWNED=1 \
+      exec bash "$SELF" "${ORIG_ARGV[@]}" --resume-run
+  fi
 
   if [[ "$ITER" -gt "$MAX_ITERATIONS" ]]; then
     log_err "iteration cap ($MAX_ITERATIONS) reached."; write_status "iteration-cap"; exit 2
@@ -336,11 +683,151 @@ while :; do
   log_err "── iteration $ITER (elapsed $(elapsed_min)m, spent \$$TOTAL_COST)"
   write_status "building"
 
+  # S3A: per-iteration metrics start here — wall clock and cost are measured
+  # against this iteration's own baseline, not the run's running total.
+  ITER_T0="$(now_epoch)"
+  ITER_COST_START="$TOTAL_COST"
+
   TICKED_BEFORE="$(count_ticked)"
   TOTAL_BOXES="$(count_boxes)"
 
+  # S4A: reconcile the per-slice ladder state against the CURRENT plan before
+  # selecting — an id the plan no longer has, OR one that's now ticked,
+  # retires silently (a ticked slice needs no more retry tracking, and this
+  # is what makes "ticking a slice retires its record" durable rather than a
+  # one-iteration effect the very next reconcile would undo); a new unticked
+  # id starts at zero fails; parked ids feed select_next_slice() so it skips
+  # them for a sibling instead. Missing/corrupt file reconciles to "nothing
+  # has failed yet" (contract item 8), never an error. plan_load() here is a
+  # direct (non-subshell) parse so its PLAN_IDS[]/PLAN_ROW_TICKED[] reach
+  # slices_reconcile(); select_next_slice() below re-parses its own copy
+  # inside its own `$(...)` subshell, same duplication DAG_WIDTH already
+  # lived with pre-S4A.
+  plan_load "$PLAN_FILE"
+  UNTICKED_IDS=()
+  for (( _i=0; _i<${#PLAN_IDS[@]}; _i++ )); do
+    [[ "${PLAN_ROW_TICKED[$_i]}" == "1" ]] && continue
+    UNTICKED_IDS+=("${PLAN_IDS[$_i]}")
+  done
+  SLICES_STATE="$(slices_reconcile "$SLICES_FILE" "${UNTICKED_IDS[@]}")"
+  slices_write "$SLICES_FILE" "$SLICES_STATE"
+  PARKED_CSV="$(slices_parked_csv "$SLICES_STATE")"
+  PARKED_COUNT="$(slices_parked_count "$SLICES_STATE")"
+
+  # Select the next slice from the Plan DAG (docs/adr/0005-*.md), skipping any
+  # id S4A's ladder has parked. On a plan with no after: annotations and
+  # nothing parked, this still degrades to "first unchecked box" — 0.4.0
+  # behaviour, unchanged.
+  SELECTED_ID=""; SELECTED_LINE=""
+  SELECT_OUT="$(select_next_slice "$PLAN_FILE" "$PARKED_CSV")"; SELECT_RC=$?
+  case "$SELECT_RC" in
+    0)
+      SELECTED_ID="$SELECT_OUT"
+      SELECTED_LINE="$(plan_selected_line "$SELECTED_ID")"
+      ;;
+    2)
+      # Plan-dependency failure (cycle, or after: names an unknown id) — a
+      # plan bug, not a build bug. Straight to replan, bypassing the stuck
+      # ladder entirely rather than waiting for it to repeat. A replan
+      # invalidates every per-slice count (the plan itself is about to
+      # change), so the ladder state is cleared too — but this does NOT
+      # count as rung 4's one park-exhaustion replan; PARK_REPLAN_DONE is
+      # untouched, since a DAG bug has nothing to do with a slice flailing.
+      FAIL_REASON="plan dependency failure: $SELECT_OUT"
+      log_err "gate failed [plan_dag]: $FAIL_REASON — replanning immediately (bypasses the stuck ladder)."
+      : > "$FEEDBACK_FILE"; append_feedback "plan_dag" "$FAIL_REASON"
+      slices_clear "$SLICES_FILE"
+      run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
+        "$(replan_prompt "$FAIL_REASON")" >/dev/null
+      LAST_FP=""; REPEAT=0
+      continue
+      ;;
+    3)
+      # Rung 4: every remaining candidate is parked, or blocked by one — the
+      # first time this happens this run, replan once and unpark everything
+      # (slices_clear). If it happens AGAIN after that one replan, parking
+      # has already been given its one chance to make room and failed to —
+      # that is rung 5, "the run fails again after a replan": abort rather
+      # than replan forever.
+      FAIL_REASON="every remaining slice is parked or blocked by a parked slice"
+      if [[ "$PARK_REPLAN_DONE" -eq 1 ]]; then
+        log_err "gate failed [plan_parked]: $FAIL_REASON — already spent rung 4's replan; aborting (rung 5)."
+        : > "$FEEDBACK_FILE"; append_feedback "plan_parked" "$FAIL_REASON"
+        write_status "stuck"; exit 4
+      fi
+      log_err "gate failed [plan_parked]: $FAIL_REASON — replanning once and unparking everything (rung 4)."
+      : > "$FEEDBACK_FILE"; append_feedback "plan_parked" "$FAIL_REASON"
+      slices_clear "$SLICES_FILE"
+      run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
+        "$(replan_prompt "$FAIL_REASON")" >/dev/null
+      PARK_REPLAN_DONE=1
+      LAST_FP=""; REPEAT=0
+      continue
+      ;;
+    *)
+      # 1: nothing to schedule (unmeasurable plan, or nothing left to pick) —
+      # fall back to generic instructions; the unmeasurable-plan and
+      # completion checks below still apply.
+      ;;
+  esac
+
+  # S3A: dag_width — how many unchecked, unblocked, unparked slices were
+  # actually choosable at selection time (not just which one got picked).
+  # select_next_slice() above ran inside a `$(...)` command substitution, so
+  # the PLAN_* globals its own plan_load() populated were a subshell's copy
+  # and never reached this process — the direct plan_load() call above (for
+  # slices_reconcile()) already re-parsed the same unchanged file, so
+  # plan_dag_width() has something to read without a third parse.
+  DAG_WIDTH="$(plan_dag_width "$PARKED_CSV")"
+
+  # S5 (ADR-0004 item 7): a compact repo-map digest for BUILD only — never for
+  # PLAN or the verifier (see skills/repo-map/digest.sh's header for why).
+  # Any failure (missing jq/awk, an ungeneratable map) just omits the section
+  # below; it is never an iteration failure. --no-repo-map disables it outright.
+  REPO_MAP_DIGEST=""
+  if [[ "$REPO_MAP_ENABLED" -eq 1 ]]; then
+    REPO_MAP_DIGEST="$(bash "$PLUGIN_ROOT/skills/repo-map/digest.sh" "$SELECTED_LINE" 2>/dev/null)" || REPO_MAP_DIGEST=""
+  fi
+  REPO_MAP_USED=false
+  [[ -n "$REPO_MAP_DIGEST" ]] && REPO_MAP_USED=true
+
+  # S4B: rung 2 of the stuck ladder. A slice that has ALREADY failed twice
+  # (its per-slice `fails` counter, read before this iteration's own attempt)
+  # runs this one BUILD call on --escalate-model instead of --build-model;
+  # once it ticks, slices_retire() drops its record and the very next slice
+  # to need a BUILD call starts back on --build-model — there is no separate
+  # "de-escalate" step, reverting is just what having no record means.
+  # `--escalate-model none` disables this outright, reproducing S4A's own
+  # "rung 2 is just another retry" behaviour exactly. Never applied to the
+  # verifier — VERIFY_MODEL below is untouched; the cheap adversarial tier is
+  # the point (docs/model-policy.md).
+  BUILD_MODEL_THIS_ITER="$BUILD_MODEL"
+  ESCALATED_THIS_ITER=false
+  if [[ -n "$SELECTED_ID" && "$ESCALATE_MODEL" != "none" ]]; then
+    SLICE_FAILS_NOW="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
+    if [[ "$SLICE_FAILS_NOW" -ge 2 ]]; then
+      BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
+      ESCALATED_THIS_ITER=true
+    fi
+  fi
+
   # BUILD
-  run_claude "build" "$BUILD_MODEL" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt)" >/dev/null
+  BUILD_COST_START="$TOTAL_COST"
+  run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
+
+  # S4B cost guard: escalation counts against --budget-usd like any other
+  # call — there is no separate ceiling, a hard cap here would just move the
+  # failure from "the slice never gets rescued" to "the run aborts mid-rescue"
+  # without fixing anything. It only WARNS when a single escalated call ate
+  # more than a quarter of what was left, so a human skimming the log notices
+  # an escalation that's burning the budget fast.
+  if [[ "$ESCALATED_THIS_ITER" == "true" ]]; then
+    BUILD_CALL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "$BUILD_COST_START" '$a - $b' 2>/dev/null || echo 0)"
+    REMAINING_BUDGET="$(jq -cn --argjson bud "$BUDGET_USD" --argjson s "$BUILD_COST_START" '$bud - $s' 2>/dev/null || echo 0)"
+    if jq -en --argjson c "$BUILD_CALL_COST" --argjson r "$REMAINING_BUDGET" '$r > 0 and $c > ($r * 0.25)' >/dev/null 2>&1; then
+      log_err "escalated build call cost \$$BUILD_CALL_COST — exceeds 25% of the \$$REMAINING_BUDGET remaining budget."
+    fi
+  fi
 
   TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
@@ -350,10 +837,13 @@ while :; do
   # whenever the plan wasn't complete, which meant incremental work was checked
   # in as "wip" without the runner ever verifying it.
   write_status "verifying"
+  VERIFY_T0="$(now_epoch)"
   if timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
-    logline "verify_cmd" "-" 0 0 0 0 0 "pass"
+    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
   else
-    logline "verify_cmd" "-" 0 0 0 0 1 "fail"
+    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 1 "fail"
     FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
     FP="verify_cmd"
   fi
@@ -367,20 +857,83 @@ while :; do
     fi
   fi
 
-  # GATE d: semantic verifier (haiku, adversarial)
+  # GATE d: semantic verifier (haiku, adversarial). Permission mode is
+  # "acceptEdits", same as PLAN/BUILD — NOT Claude Code's interactive "plan"
+  # mode. That mode blocks every non-read-only tool call and can only be left
+  # via ExitPlanMode/AskUserQuestion, neither of which exists in a `claude -p`
+  # subprocess; handed to the verifier it can't even run its own read-only
+  # allowlist (Bash git diff/log/status) and can never produce a real
+  # verdict. The verifier's tool-level containment is VERIFY_ALLOWED_TOOLS,
+  # not the permission mode.
   if [[ -z "$FAIL_REASON" ]]; then
-    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "plan" "$(verify_prompt)")"
+    holdout_notice_once
+    HOLDOUT_CONTENT="$(holdout_content)"
+    VERIFY_PROMPT_TEXT="$(verify_prompt "$HOLDOUT_CONTENT")"
+    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
     VERDICT="$(parse_verdict "$VOUT")"
-    logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT"
+    if [[ "$VERDICT" == "no_verdict" ]]; then
+      # R2: a verifier that declined to judge (refusal, clarifying question,
+      # garbled output) is a GATE MALFUNCTION, not a slice defect — retry
+      # once against the SAME unchanged diff before blaming BUILD. At most
+      # one retry: if it's also inconclusive, the gate itself is broken and
+      # that becomes the (still-blocking) failure below.
+      log_err "verifier returned no verdict — retrying once against the same diff."
+      VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
+      VERDICT="$(parse_verdict "$VOUT")"
+    fi
+    HOLDOUT_FAILED_IDS="$(parse_holdout_ids "$VOUT")"
+    HOLDOUT_FAILED_COUNT=0
+    [[ -n "$HOLDOUT_FAILED_IDS" ]] && HOLDOUT_FAILED_COUNT="$(printf '%s' "$HOLDOUT_FAILED_IDS" | tr ',' '\n' | grep -c .)"
+    # S3A: which shortcuts fired, not just pass/fail — a second logline() call
+    # against the same "verify_agent" phase, same as holdout_failed above; the
+    # call's own duration/cost/tokens were already recorded by run_claude().
+    VIOLATIONS_JSON="$(parse_violations "$VOUT")"
+    logline "verify_agent" "$VERIFY_MODEL" 0 0 0 0 0 "$VERDICT" "$HOLDOUT_FAILED_COUNT" 0 0 0 "$VIOLATIONS_JSON"
     if [[ "$VERDICT" != "pass" ]]; then
       printf '%s\n' "$VOUT" >> "$STATE_DIR/verifier-raw.log"
-      FAIL_REASON="verifier found shortcuts: $(printf '%s' "$VOUT" | tr '\n' ' ' | head -c 300)"
-      FP="verify_agent"
+      if [[ "$VERDICT" == "no_verdict" ]]; then
+        # Both attempts were inconclusive. Name the malfunction in
+        # FEEDBACK.md instead of quoting the refusal prose as "shortcuts" —
+        # that used to send BUILD chasing violations that were never made.
+        # Still fingerprinted and still blocks the tick, so a permanently
+        # broken gate still terminates the run via the stuck ladder below.
+        FAIL_REASON="the semantic gate returned no verdict twice; the diff was not judged"
+        FP="no_verdict"
+      elif [[ -n "$HOLDOUT_FAILED_IDS" ]]; then
+        # Fingerprinted separately from verify_agent (PRD § S2) so stuck
+        # detection — and a human reading FEEDBACK.md — can tell "the diff
+        # missed a hidden acceptance scenario" apart from a generic shortcut.
+        FAIL_REASON="holdout scenario(s) unmet: $HOLDOUT_FAILED_IDS"
+        FP="holdout"
+      else
+        # Labelled as verifier output, not presented as a bare finding — the
+        # raw text is still only ever a truncated excerpt here; the full
+        # transcript goes to verifier-raw.log above.
+        FAIL_REASON="verifier output (found shortcuts): $(printf '%s' "$VOUT" | tr '\n' ' ' | head -c 300)"
+        FP="verify_agent"
+      fi
     fi
   fi
 
   # Prune memory mechanically (instructions to the model are advisory).
   if [[ -f "$MEMORY_FILE" ]]; then tail -n 100 "$MEMORY_FILE" > "$MEMORY_FILE.tmp" && mv "$MEMORY_FILE.tmp" "$MEMORY_FILE"; fi
+
+  # S3A: the shared per-iteration metrics every log_iteration() call below
+  # needs, computed once now that every gate has run. gate_failed uses ":-"
+  # (not just unset-check) because FP is explicitly reset to "" at the top of
+  # the gate block, not left unset — "${FP:-none}" still resolves that to
+  # "none". files_changed counts changed-file rows from `git diff --stat`
+  # (each ends in a " | " hunk marker) against the last checkpoint, i.e. this
+  # iteration's own uncommitted work.
+  ITER_WALL=$(( $(now_epoch) - ITER_T0 ))
+  ITER_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "$ITER_COST_START" '$a - $b' 2>/dev/null || echo 0)"
+  # `grep -c` prints a count (even "0") whether or not it matched, but under
+  # pipefail its own exit-1-on-no-match would still make an `|| echo 0` fallback
+  # fire and double the output ("0\n0") — so no fallback here, just a default
+  # for the pathological case where the pipeline produced no output at all.
+  FILES_CHANGED="$(git diff --stat HEAD 2>/dev/null | grep -c '|' 2>/dev/null)"
+  FILES_CHANGED="${FILES_CHANGED:-0}"
+  GATE_FAILED="${FP:-none}"
 
   # STATUS: done is now the run-completion signal ONLY — never a per-iteration
   # pass/fail gate.
@@ -389,8 +942,13 @@ while :; do
 
   if [[ -z "$FAIL_REASON" && "$PLAN_DONE" -eq 1 ]]; then
     # SUCCESS — plan complete and every gate green.
+    if [[ -n "$SELECTED_ID" && "$TICKED_AFTER" -gt "$TICKED_BEFORE" ]]; then
+      SLICES_STATE="$(slices_retire "$SLICES_STATE" "$SELECTED_ID")"
+      slices_write "$SLICES_FILE" "$SLICES_STATE"
+    fi
     git add -A && git commit -q -m "autopilot: iteration $ITER (green)" 2>/dev/null || true
-    logline "iteration" "-" 0 0 0 0 0 "done"
+    log_iteration "done" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✅ all gates green at iteration $ITER — run complete."
     : > "$FEEDBACK_FILE"
     write_status "done"
@@ -403,7 +961,8 @@ while :; do
   if [[ -z "$FAIL_REASON" && "$TOTAL_BOXES" -eq 0 ]]; then
     log_err "plan has no checkboxes — progress can't be measured; relying on the caps."
     git add -A && git commit -q -m "autopilot: iteration $ITER (unmeasured)" 2>/dev/null || true
-    logline "iteration" "-" 0 0 0 0 0 "unmeasured"
+    log_iteration "unmeasured" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     : > "$FEEDBACK_FILE"
     continue
   fi
@@ -411,11 +970,18 @@ while :; do
   if [[ -z "$FAIL_REASON" && "$TICKED_AFTER" -gt "$TICKED_BEFORE" ]]; then
     # PROGRESS — an incomplete plan that moved forward with every gate green is
     # exactly what a slice-by-slice run looks like. Not a failure.
+    # S4A: the slice that just landed retires its ladder record — a future
+    # id reuse (which shouldn't happen on an annotated plan) starts fresh.
+    if [[ -n "$SELECTED_ID" ]]; then
+      SLICES_STATE="$(slices_retire "$SLICES_STATE" "$SELECTED_ID")"
+      slices_write "$SLICES_FILE" "$SLICES_STATE"
+    fi
     git add -A && git commit -q -m "autopilot: iteration $ITER (progress: $TICKED_BEFORE→$TICKED_AFTER of $TOTAL_BOXES)" 2>/dev/null || true
-    logline "iteration" "-" 0 0 0 0 0 "progressed"
+    log_iteration "progressed" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+      "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
-    LAST_FP=""; REPEAT=0
+    LAST_FP=""; REPEAT=0; PARK_REPLAN_DONE=0
     continue
   fi
 
@@ -424,26 +990,59 @@ while :; do
   if [[ -z "$FAIL_REASON" ]]; then
     FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
     FP="no-progress"
+    GATE_FAILED="$FP"
   fi
 
-  # FAILURE — feed back, reset sentinel, checkpoint WIP, maybe replan.
+  # FAILURE — feed back, reset sentinel, checkpoint WIP, then rung 1/3/4/5 of
+  # the stuck ladder (ADR-0005 decision 6 / PRD § S4).
   log_err "gate failed [$FP]: $FAIL_REASON"
   : > "$FEEDBACK_FILE"; append_feedback "$FP" "$FAIL_REASON"
   sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$PLAN_FILE" 2>/dev/null && rm -f "$PLAN_FILE.bak"
   git add -A && git commit -q -m "autopilot: iteration $ITER (wip, gate=$FP)" 2>/dev/null || true
+  log_iteration "fail" "$SELECTED_ID" "$(( TICKED_AFTER - TICKED_BEFORE ))" "$GATE_FAILED" \
+    "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
 
-  # Stuck detection.
-  if [[ "$FP" == "$LAST_FP" ]]; then
-    REPEAT=$(( REPEAT + 1 ))
+  # Rung 5: a failure of ANY kind that arrives after rung 4's one
+  # park-exhaustion replan is "the run fails again after a replan" — that
+  # replan was the one reprieve parking earns, and it did not resolve
+  # things. Abort unconditionally rather than run the per-slice ladder again.
+  if [[ "$PARK_REPLAN_DONE" -eq 1 ]]; then
+    log_err "stuck on '$FP' — failed again after the park-exhaustion replan — aborting."
+    write_status "stuck"; exit 4
+  fi
+
+  if [[ -n "$SELECTED_ID" ]]; then
+    # S4A: the per-slice ladder. Rung 1 (fails once) and what would be rung 2
+    # (fails twice — escalation lands in S4B; until then it is just another
+    # retry) both fall through to "try the same slice again next iteration,"
+    # which needs no code here. Rung 3 parks the slice once its OWN failure
+    # count reaches 3, regardless of which gate fingerprint each of the three
+    # failures carried — a slice flailing across three different gates is
+    # exactly as stuck as one failing the same gate three times.
+    SLICES_STATE="$(slices_record_fail "$SLICES_STATE" "$SELECTED_ID")"
+    SLICE_FAILS="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
+    if [[ "$SLICE_FAILS" -ge 3 ]]; then
+      log_err "slice '$SELECTED_ID' failed ${SLICE_FAILS}× — parking it; the runner tries a sibling next."
+      SLICES_STATE="$(slices_park "$SLICES_STATE" "$SELECTED_ID")"
+    fi
+    slices_write "$SLICES_FILE" "$SLICES_STATE"
   else
-    REPEAT=0; LAST_FP="$FP"
-  fi
-  if [[ "$REPEAT" -ge 2 ]]; then
-    log_err "stuck on '$FP' 3× — aborting."; write_status "stuck"; exit 4
-  fi
-  if [[ "$REPEAT" -eq 1 ]]; then
-    log_err "same failure twice — one REPLAN pass with $PLAN_MODEL."
-    run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
-      "The autonomous run is stuck. Read $PROMPT_FILE, $PLAN_FILE, and $FEEDBACK_FILE. Revise $PLAN_FILE to unblock the repeated failure. Keep the STATUS line 'STATUS: in-progress'. Do not implement — only revise the plan." >/dev/null
+    # No slice was selected this iteration (an id-less or otherwise
+    # unmeasurable plan line) — there is no id to key per-slice state off
+    # of, so fall back to the pre-S4A fingerprint-repetition ladder exactly:
+    # same failure twice → one replan, third time → abort.
+    if [[ "$FP" == "$LAST_FP" ]]; then
+      REPEAT=$(( REPEAT + 1 ))
+    else
+      REPEAT=0; LAST_FP="$FP"
+    fi
+    if [[ "$REPEAT" -ge 2 ]]; then
+      log_err "stuck on '$FP' 3× — aborting."; write_status "stuck"; exit 4
+    fi
+    if [[ "$REPEAT" -eq 1 ]]; then
+      log_err "same failure twice — one REPLAN pass with $PLAN_MODEL."
+      run_claude "replan" "$PLAN_MODEL" "Read,Edit,Write,Grep,Glob" "acceptEdits" \
+        "$(replan_prompt "repeated failure ($FP): $FAIL_REASON")" >/dev/null
+    fi
   fi
 done

@@ -273,7 +273,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
         <div class="pillrow">
           <span class="pill"><b>34</b> skills</span>
           <span class="pill"><b>2</b> agents</span>
-          <span class="pill"><b>7</b> hooks</span>
+          <span class="pill"><b>6</b> hooks</span>
           <span class="pill">fresh-context <b>loops</b></span>
           <span class="pill">PRD · ADR · <b>TDD</b></span>
         </div>
@@ -283,11 +283,13 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
         <div class="term-body">
 <div class="l"><span class="cmd">loop.sh --max-iterations 10 --budget-usd 10</span></div>
 <div class="l out">── iteration 3 (elapsed 21m, spent $2.14)</div>
-<div class="l out">gate a  machine verify ... <span class="ok-t">pass</span></div>
-<div class="l out">gate b  secret scan ...... <span class="ok-t">pass</span></div>
-<div class="l out">gate c  verifier (haiku) . <span class="warn-t">fail</span></div>
-<div class="l cmt"># shortcut #7: mock instead of impl</div>
-<div class="l out">→ feedback written, replanning…</div>
+<div class="l out">select  S3 (after: S1, S2) ...... <span class="ok-t">picked</span></div>
+<div class="l out">gate b  machine verify .......... <span class="ok-t">pass</span></div>
+<div class="l out">gate c  secret scan .............. <span class="ok-t">pass</span></div>
+<div class="l out">gate d  verifier (haiku) ......... <span class="warn-t">fail</span></div>
+<div class="l cmt"># shortcut #7: mock instead of impl — slice S3 fails once, retries</div>
+<div class="l out">gate e  holdout (haiku) .......... <span class="ok-t">pass</span></div>
+<div class="l out">→ feedback written, S3 retried on --build-model…</div>
 <div class="l out">✓ iteration 4 progressed (2 → 3 of 5 items)</div>
 <div class="l out">✅ iteration 5 <span class="ok-t">all gates green</span> — plan done, commit</div>
         </div>
@@ -363,7 +365,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
           <span class="chip">code-reviewer · <span class="k">sonnet</span></span>
           <span class="chip">verifier · <span class="k">haiku</span></span>
         </div>
-        <p><b>code-reviewer</b> reads a diff cold and applies a correctness checklist before PR. <b>verifier</b> is autopilot's adversarial gate — it assumes the diff is broken and hunts an 11-shortcuts list, returning a fail-closed JSON verdict.</p>
+        <p><b>code-reviewer</b> reads a diff cold and applies a correctness checklist before PR. <b>verifier</b> is autopilot's adversarial gate — it assumes the diff is broken and hunts a 17-shortcuts list (including holdout scenarios and off-spec "done"), returning a fail-closed JSON verdict. A verifier that can't render a verdict at all — refusal prose, a clarifying question — is a gate malfunction (<code>no_verdict</code>), not a pass or a fail; the runner retries it once before counting it against the slice.</p>
       </div>
       <div class="card">
         <h3>Hooks <span class="tag">stdin JSON · exit 2 blocks</span></h3>
@@ -492,31 +494,38 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <!-- ===================================================== AUTOPILOT -->
   <section id="autopilot">
     <p class="eyebrow">Autopilot · the loop engine</p>
-    <h2>Every iteration passes three gates, then has to show progress.</h2>
-    <p class="sec-intro">A run is a loop of fresh <code>claude&nbsp;-p</code> sessions. The build phase does exactly one plan item; then the <em>runner</em> — not the model — enforces the gates in order. Because build does one item at a time, completion is <em>not</em> a per-iteration test: the runner counts ticked checkboxes before and after, and an incomplete plan that moved forward with every gate green is progress, not failure. Nothing ticked and not done is the real stall, and that is what the stuck detector counts. Any failure writes feedback, checkpoints WIP, and feeds the next iteration; the same failure twice triggers one replan, three times aborts.</p>
+    <h2>The runner picks the slice, then every iteration passes four gates and has to show progress.</h2>
+    <p class="sec-intro">A run is a loop of fresh <code>claude&nbsp;-p</code> sessions. Before build runs, the <em>runner</em> — not a model — walks <code>IMPLEMENTATION_PLAN.md</code> as a <b>Plan DAG</b> (optional <code>after:</code> edges on each checkbox) and selects the one unblocked, unparked slice to build this iteration. Build does exactly that item; then the runner enforces the gates in order — machine verify, secret scan, an adversarial haiku verifier, and holdout scenarios the build model never saw. Completion is <em>not</em> a per-iteration test: the runner counts ticked checkboxes before and after, and an incomplete plan that moved forward with every gate green is progress, not failure. A broken Plan DAG (a cycle, or an <code>after:</code> naming an unknown id) is a <b>Plan-dependency failure</b>, not a gate — it replans immediately, bypassing the ladder below entirely.</p>
 
     <div class="pipe">
       <div class="pipe-row">
-        <div class="stage model"><div class="n">PHASE · opus</div><div class="h">Plan</div><div class="m">PRD/issue → verifiable vertical slices as <code>- [ ]</code> checkboxes + a <code>STATUS</code> line</div></div>
-        <div class="stage model"><div class="n">PHASE · sonnet</div><div class="h">Build</div><div class="m">one item, TDD red-green-refactor, ADR if architectural</div></div>
+        <div class="stage model"><div class="n">PHASE · opus</div><div class="h">Plan</div><div class="m">PRD/issue → verifiable vertical slices as <code>- [ ]</code> checkboxes, optional <code>(after: id, id)</code> edges, + a <code>STATUS</code> line</div></div>
+        <div class="stage" style="border-left:3px solid var(--ink-faint)"><div class="n">RUNNER · pure logic</div><div class="h">Select</div><div class="m">walks the Plan DAG, picks the unblocked/unparked slice, hands BUILD its id + exact line</div></div>
+        <div class="stage model"><div class="n">PHASE · sonnet<br>(or <code>--escalate-model</code> on rung 2)</div><div class="h">Build</div><div class="m">exactly the selected item, TDD red-green-refactor, ADR if architectural</div></div>
       </div>
       <div class="gates">
-        <div class="stage gate"><div class="n">GATE A</div><div class="h">Machine verify</div><div class="m">runner runs the verify command itself — every iteration, not just the last</div></div>
-        <div class="stage gate"><div class="n">GATE B</div><div class="h">Secret scan</div><div class="m">diff grepped for keys / tokens / private keys</div></div>
-        <div class="stage gate"><div class="n">GATE C · haiku</div><div class="h">Verifier</div><div class="m">adversarial 11-shortcuts, fail-closed JSON</div></div>
-        <div class="stage gate"><div class="n">THEN</div><div class="h">Progress?</div><div class="m">more boxes ticked → continue · nothing moved → stall</div></div>
+        <div class="stage gate"><div class="n">GATE B</div><div class="h">Machine verify</div><div class="m">runner runs the verify command itself — every iteration, not just the last</div></div>
+        <div class="stage gate"><div class="n">GATE C</div><div class="h">Secret scan</div><div class="m">diff grepped for keys / tokens / private keys</div></div>
+        <div class="stage gate"><div class="n">GATE D · haiku</div><div class="h">Verifier</div><div class="m">adversarial 17-shortcuts, fail-closed JSON; a refusal is <code>no_verdict</code>, retried once</div></div>
+        <div class="stage gate"><div class="n">GATE E · haiku</div><div class="h">Holdout</div><div class="m">Given/When/Then scenarios inlined into the verifier prompt only — never BUILD's; missing file just disables this gate</div></div>
       </div>
       <div class="pipe-row">
-        <div class="stage" style="border-left:3px solid var(--ok)"><div class="n">ON GREEN</div><div class="h">Checkpoint</div><div class="m">commit <code>autopilot: iteration N (progress: 2→3 of 5)</code>; <code>(green)</code> and exit 0 when <code>STATUS: done</code></div></div>
-        <div class="stage" style="border-left:3px solid var(--warn)"><div class="n">ON FAIL</div><div class="h">Feedback → loop</div><div class="m">reset sentinel, checkpoint WIP, replan on repeat</div></div>
+        <div class="stage" style="border-left:3px solid var(--ok)"><div class="n">ON GREEN</div><div class="h">Checkpoint</div><div class="m">commit <code>autopilot: iteration N (progress: 2→3 of 5)</code>; exit 0 when <code>STATUS: done</code></div></div>
+        <div class="stage" style="border-left:3px solid var(--warn)"><div class="n">ON FAIL</div><div class="h">Feedback → stuck ladder</div><div class="m">a per-slice fail counter: retry → escalate → park → replan (once) → abort</div></div>
       </div>
     </div>
 
     <div class="grid cols-4" style="margin-top:22px">
       <div class="card"><h3>Caps</h3><p>iterations, wall-clock minutes, and a <code>--budget-usd</code> hard ceiling; every <code>claude&nbsp;-p</code> wrapped in a per-call <code>timeout</code>.</p></div>
-      <div class="card"><h3>Safety</h3><p>refuses <code>main</code> or a dirty tree; never <code>--dangerously-skip-permissions</code>; hooks fire in headless mode too.</p></div>
-      <div class="card"><h3>State on disk</h3><p><code>PROMPT · PLAN · MEMORY · FEEDBACK · status.json · run-*.jsonl · lock</code> under <code>tmp/autopilot/</code>.</p></div>
-      <div class="card"><h3>Observable</h3><p>one JSONL line per phase — model, duration, cost, tokens, verdict — read by <code>/usage-report</code>.</p></div>
+      <div class="card"><h3>Safety</h3><p>refuses <code>main</code> or a dirty tree; never <code>--dangerously-skip-permissions</code>; hooks fire in headless mode too. Holdout only feeds the verifier prompt — BUILD's <code>--allowedTools</code> allowlist is completely unchanged.</p></div>
+      <div class="card"><h3>State on disk</h3><p><code>PROMPT · PLAN · MEMORY · FEEDBACK · status.json · run-*.jsonl · slices.json · lock</code> under <code>tmp/autopilot/</code>; <code>HOLDOUT.md</code> lives outside the worktree on purpose.</p></div>
+      <div class="card"><h3>Observable</h3><p>one JSONL line per call and one per iteration — model, duration, cost, tokens, turns, dag width, verdict; <code>status.json</code> carries per-run aggregates read by <code>/usage-report</code>.</p></div>
+    </div>
+
+    <div class="grid cols-3" style="margin-top:16px">
+      <div class="card"><h3>The stuck ladder</h3><p>Per-slice failure count, not fingerprint repetition: 1st fail retries, 2nd escalates the next BUILD to <code>--escalate-model</code> (default opus, <code>none</code> disables), 3rd parks the slice for a sibling to run, all-parked triggers one replan that unparks everything, and a failure after that replan aborts.</p></div>
+      <div class="card"><h3>Repo-map digest</h3><p>Every BUILD prompt gets a ≤40-line <code>digest.sh</code> excerpt — stats, top hotspots, deps/rdeps for files the slice names — as a navigational hint, never fed to PLAN or the verifier. <code>--no-repo-map</code> turns it off.</p></div>
+      <div class="card"><h3>Runner self-reload</h3><p>If a slice's own job is to fix <code>loop.sh</code>/<code>plan.sh</code>/<code>allowlist.sh</code>/<code>slices.sh</code>, the runner notices its sourced files changed on disk and re-execs itself under the same run id before the next iteration — no human restart needed.</p></div>
     </div>
   </section>
 
@@ -532,6 +541,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
           <tr><td><span class="tier h">cheap</span></td><td class="mono">haiku</td><td>verification, adversarial gates, secret scans, mechanical checks, triage</td><td class="mono">verifier agent · loop --verify-model</td></tr>
           <tr><td><span class="tier m">mid</span></td><td class="mono">sonnet</td><td>implementation, code review, refactoring — the default working tier</td><td class="mono">code-reviewer agent · loop --build-model</td></tr>
           <tr><td><span class="tier t">top</span></td><td class="mono">opus</td><td>planning, architecture, decomposition, grilling, hard trade-offs</td><td class="mono">loop --plan-model</td></tr>
+          <tr><td><span class="tier t">escalation</span></td><td class="mono">opus (default)</td><td>rung 2 of the stuck ladder — a slice's next BUILD attempt only, after 2 failures; back to <code>--build-model</code> once it ticks. Never applied to the verifier.</td><td class="mono">loop --escalate-model</td></tr>
         </tbody>
       </table>
     </div>
