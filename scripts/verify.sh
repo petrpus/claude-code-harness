@@ -248,8 +248,22 @@ else
   # pre-edit: allows
   assert_hook "pre-edit allows .env.example" 0 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/.env.example"}}'
+  # .env.test carries test-environment defaults and is committed, so it has to
+  # be writable — L1's deny no longer swallows it and L2 must agree (#50).
+  assert_hook "pre-edit allows .env.test" 0 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.test"}}'
+  assert_hook "pre-edit allows a nested .env.test" 0 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/apps/web/.env.test"}}'
   assert_hook "pre-edit allows a normal source file" 0 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/src/index.ts"}}'
+  # `.local` is the conventional marker for the uncommitted, secret-bearing
+  # variant — widening the allow list must not reach it.
+  assert_hook "pre-edit blocks .env.test.local" 2 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.test.local"}}'
+  assert_hook "pre-edit blocks .env.local" 2 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.local"}}'
+  assert_hook "pre-edit blocks .env.production" 2 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.production"}}'
 
   # require-verify-before-stop template (opt-in Stop gate) — same stdin-JSON
   # style: block while verify is missing/stale/not-ok, allow when fresh + ok.

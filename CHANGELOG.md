@@ -45,6 +45,23 @@ narrowing it exposed.
   #49 false-positive class reappearing one layer down. Everything after a bare
   `--` is an operand too, so `git push origin -- -f` pushes a ref named `-f`.
 
+- `templates/project-settings.template.json`: `Read(.env.*)` matched the two
+  env files a project is *supposed* to commit — `.env.example`, which
+  `/project-infra env` writes and `npm run setup` copies from, and `.env.test`,
+  which Vitest/Playwright read. Write/Edit derive from the Read deny, so both
+  were uncreatable ("File is covered by a Read deny rule…") and the
+  `Edit(.env.example)`/`Write(.env.example)` allows a few lines above were
+  dead, because deny wins. Deny now enumerates the names that actually hold
+  secrets: `.env`, `.env.local`, `.env.*.local`, `.env.production`,
+  `.env.staging`. A deny pattern has no negation, so a project adding its own
+  secret-bearing name must add it here. (#50)
+- `hooks/pre-edit.sh`: `.env.test` joins the committed-file allow list.
+  Narrowing L1 alone would not have made it writable — L2 blocked every
+  `.env.*` that wasn't an example/template/sample, so the file would have been
+  permitted by settings and still refused by the hook. `.env.test.local` stays
+  blocked: matching is on the full basename, and `.local` is the conventional
+  marker for the uncommitted, secret-bearing variant.
+
 ### Changed
 
 - `templates/project-settings.template.json`: `git clean`'s deny was the
@@ -61,8 +78,12 @@ narrowing it exposed.
 - `scripts/verify.sh`: hook matrix covers `-f` in every position, both bundled
   forms, the three branch names from the issue, and `--follow-tags`.
 - `skills/harness-doctor/SKILL.md`: new check 6b flags a project still carrying
-  `Bash(git push *-f*)` and names the replacement. Existing projects need the
-  edit in their own `.claude/settings.json`.
+  `Bash(git push *-f*)`, and check 6c flags a deny pattern that matches
+  `.env.example` or `.env.test`, each naming its replacement. Existing projects
+  need the edit in their own `.claude/settings.json`.
+- `skills/project-infra/SKILL.md`: `env` mode states the permission it needs and
+  what the failure looks like, instead of failing opaquely on a project whose
+  deny list swallows `.env.example`.
 
 ## [0.5.1] — 2026-08-29
 

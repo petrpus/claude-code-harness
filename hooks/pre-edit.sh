@@ -19,10 +19,16 @@ PATH_ARG="$(hook_tool_file_path)"
 
 base="$(basename "$PATH_ARG")"
 
-# Allow example/template env files FIRST — .env.example is meant to be edited
-# (project-infra's `env` mode writes it; .gitignore un-ignores it).
+# Allow committed env files FIRST — these are documentation and test defaults,
+# not secrets: .env.example is meant to be edited (project-infra's `env` mode
+# writes it; .gitignore un-ignores it), and .env.test carries test-environment
+# defaults that Vitest/Playwright read.
+#
+# Matched on the FULL basename, so `.env.test.local` is not covered here and
+# falls through to the block below — the `.local` suffix is the conventional
+# marker for the uncommitted, secret-bearing variant of any of these.
 case "$base" in
-  .env.example|*.env.example|.env.template|*.env.template|.env.sample|*.env.sample)
+  .env.example|*.env.example|.env.template|*.env.template|.env.sample|*.env.sample|.env.test|*.env.test)
     exit 0
     ;;
 esac
