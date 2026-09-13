@@ -2,6 +2,47 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [0.5.2] — 2026-09-13
+
+A deny glob that matched a flag inside branch names, and the L2 gap that
+narrowing it exposed.
+
+### Fixed
+
+- `templates/project-settings.template.json`: `Bash(git push *-f*)` matched
+  `-f` anywhere in the command, not just as a flag, so pushing any branch whose
+  name contained `-f` was denied — `feat/…-full`, `fix/…-first`,
+  `feat/…-filter`. The denial surfaces as a plain permission error with no hint
+  about the rule, so it looks like the user declined the action. Replaced with
+  three whitespace-anchored patterns (`git push -f*`, `git push * -f *`,
+  `git push * -f`). `*--force*` is unchanged: it is prefix-shaped and cannot
+  match inside a ref name, and `--force-with-lease` shares the prefix on
+  purpose. (#49)
+- `hooks/pre-bash.sh`: `seg_has_force()` tested for a literal `" -f "`, so a
+  bundled short-option cluster — `git push -fu origin main`, as much a force
+  push as `-f` alone — was missed at L2 and caught only by the accident of L1's
+  over-broad glob. With L1 anchored, that accident is gone, so the hook now
+  reads single-dash clusters for what they are. `--` long options are skipped,
+  which keeps `--follow-tags` from being mistaken for a force flag.
+
+### Changed
+
+- `templates/project-settings.template.json`: `git clean`'s deny was the
+  opposite bug — `Bash(git clean -f*)` is prefix-shaped, so it missed
+  `git clean -d -f` and `git clean --force` entirely. Widened with the same
+  three anchored shapes plus `*--force*`. The breadth of `rm -rf /*` is left
+  alone and now documented as deliberate: over-denying a destructive command
+  costs a permission prompt, under-denying costs the machine.
+- `scripts/check-consistency.sh`: new section asserting no deny entry contains
+  an unanchored `*-f`, and that the anchored `git push` / `git clean` patterns
+  are present. Claude Code's matcher can't be exercised from a test, so the
+  invariant is checked as shape.
+- `scripts/verify.sh`: hook matrix covers `-f` in every position, both bundled
+  forms, the three branch names from the issue, and `--follow-tags`.
+- `skills/harness-doctor/SKILL.md`: new check 6b flags a project still carrying
+  `Bash(git push *-f*)` and names the replacement. Existing projects need the
+  edit in their own `.claude/settings.json`.
+
 ## [0.5.1] — 2026-08-29
 
 Guard fix found while tagging 0.5.0 — the release step blocked itself.

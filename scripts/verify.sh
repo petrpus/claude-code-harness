@@ -118,6 +118,18 @@ else
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force\"}}"
   assert_hook "pre-bash segment-split catches cd && git push --force" 2 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"cd sub && git push --force\"}}"
+  # Short `-f`, in every position and bundled with another short option. The
+  # bundled forms are the ones L1's deny used to catch only by accident, with a
+  # glob so broad it also denied branches named `...-full` (issue #49); L1 is
+  # anchored now, so L2 has to read a cluster for what it is.
+  assert_hook "pre-bash blocks git push -f" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -f origin x\"}}"
+  assert_hook "pre-bash blocks trailing -f" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin x -f\"}}"
+  assert_hook "pre-bash blocks bundled -fu" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -fu origin x\"}}"
+  assert_hook "pre-bash blocks bundled -uf" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -uf origin x\"}}"
   assert_hook "pre-bash blocks broad rm -rf /" 2 hooks/pre-bash.sh \
     '{"tool_input":{"command":"rm -rf /"}}'
   assert_hook "pre-bash blocks broad rm -rf ~" 2 hooks/pre-bash.sh \
@@ -129,6 +141,17 @@ else
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push\"}}"
   assert_hook "pre-bash allows --force-with-lease on a feature branch" 0 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force-with-lease\"}}"
+  # Issue #49's symptom: a branch name carrying '-f' is an operand, not a flag.
+  # Only single-dash words are inspected, so these must stay allowed — and
+  # --follow-tags must not be read as a force flag just because it contains 'f'.
+  assert_hook "pre-bash allows pushing a branch named ...-full" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin feat/harness-roadmap-full-i18n\"}}"
+  assert_hook "pre-bash allows pushing a branch named ...-first" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin fix/pre-bash-first-pass\"}}"
+  assert_hook "pre-bash allows pushing a branch named ...-filter" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin feat/search-filter\"}}"
+  assert_hook "pre-bash allows --follow-tags (contains 'f', not a force flag)" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --follow-tags origin x\"}}"
 
   # Tag pushes from main. A tag doesn't advance a branch, and blocking it broke
   # this repo's own release step (tag v0.x.0 on the merge commit on main). Needs

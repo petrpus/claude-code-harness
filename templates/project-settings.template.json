@@ -1,6 +1,7 @@
 {
   "_comment": "Baseline permissions + deny for code-dev projects using claude-code-harness. Copy to .claude/settings.json in the project, then add project-specific WebFetch domains / Read paths / extra allows on top.",
   "_policy_layering": "Three layers, single source of truth each: (L1) this deny list = static string patterns (force-push, rm -rf /, reading .env). (L2) hooks/pre-bash.sh = context-dependent logic that a static pattern can't express (push FROM main needs the branch). (L3) skills like commit-agent = workflow advice that references, never re-implements, L1/L2. Don't duplicate a rule across layers.",
+  "_deny_globs": "A deny glob matches a SUBSTRING of the command, so a short flag must be anchored on whitespace or it matches inside operands. `Bash(git push *-f*)` denied every branch whose name contained '-f' — feat/...-full, fix/...-first, feat/...-filter — and surfaced as a bare permission error that reads like the user declined. Short-flag denies are therefore written as three patterns: `<cmd> -f*` (flag first, covers bundles like -fu), `<cmd> * -f *` (flag in the middle), `<cmd> * -f` (flag last). Long forms keep a plain `*--force*`, which is prefix-shaped and cannot match inside a ref name. The breadth of `rm -rf /*` is DELIBERATE and not the same bug: over-denying a destructive command costs one permission prompt, under-denying costs the machine, and hooks/pre-bash.sh already resolves root-ish targets with context. Don't 'fix' it.",
   "_verify_gate": "Verification is reminders by default (the harness Stop hooks always exit 0). For UNATTENDED runs you can opt into a hard gate: register templates/require-verify-before-stop.sh as a Stop hook here (hooks.Stop[].hooks[].command) — it exits 2 until tmp/.last-verify-status is a fresh 'ok', blocking the turn from ending. It is opt-in only and never wired into the plugin's hooks/hooks.json (ADR-0002); Claude Code lifts the block after 8 refusals so it can't deadlock. autopilot enables it for the duration of a run and removes it on run end.",
   "permissions": {
     "allow": [
@@ -75,9 +76,14 @@
     ],
     "deny": [
       "Bash(git push *--force*)",
-      "Bash(git push *-f*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f *)",
+      "Bash(git push * -f)",
       "Bash(git reset --hard*)",
+      "Bash(git clean *--force*)",
       "Bash(git clean -f*)",
+      "Bash(git clean * -f *)",
+      "Bash(git clean * -f)",
       "Bash(rm -rf /*)",
       "Bash(rm -rf .git*)",
       "Write(.env)",

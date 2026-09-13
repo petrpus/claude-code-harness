@@ -77,11 +77,38 @@ seg_is_git_push() {
   [[ " $after " == *" push "* ]]
 }
 
-# Return 0 if a segment carries a force-push flag (--force or standalone -f).
-# --force-with-lease is handled by the caller as the sanctioned escape hatch.
+# Return 0 if a segment carries a force-push flag (--force, or a short-option
+# cluster containing `f`). --force-with-lease is handled by the caller as the
+# sanctioned escape hatch.
+#
+# The cluster case is why this can't stay a substring test for " -f ".
+# `git push -fu origin main` is as much a force push as `git push -f`, and the
+# L1 deny used to catch it only by accident, with a glob so broad it also
+# denied any branch named `...-full`. Anchoring L1 on whitespace fixed that
+# false positive and left this one to L2, where the segment is already
+# tokenised and a bundle can be read for what it is.
+#
+# Only single-dash words are inspected: `--` long options are skipped so
+# `--follow-tags` isn't read as a force flag. Of git push's short options
+# (-n -v -q -u -f -d -o -4 -6) only `-f` carries an `f`, so a cluster
+# containing one is unambiguous.
 seg_has_force() {
   local seg; seg="$(seg_words "$1")"
-  [[ "$seg" == *" --force "* || "$seg" == *" -f "* ]]
+  [[ "$seg" == *" --force "* ]] && return 0
+
+  # `read -ra` splits on IFS without pathname expansion — a plain `for word in
+  # $seg` would glob, and `git push origin *` would be matched against the
+  # working directory instead of being read as words.
+  local -a words=()
+  read -ra words <<<"$seg"
+  [[ "${#words[@]}" -eq 0 ]] && return 1
+
+  local word
+  for word in "${words[@]}"; do
+    [[ "$word" == --* ]] && continue
+    [[ "$word" == -*f* ]] && return 0
+  done
+  return 1
 }
 
 # Return 0 if a push targets ONLY tags. A tag doesn't advance a branch, so the

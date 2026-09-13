@@ -61,6 +61,25 @@ harness hook filenames (see §5) and pointing under `${CLAUDE_PROJECT_DIR}/.clau
 
 Entries pointing at `*.local.sh` are fine.
 
+### 6b. Over-matching short-flag deny globs
+
+A deny glob matches a **substring** of the command, so a short flag that isn't
+anchored on whitespace also matches inside operands. Projects bootstrapped
+before 0.5.2 carry `"Bash(git push *-f*)"`, which denies every push of a branch
+whose name contains `-f` — `feat/…-full`, `fix/…-first`, `feat/…-filter` — and
+surfaces as a bare permission error that reads as if the user declined.
+
+Scan `.claude/settings.json` `permissions.deny` for any entry containing the
+literal `*-f`. Each match → 🟠, with the replacement:
+
+```
+"Bash(git push -f*)", "Bash(git push * -f *)", "Bash(git push * -f)"
+```
+
+(and the same three shapes for `git clean`). `rm -rf /*` is **not** a match for
+this check and must not be flagged — a wildcard running into `-f` is the bug,
+`-rf` as a literal flag is not, and that entry's breadth is deliberate.
+
 ### 7. tmp/ directory
 
 If `.claude/settings.json` or any hook references `tmp/.last-verify-status`
