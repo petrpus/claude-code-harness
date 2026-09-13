@@ -1,6 +1,8 @@
 {
   "_comment": "Baseline permissions + deny for code-dev projects using claude-code-harness. Copy to .claude/settings.json in the project, then add project-specific WebFetch domains / Read paths / extra allows on top.",
   "_policy_layering": "Three layers, single source of truth each: (L1) this deny list = static string patterns (force-push, rm -rf /, reading .env). (L2) hooks/pre-bash.sh = context-dependent logic that a static pattern can't express (push FROM main needs the branch). (L3) skills like commit-agent = workflow advice that references, never re-implements, L1/L2. Don't duplicate a rule across layers.",
+  "_env_files": "Write/Edit derive from the Read deny, so a Read deny on a committed file makes that file uncreatable and any Edit/Write allow above it dead. `Read(.env.*)` therefore blocked the two files a project is SUPPOSED to commit — `.env.example` (what /project-infra env writes) and `.env.test` (test defaults, no secrets) — with an error that reads as though the user declined. Deny is an enumeration of the files that actually hold secrets; there is no negation in a deny pattern, so a new secret-bearing name (.env.prod, say) must be added here explicitly. Reads are what this list narrows: WRITES to every other .env.* stay blocked by hooks/pre-edit.sh, which allows only the example/template/sample/test names. Keep the two layers in step — adding a committed env filename here without adding it there leaves it still unwritable.",
+  "_deny_globs": "A deny glob matches a SUBSTRING of the command, so a short flag must be anchored on whitespace or it matches inside operands. `Bash(git push *-f*)` denied every branch whose name contained '-f' — feat/...-full, fix/...-first, feat/...-filter — and surfaced as a bare permission error that reads like the user declined. Short-flag denies are therefore written as three patterns: `<cmd> -f*` (flag first, covers bundles like -fu), `<cmd> * -f *` (flag in the middle), `<cmd> * -f` (flag last). Long forms keep a plain `*--force*`, which is prefix-shaped and cannot match inside a ref name. The breadth of `rm -rf /*` is DELIBERATE and not the same bug: over-denying a destructive command costs one permission prompt, under-denying costs the machine, and hooks/pre-bash.sh already resolves root-ish targets with context. Don't 'fix' it.",
   "_verify_gate": "Verification is reminders by default (the harness Stop hooks always exit 0). For UNATTENDED runs you can opt into a hard gate: register templates/require-verify-before-stop.sh as a Stop hook here (hooks.Stop[].hooks[].command) — it exits 2 until tmp/.last-verify-status is a fresh 'ok', blocking the turn from ending. It is opt-in only and never wired into the plugin's hooks/hooks.json (ADR-0002); Claude Code lifts the block after 8 refusals so it can't deadlock. autopilot enables it for the duration of a run and removes it on run end.",
   "permissions": {
     "allow": [
@@ -56,6 +58,8 @@
       "Write(.gitignore)",
       "Edit(.env.example)",
       "Write(.env.example)",
+      "Edit(.env.test)",
+      "Write(.env.test)",
       "Edit(.claude/**)",
       "Write(.claude/**)",
       "Edit(.github/**)",
@@ -75,15 +79,23 @@
     ],
     "deny": [
       "Bash(git push *--force*)",
-      "Bash(git push *-f*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f *)",
+      "Bash(git push * -f)",
       "Bash(git reset --hard*)",
+      "Bash(git clean *--force*)",
       "Bash(git clean -f*)",
+      "Bash(git clean * -f *)",
+      "Bash(git clean * -f)",
       "Bash(rm -rf /*)",
       "Bash(rm -rf .git*)",
       "Write(.env)",
       "Edit(.env)",
       "Read(.env)",
-      "Read(.env.*)"
+      "Read(.env.local)",
+      "Read(.env.*.local)",
+      "Read(.env.production)",
+      "Read(.env.staging)"
     ],
     "additionalDirectories": ["/tmp"]
   }

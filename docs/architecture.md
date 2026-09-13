@@ -79,9 +79,15 @@ Two tiers, chosen by how much autonomy the session has:
 Three layers, each owning its rule kind — don't duplicate a rule across them:
 
 - **L1 `settings.json` deny** — static string patterns (force-push, `rm -rf /`,
-  reading/writing `.env`).
+  reading/writing `.env`). A pattern matches a **substring** of the command, so
+  a short flag must be anchored on whitespace — `<cmd> -f*`, `<cmd> * -f *`,
+  `<cmd> * -f` — or it matches inside operands as well. The unanchored
+  `git push *-f*` denied every branch named `feat/…-full` (#49).
 - **L2 `hooks/pre-bash.sh`** — context-dependent logic a static pattern can't
-  express, chiefly "push **from** main" (needs the current branch).
+  express, chiefly "push **from** main" (needs the current branch), plus
+  anything that needs the command tokenised rather than substring-matched: a
+  bundled short-option cluster like `-fu` is a force push, and only a layer
+  that reads words can tell it from a branch name.
 - **L3 skills** (`commit-agent`) — workflow advice that references, never
   re-implements, L1/L2.
 

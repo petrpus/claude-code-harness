@@ -98,6 +98,22 @@ longer appear in a live grep, as a note, not a deletion.
 **Never** put a real value on the right-hand side — always empty or a
 placeholder like `changeme`.
 
+**Permission this mode needs.** Writing `.env.example` requires that no deny
+pattern match it. Write/Edit derive from the **Read** deny, so a project
+carrying `"Read(.env.*)"` refuses the write — "File is covered by a Read deny
+rule in your permission settings and cannot be written" — even with
+`Edit(.env.example)` in the allow list, because deny wins. If you hit that,
+the project's `.claude/settings.json` needs the secret-bearing names
+enumerated instead of the wildcard:
+
+```
+"Read(.env)", "Read(.env.local)", "Read(.env.*.local)",
+"Read(.env.production)", "Read(.env.staging)"
+```
+
+Report it rather than editing the deny list silently — loosening a secrets
+guard is the project's call. `/harness-doctor` check 6c flags the same thing.
+
 ### ci
 
 Instantiate `ci-workflow.template.yml` → `.github/workflows/ci.yml`. Ask

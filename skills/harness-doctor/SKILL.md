@@ -61,6 +61,49 @@ harness hook filenames (see §5) and pointing under `${CLAUDE_PROJECT_DIR}/.clau
 
 Entries pointing at `*.local.sh` are fine.
 
+### 6b. Over-matching short-flag deny globs
+
+A deny glob matches a **substring** of the command, so a short flag that isn't
+anchored on whitespace also matches inside operands. Projects bootstrapped
+before 0.5.2 carry `"Bash(git push *-f*)"`, which denies every push of a branch
+whose name contains `-f` — `feat/…-full`, `fix/…-first`, `feat/…-filter` — and
+surfaces as a bare permission error that reads as if the user declined.
+
+Scan `.claude/settings.json` `permissions.deny` for any entry containing the
+literal `*-f`. Each match → 🟠, with the replacement:
+
+```
+"Bash(git push -f*)", "Bash(git push * -f *)", "Bash(git push * -f)"
+```
+
+(and the same three shapes for `git clean`). `rm -rf /*` is **not** a match for
+this check and must not be flagged — a wildcard running into `-f` is the bug,
+`-rf` as a literal flag is not, and that entry's breadth is deliberate.
+
+### 6c. `Read(.env.*)` makes committed env files uncreatable
+
+Write/Edit derive from the Read deny, so a Read deny that matches a file the
+project is supposed to *commit* makes that file uncreatable — and any
+`Edit(...)`/`Write(...)` allow for it is dead, because deny wins. Projects
+bootstrapped before 0.5.2 carry `"Read(.env.*)"`, which swallows `.env.example`
+(what `/project-infra env` writes, and what `npm run setup` copies from) and
+`.env.test` (test defaults read by Vitest/Playwright). The agent reports "File
+is covered by a Read deny rule in your permission settings and cannot be
+written".
+
+Check every `permissions.deny` entry of the form `Read(...)`, `Edit(...)` or
+`Write(...)` and test its glob against `.env.example` and `.env.test`. Any match
+→ 🟠, with the replacement: enumerate the secret-bearing names instead —
+
+```
+"Read(.env)", "Read(.env.local)", "Read(.env.*.local)",
+"Read(.env.production)", "Read(.env.staging)"
+```
+
+Also check the project's own `.claude/hooks/pre-edit.local.sh`, if any, for an
+env block that would still refuse `.env.test` — L1 and L2 have to agree, or the
+file is writable in settings and refused by the hook.
+
 ### 7. tmp/ directory
 
 If `.claude/settings.json` or any hook references `tmp/.last-verify-status`

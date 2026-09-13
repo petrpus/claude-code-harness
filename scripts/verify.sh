@@ -118,6 +118,18 @@ else
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force\"}}"
   assert_hook "pre-bash segment-split catches cd && git push --force" 2 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"cd sub && git push --force\"}}"
+  # Short `-f`, in every position and bundled with another short option. The
+  # bundled forms are the ones L1's deny used to catch only by accident, with a
+  # glob so broad it also denied branches named `...-full` (issue #49); L1 is
+  # anchored now, so L2 has to read a cluster for what it is.
+  assert_hook "pre-bash blocks git push -f" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -f origin x\"}}"
+  assert_hook "pre-bash blocks trailing -f" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin x -f\"}}"
+  assert_hook "pre-bash blocks bundled -fu" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -fu origin x\"}}"
+  assert_hook "pre-bash blocks bundled -uf" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -uf origin x\"}}"
   assert_hook "pre-bash blocks broad rm -rf /" 2 hooks/pre-bash.sh \
     '{"tool_input":{"command":"rm -rf /"}}'
   assert_hook "pre-bash blocks broad rm -rf ~" 2 hooks/pre-bash.sh \
@@ -129,6 +141,53 @@ else
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push\"}}"
   assert_hook "pre-bash allows --force-with-lease on a feature branch" 0 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --force-with-lease\"}}"
+  # Issue #49's symptom: a branch name carrying '-f' is an operand, not a flag.
+  # Only single-dash words are inspected, so these must stay allowed — and
+  # --follow-tags must not be read as a force flag just because it contains 'f'.
+  assert_hook "pre-bash allows pushing a branch named ...-full" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin feat/harness-roadmap-full-i18n\"}}"
+  assert_hook "pre-bash allows pushing a branch named ...-first" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin fix/pre-bash-first-pass\"}}"
+  assert_hook "pre-bash allows pushing a branch named ...-filter" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin feat/search-filter\"}}"
+  assert_hook "pre-bash allows --follow-tags (contains 'f', not a force flag)" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --follow-tags origin x\"}}"
+  # A short option with an ATTACHED value swallows the rest of its token, so an
+  # 'f' inside that value is not a force flag — the #49 false-positive class
+  # reappearing one layer down if the cluster is searched instead of walked.
+  assert_hook "pre-bash allows -o with an attached value containing 'f'" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -oci.skip-if-forked=true origin x\"}}"
+  # After a bare `--`, `-f` is a ref name, not the force flag.
+  assert_hook "pre-bash allows a ref named -f after end-of-options" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin -- -f\"}}"
+
+  # Forceful `git clean` deletes untracked files irreversibly. L1 can anchor
+  # `-f` as its own token or at the head of a cluster, but not in the middle of
+  # one, so `-df` / `-xdf` need this L2 backstop.
+  assert_hook "pre-bash blocks git clean -df" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -df"}}'
+  assert_hook "pre-bash blocks git clean -xdf" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -xdf"}}'
+  assert_hook "pre-bash blocks git clean --force" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean --force"}}'
+  assert_hook "pre-bash blocks git clean -fe (attached -e value)" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -fe build"}}'
+  assert_hook "pre-bash allows a git clean dry run" 0 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -nd"}}'
+  assert_hook "pre-bash allows git clean -e with a value containing 'f'" 0 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -e dist/fixtures -d"}}'
+
+  # A guard must read the command it was given, not the directory it runs in.
+  # `for word in $after` glob-expanded `*`; in a directory holding a file called
+  # `tag` that produced `origin tag`, which read as a tag-only push and skipped
+  # the push-from-main guard for what is a plain branch push.
+  TMP_GLOB_REPO="$(mktemp -d)"
+  git -C "$TMP_GLOB_REPO" init -q >/dev/null 2>&1
+  git -C "$TMP_GLOB_REPO" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1
+  : > "$TMP_GLOB_REPO/tag"
+  GLOB_JSON_CWD="$(printf '%s' "$TMP_GLOB_REPO" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  assert_hook "pre-bash does not glob-expand a refspec into a fake tag push" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$GLOB_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin *\"}}"
 
   # Tag pushes from main. A tag doesn't advance a branch, and blocking it broke
   # this repo's own release step (tag v0.x.0 on the merge commit on main). Needs
@@ -189,8 +248,22 @@ else
   # pre-edit: allows
   assert_hook "pre-edit allows .env.example" 0 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/.env.example"}}'
+  # .env.test carries test-environment defaults and is committed, so it has to
+  # be writable — L1's deny no longer swallows it and L2 must agree (#50).
+  assert_hook "pre-edit allows .env.test" 0 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.test"}}'
+  assert_hook "pre-edit allows a nested .env.test" 0 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/apps/web/.env.test"}}'
   assert_hook "pre-edit allows a normal source file" 0 hooks/pre-edit.sh \
     '{"tool_input":{"file_path":"/repo/src/index.ts"}}'
+  # `.local` is the conventional marker for the uncommitted, secret-bearing
+  # variant — widening the allow list must not reach it.
+  assert_hook "pre-edit blocks .env.test.local" 2 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.test.local"}}'
+  assert_hook "pre-edit blocks .env.local" 2 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.local"}}'
+  assert_hook "pre-edit blocks .env.production" 2 hooks/pre-edit.sh \
+    '{"tool_input":{"file_path":"/repo/.env.production"}}'
 
   # require-verify-before-stop template (opt-in Stop gate) — same stdin-JSON
   # style: block while verify is missing/stale/not-ok, allow when fresh + ok.

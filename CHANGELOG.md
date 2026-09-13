@@ -2,6 +2,89 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [0.5.2] — 2026-09-13
+
+A deny glob that matched a flag inside branch names, and the L2 gap that
+narrowing it exposed.
+
+### Fixed
+
+- `templates/project-settings.template.json`: `Bash(git push *-f*)` matched
+  `-f` anywhere in the command, not just as a flag, so pushing any branch whose
+  name contained `-f` was denied — `feat/…-full`, `fix/…-first`,
+  `feat/…-filter`. The denial surfaces as a plain permission error with no hint
+  about the rule, so it looks like the user declined the action. Replaced with
+  three whitespace-anchored patterns (`git push -f*`, `git push * -f *`,
+  `git push * -f`). `*--force*` is unchanged: it is prefix-shaped and cannot
+  match inside a ref name, and `--force-with-lease` shares the prefix on
+  purpose. (#49)
+- `hooks/pre-bash.sh`: the force check (`seg_has_force()`, now
+  `seg_has_force_flag()`) tested for a literal `" -f "`, so a
+  bundled short-option cluster — `git push -fu origin main`, as much a force
+  push as `-f` alone — was missed at L2 and caught only by the accident of L1's
+  over-broad glob. With L1 anchored, that accident is gone, so the hook now
+  reads single-dash clusters for what they are. `--` long options are skipped,
+  which keeps `--follow-tags` from being mistaken for a force flag.
+
+- `hooks/pre-bash.sh`: forceful `git clean` had no L2 guard at all, and L1
+  cannot supply one. A deny glob can anchor `-f` as its own token or at the
+  head of a cluster, but not in the middle of one, so `git clean -df` and
+  `git clean -xdf` — delete untracked files *and* directories — matched no
+  pattern and reached git unguarded. `git clean` now gets the same backstop
+  force-push has.
+- `hooks/pre-bash.sh`: `seg_is_tag_only_push()` split its arguments with an
+  unquoted `for word in $after`, which pathname-expands. In a directory holding
+  a file named `tag`, `git push origin *` expanded to `origin tag`, was read as
+  a tag-only push, and skipped the push-from-main guard entirely for a plain
+  branch push. A guard must read the command it was given, not the working
+  directory it happens to run in.
+- `hooks/pre-bash.sh`: a force-flag cluster is walked letter by letter instead
+  of searched for an `f`. A short option carrying an attached value swallows
+  the rest of its token, so `git push -oci.skip-if-forked=true` is one `-o`
+  option, not a force push — searching the token would deny it, which is the
+  #49 false-positive class reappearing one layer down. Everything after a bare
+  `--` is an operand too, so `git push origin -- -f` pushes a ref named `-f`.
+
+- `templates/project-settings.template.json`: `Read(.env.*)` matched the two
+  env files a project is *supposed* to commit — `.env.example`, which
+  `/project-infra env` writes and `npm run setup` copies from, and `.env.test`,
+  which Vitest/Playwright read. Write/Edit derive from the Read deny, so both
+  were uncreatable ("File is covered by a Read deny rule…") and the
+  `Edit(.env.example)`/`Write(.env.example)` allows a few lines above were
+  dead, because deny wins. Deny now enumerates the names that actually hold
+  secrets: `.env`, `.env.local`, `.env.*.local`, `.env.production`,
+  `.env.staging`. A deny pattern has no negation, so a project adding its own
+  secret-bearing name must add it here. (#50)
+- `hooks/pre-edit.sh`: `.env.test` joins the committed-file allow list.
+  Narrowing L1 alone would not have made it writable — L2 blocked every
+  `.env.*` that wasn't an example/template/sample, so the file would have been
+  permitted by settings and still refused by the hook. `.env.test.local` stays
+  blocked: matching is on the full basename, and `.local` is the conventional
+  marker for the uncommitted, secret-bearing variant.
+
+### Changed
+
+- `templates/project-settings.template.json`: `git clean`'s deny was the
+  opposite bug — `Bash(git clean -f*)` is prefix-shaped, so it missed
+  `git clean -d -f` and `git clean --force` entirely. Widened with the same
+  three anchored shapes plus `*--force*`; bundled clusters are the hook's job,
+  above. The breadth of `rm -rf /*` is left alone and now documented as
+  deliberate: over-denying a destructive command costs a permission prompt,
+  under-denying costs the machine.
+- `scripts/check-consistency.sh`: new section asserting no deny entry contains
+  an unanchored `*-f`, and that the anchored `git push` / `git clean` patterns
+  are present. Claude Code's matcher can't be exercised from a test, so the
+  invariant is checked as shape.
+- `scripts/verify.sh`: hook matrix covers `-f` in every position, both bundled
+  forms, the three branch names from the issue, and `--follow-tags`.
+- `skills/harness-doctor/SKILL.md`: new check 6b flags a project still carrying
+  `Bash(git push *-f*)`, and check 6c flags a deny pattern that matches
+  `.env.example` or `.env.test`, each naming its replacement. Existing projects
+  need the edit in their own `.claude/settings.json`.
+- `skills/project-infra/SKILL.md`: `env` mode states the permission it needs and
+  what the failure looks like, instead of failing opaquely on a project whose
+  deny list swallows `.env.example`.
+
 ## [0.5.1] — 2026-08-29
 
 Guard fix found while tagging 0.5.0 — the release step blocked itself.

@@ -33,6 +33,74 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# A deny glob matches a substring of the command, so an unanchored short flag
+# matches inside operands too: `Bash(git push *-f*)` denied every branch named
+# feat/...-full, fix/...-first, feat/...-filter. Claude Code's matcher can't be
+# exercised from here, so this is the closest thing to a test for L1 — assert
+# the shape instead of the behaviour. `-rf` in `rm -rf /*` is untouched: the
+# offending shape is `*-f`, a wildcard running straight into the flag.
+section "settings template: short-flag denies are whitespace-anchored"
+TPL=templates/project-settings.template.json
+if command -v jq >/dev/null 2>&1 && [[ -f "$TPL" ]]; then
+  UNANCHORED="$(jq -r '.permissions.deny[]? | select(contains("*-f"))' "$TPL" 2>/dev/null)"
+  if [[ -n "$UNANCHORED" ]]; then
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      note "deny '$p' matches '-f' inside operands; anchor it as '<cmd> -f*', '<cmd> * -f *', '<cmd> * -f'"
+    done <<<"$UNANCHORED"
+  else
+    ok "no unanchored '*-f' deny pattern"
+  fi
+  for p in 'Bash(git push -f*)' 'Bash(git push * -f *)' 'Bash(git push * -f)' \
+           'Bash(git clean -f*)' 'Bash(git clean * -f *)' 'Bash(git clean * -f)'; do
+    if jq -e --arg p "$p" '.permissions.deny | index($p)' "$TPL" >/dev/null 2>&1; then
+      ok "deny has $p"
+    else
+      note "deny is missing $p"
+    fi
+  done
+else
+  echo "  (jq not available or template missing — skipping deny-glob check)"
+fi
+
+# ---------------------------------------------------------------------------
+# Write/Edit derive from the Read deny, so a Read deny matching a file a project
+# is supposed to COMMIT makes that file uncreatable and any Edit/Write allow
+# above it dead. `Read(.env.*)` did exactly that to .env.example and .env.test.
+# Assert the property (does any deny pattern match this filename?) rather than
+# the spelling of one known-bad glob.
+section "settings template: committed env files are not deny-matched"
+if command -v jq >/dev/null 2>&1 && [[ -f "$TPL" ]]; then
+  for f in .env.example .env.test; do
+    HIT=""
+    while IFS= read -r entry; do
+      [[ -z "$entry" ]] && continue
+      g="${entry#*(}"; g="${g%)}"
+      # shellcheck disable=SC2254 — $g is intentionally a glob here.
+      case "$f" in $g) HIT="$entry"; break ;; esac
+    done < <(jq -r '.permissions.deny[]? | select(startswith("Read(") or startswith("Edit(") or startswith("Write("))' "$TPL" 2>/dev/null)
+    if [[ -n "$HIT" ]]; then
+      note "$f is matched by deny '$HIT' — deny wins over allow, so the file cannot be written"
+    else
+      ok "$f is not caught by any deny pattern"
+    fi
+  done
+  # The secret-bearing names must stay denied — narrowing must not empty the list.
+  for f in .env .env.local .env.production .env.staging; do
+    HIT=""
+    while IFS= read -r entry; do
+      [[ -z "$entry" ]] && continue
+      g="${entry#*(}"; g="${g%)}"
+      # shellcheck disable=SC2254 — $g is intentionally a glob here.
+      case "$f" in $g) HIT="$entry"; break ;; esac
+    done < <(jq -r '.permissions.deny[]? | select(startswith("Read("))' "$TPL" 2>/dev/null)
+    [[ -n "$HIT" ]] && ok "$f is still read-denied" || note "$f is no longer read-denied"
+  done
+else
+  echo "  (jq not available or template missing — skipping env-file deny check)"
+fi
+
+# ---------------------------------------------------------------------------
 section "version == changelog top entry"
 PV="$(jq -r '.version' .claude-plugin/plugin.json 2>/dev/null || echo '?')"
 CV="$(grep -m1 -oE '## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?')"
