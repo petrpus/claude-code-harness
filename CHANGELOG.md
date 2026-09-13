@@ -18,21 +18,42 @@ narrowing it exposed.
   `git push * -f`). `*--force*` is unchanged: it is prefix-shaped and cannot
   match inside a ref name, and `--force-with-lease` shares the prefix on
   purpose. (#49)
-- `hooks/pre-bash.sh`: `seg_has_force()` tested for a literal `" -f "`, so a
+- `hooks/pre-bash.sh`: the force check (`seg_has_force()`, now
+  `seg_has_force_flag()`) tested for a literal `" -f "`, so a
   bundled short-option cluster — `git push -fu origin main`, as much a force
   push as `-f` alone — was missed at L2 and caught only by the accident of L1's
   over-broad glob. With L1 anchored, that accident is gone, so the hook now
   reads single-dash clusters for what they are. `--` long options are skipped,
   which keeps `--follow-tags` from being mistaken for a force flag.
 
+- `hooks/pre-bash.sh`: forceful `git clean` had no L2 guard at all, and L1
+  cannot supply one. A deny glob can anchor `-f` as its own token or at the
+  head of a cluster, but not in the middle of one, so `git clean -df` and
+  `git clean -xdf` — delete untracked files *and* directories — matched no
+  pattern and reached git unguarded. `git clean` now gets the same backstop
+  force-push has.
+- `hooks/pre-bash.sh`: `seg_is_tag_only_push()` split its arguments with an
+  unquoted `for word in $after`, which pathname-expands. In a directory holding
+  a file named `tag`, `git push origin *` expanded to `origin tag`, was read as
+  a tag-only push, and skipped the push-from-main guard entirely for a plain
+  branch push. A guard must read the command it was given, not the working
+  directory it happens to run in.
+- `hooks/pre-bash.sh`: a force-flag cluster is walked letter by letter instead
+  of searched for an `f`. A short option carrying an attached value swallows
+  the rest of its token, so `git push -oci.skip-if-forked=true` is one `-o`
+  option, not a force push — searching the token would deny it, which is the
+  #49 false-positive class reappearing one layer down. Everything after a bare
+  `--` is an operand too, so `git push origin -- -f` pushes a ref named `-f`.
+
 ### Changed
 
 - `templates/project-settings.template.json`: `git clean`'s deny was the
   opposite bug — `Bash(git clean -f*)` is prefix-shaped, so it missed
   `git clean -d -f` and `git clean --force` entirely. Widened with the same
-  three anchored shapes plus `*--force*`. The breadth of `rm -rf /*` is left
-  alone and now documented as deliberate: over-denying a destructive command
-  costs a permission prompt, under-denying costs the machine.
+  three anchored shapes plus `*--force*`; bundled clusters are the hook's job,
+  above. The breadth of `rm -rf /*` is left alone and now documented as
+  deliberate: over-denying a destructive command costs a permission prompt,
+  under-denying costs the machine.
 - `scripts/check-consistency.sh`: new section asserting no deny entry contains
   an unanchored `*-f`, and that the anchored `git push` / `git clean` patterns
   are present. Claude Code's matcher can't be exercised from a test, so the

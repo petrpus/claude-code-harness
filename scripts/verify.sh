@@ -152,6 +152,42 @@ else
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -u origin feat/search-filter\"}}"
   assert_hook "pre-bash allows --follow-tags (contains 'f', not a force flag)" 0 hooks/pre-bash.sh \
     "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push --follow-tags origin x\"}}"
+  # A short option with an ATTACHED value swallows the rest of its token, so an
+  # 'f' inside that value is not a force flag — the #49 false-positive class
+  # reappearing one layer down if the cluster is searched instead of walked.
+  assert_hook "pre-bash allows -o with an attached value containing 'f'" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push -oci.skip-if-forked=true origin x\"}}"
+  # After a bare `--`, `-f` is a ref name, not the force flag.
+  assert_hook "pre-bash allows a ref named -f after end-of-options" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$FEAT_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin -- -f\"}}"
+
+  # Forceful `git clean` deletes untracked files irreversibly. L1 can anchor
+  # `-f` as its own token or at the head of a cluster, but not in the middle of
+  # one, so `-df` / `-xdf` need this L2 backstop.
+  assert_hook "pre-bash blocks git clean -df" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -df"}}'
+  assert_hook "pre-bash blocks git clean -xdf" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -xdf"}}'
+  assert_hook "pre-bash blocks git clean --force" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean --force"}}'
+  assert_hook "pre-bash blocks git clean -fe (attached -e value)" 2 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -fe build"}}'
+  assert_hook "pre-bash allows a git clean dry run" 0 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -nd"}}'
+  assert_hook "pre-bash allows git clean -e with a value containing 'f'" 0 hooks/pre-bash.sh \
+    '{"tool_input":{"command":"git clean -e dist/fixtures -d"}}'
+
+  # A guard must read the command it was given, not the directory it runs in.
+  # `for word in $after` glob-expanded `*`; in a directory holding a file called
+  # `tag` that produced `origin tag`, which read as a tag-only push and skipped
+  # the push-from-main guard for what is a plain branch push.
+  TMP_GLOB_REPO="$(mktemp -d)"
+  git -C "$TMP_GLOB_REPO" init -q >/dev/null 2>&1
+  git -C "$TMP_GLOB_REPO" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1
+  : > "$TMP_GLOB_REPO/tag"
+  GLOB_JSON_CWD="$(printf '%s' "$TMP_GLOB_REPO" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  assert_hook "pre-bash does not glob-expand a refspec into a fake tag push" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$GLOB_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin *\"}}"
 
   # Tag pushes from main. A tag doesn't advance a branch, and blocking it broke
   # this repo's own release step (tag v0.x.0 on the merge commit on main). Needs

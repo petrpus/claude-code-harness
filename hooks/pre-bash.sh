@@ -89,11 +89,21 @@ seg_is_git_push() {
 # tokenised and a bundle can be read for what it is.
 #
 # Only single-dash words are inspected: `--` long options are skipped so
-# `--follow-tags` isn't read as a force flag. Of git push's short options
-# (-n -v -q -u -f -d -o -4 -6) only `-f` carries an `f`, so a cluster
-# containing one is unambiguous.
-seg_has_force() {
+# `--follow-tags` isn't read as a force flag.
+#
+# A cluster is walked letter by letter rather than searched for an `f`, because
+# a short option that takes an ATTACHED value swallows the rest of its token:
+# `git push -oci.skip-if-forked=true` is one `-o` option whose value happens to
+# contain an `f`, not a force push. Searching the token would deny it — the very
+# false-positive class this guard's L1 counterpart was just fixed for (#49), one
+# layer down. $2 lists those value-taking letters for the command in hand
+# (`o` for push, `e` for clean); scanning stops when one is reached.
+#
+# Everything after a bare `--` is an operand, so `git push origin -- -f` pushes
+# a ref named `-f` and is not a force push.
+seg_has_force_flag() {
   local seg; seg="$(seg_words "$1")"
+  local valopts="${2:-}"
   [[ "$seg" == *" --force "* ]] && return 0
 
   # `read -ra` splits on IFS without pathname expansion — a plain `for word in
@@ -103,12 +113,34 @@ seg_has_force() {
   read -ra words <<<"$seg"
   [[ "${#words[@]}" -eq 0 ]] && return 1
 
-  local word
+  local word rest ch
   for word in "${words[@]}"; do
+    [[ "$word" == "--" ]] && return 1
     [[ "$word" == --* ]] && continue
-    [[ "$word" == -*f* ]] && return 0
+    [[ "$word" == -?* ]] || continue
+    rest="${word#-}"
+    while [[ -n "$rest" ]]; do
+      ch="${rest:0:1}"
+      [[ "$ch" == "f" ]] && return 0
+      [[ -n "$valopts" && "$valopts" == *"$ch"* ]] && break
+      rest="${rest#?}"
+    done
   done
   return 1
+}
+
+# Return 0 if a segment is a `git ... clean` invocation.
+#
+# L1's static deny cannot cover this on its own for the same reason it cannot
+# cover force-push: a glob can anchor `-f` as its own token or as the head of a
+# cluster, but not in the middle of one, so `git clean -df` and `git clean -xdf`
+# slip past every pattern. Forceful clean deletes untracked files irreversibly,
+# so it gets the same L2 backstop force-push has.
+seg_is_git_clean() {
+  local seg; seg="$(seg_words "$1")"
+  [[ "$seg" == *" git "* ]] || return 1
+  local after="${seg#* git }"
+  [[ " $after " == *" clean "* ]]
 }
 
 # Return 0 if a push targets ONLY tags. A tag doesn't advance a branch, so the
@@ -128,8 +160,16 @@ seg_is_tag_only_push() {
   local after="${seg#* git }"
   case " $after " in *" push "*) after="${after#*push }" ;; *) return 1 ;; esac
 
+  # `read -ra`, not `for word in $after`: unquoted expansion globs, so in a
+  # directory holding a file called `tag`, `git push origin *` expanded to
+  # `origin tag`, was read as `git push origin tag <name>`, and classified as a
+  # tag-only push — silently skipping the push-from-main guard for what is a
+  # plain branch push. A guard must read the command it was given, not the
+  # working directory it happens to run in.
+  local -a argv=()
+  read -ra argv <<<"$after"
   local word tags_flag=0 tag_kw=0 operands=0 tagrefs=0 names=()
-  for word in $after; do
+  for word in ${argv[@]+"${argv[@]}"}; do
     case "$word" in
       --tags)      tags_flag=1; continue ;;
       -*)          continue ;;
@@ -212,10 +252,20 @@ while IFS= read -r seg; do
       echo "  git checkout -b feat/<area>-<short-desc>" >&2
       exit 2
     fi
-    if seg_has_force "$seg" && [[ "$seg" != *"--force-with-lease"* ]]; then
+    # `o` takes an attached value on push (-oci.skip=…), so its argument is not
+    # scanned for an `f`.
+    if seg_has_force_flag "$seg" "o" && [[ "$seg" != *"--force-with-lease"* ]]; then
       echo "Force push blocked. Use --force-with-lease only if explicitly justified." >&2
       exit 2
     fi
+  fi
+
+  # `e` takes an attached value on clean (-epattern), so its argument is not
+  # scanned for an `f`.
+  if seg_is_git_clean "$seg" && seg_has_force_flag "$seg" "e"; then
+    echo "Forceful 'git clean' blocked — it deletes untracked files irreversibly." >&2
+    echo "  Preview first: git clean -nd" >&2
+    exit 2
   fi
 
   if seg_is_dangerous_rm "$seg"; then
