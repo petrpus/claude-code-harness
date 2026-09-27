@@ -18,6 +18,8 @@
 #     AGENT_MAX_TURNS   --max-turns (default 80)
 #     AGENT_DRY_RUN     1 = don't call, return a zero-cost "dry-run" result
 #     AGENT_STDERR_LOG  where claude's stderr is appended (default /dev/null)
+#     AGENT_DISALLOWED_TOOLS  optional --disallowedTools list: tools the call
+#                       may not use even if a permission mode would allow them
 #
 #   Results (globals, set by every call, dry runs included):
 #     AGENT_LAST_RC, AGENT_LAST_JSON, AGENT_LAST_RESULT, AGENT_LAST_COST,
@@ -29,13 +31,17 @@
 
 agent_run() {
   local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5" cwd="${6:-}"
-  local t0 t1 out rc
+  local t0 t1 out rc errlog="${AGENT_STDERR_LOG:-/dev/null}"
+  # Resolve a relative log path before the call changes directory into cwd.
+  [[ "$errlog" == /* ]] || errlog="$PWD/$errlog"
   t0="$(date +%s 2>/dev/null || echo 0)"
   if [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]]; then
     echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
     out='{"result":"dry-run","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}'
     rc=0
   else
+    local -a extra=()
+    [[ -n "${AGENT_DISALLOWED_TOOLS:-}" ]] && extra=(--disallowedTools "$AGENT_DISALLOWED_TOOLS")
     out="$(
       # 125: "could not even start the command" (the xargs/env convention),
       # so an unusable cwd is told apart from anything claude itself returns.
@@ -43,7 +49,7 @@ agent_run() {
       timeout "${AGENT_TIMEOUT:-1200}" claude -p "$prompt" \
         --model "$model" --output-format json \
         --permission-mode "$perm" --allowedTools "$allowed" \
-        --max-turns "${AGENT_MAX_TURNS:-80}" 2>>"${AGENT_STDERR_LOG:-/dev/null}"
+        --max-turns "${AGENT_MAX_TURNS:-80}" ${extra[@]+"${extra[@]}"} 2>>"$errlog"
     )"
     rc=$?
   fi

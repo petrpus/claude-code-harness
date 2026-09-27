@@ -187,17 +187,30 @@ head=<sha> -->` marker, so nothing is posted twice); a pushed branch without a P
   `changes_requested` if and only if an in-scope blocker or issue exists.
   Interactive use keeps "the user decides".
 
-The runner (`review.sh`): records branch, HEAD, `git status --porcelain`,
-`tmp/.last-verify-status` and `git worktree list`; creates
-`git worktree add --detach "$(mktemp -d)" <head>`; runs the reviewer on sonnet
-with `Read, Grep, Glob, Bash(git diff:*), Bash(git log:*), Bash(git show:*)` in
-that worktree, with the charter inlined; parses the last JSON block (invalid →
-retry once → park); removes the worktree; asserts every recorded value is
-unchanged — a violation fails the **whole run**, not the issue. It posts the
-report with `gh pr comment --body-file` (self-approval is impossible on GitHub).
-In-scope findings become fix items. Out-of-scope issues and blockers become
-follow-ups (`needs-triage`, deduplicated by a finding hash in the body, appended
-to the Map). Suggestions only appear in the PR comment.
+The runner (`review.sh`, as built in #59 after two review rounds):
+
+- **No shell, no write tool.** `Read, Grep, Glob` only, `--permission-mode
+  default`, and Bash / Edit / Write / MultiEdit / NotebookEdit / WebFetch /
+  WebSearch / Task / Agent / TodoWrite / Skill explicitly disallowed. A git
+  allowlist is not read-only (`git diff --output=<file>` writes), so the
+  runner inlines the commits, stat and diff (cut at `REVIEW_MAX_DIFF_BYTES`)
+  into the prompt, with the charter.
+- **A throwaway worktree** of the exact head (`git worktree add --detach`
+  under a `deliver-review.XXXXXX` scratch dir) is the reviewer's cwd; claude's
+  stderr goes to the scratch dir too; `EXIT/INT/TERM` traps remove it.
+- **Two snapshots** of the runner's checkout around the call: every ref, HEAD,
+  `git status`, the repo's config / HEAD / hooks / info, the worktree list,
+  and the content of every file under `tmp/`. Any difference fails the
+  **whole run**, not the issue.
+- **The verdict is bound to the head and recomputed.** Only a JSON block with
+  `"head": "<sha under review>"` counts (the reviewer's own instructions
+  contain an example block); the runner recomputes `changes_requested` iff an
+  in-scope blocker or issue exists. No usable verdict → retry once → hold.
+- The report is posted with `gh pr comment --body-file` (self-approval is
+  impossible on GitHub). In-scope findings become fix items (#63).
+  Out-of-scope issues and blockers become follow-ups (`needs-triage`,
+  deduplicated by a finding hash in the body, appended to the Map).
+  Suggestions only appear in the PR comment.
 
 ### PR title, body, final PR
 

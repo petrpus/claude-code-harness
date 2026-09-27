@@ -4,14 +4,16 @@
 # autopilot's loop.sh, verified, squash-merged, and ticked on the Map — in
 # blocking-edge order. docs/prd/0003-deliver.md, ADR-0007, ADR-0008.
 #
-# Tracer bullet (#57): the straight path only. No review, parking, CI wait,
-# resume or /deliver skill yet — any failure stops the run where it is, with
-# the issue branch left checked out for a human to inspect.
+# Every issue PR gets an independent review (agents/code-reviewer.md, in a
+# throwaway worktree, #59) before it may merge. Not built yet: fix rounds,
+# parking, CI wait, resume, the /deliver launcher — so a review that requests
+# changes, like any other failure, stops the run where it is, with the PR open
+# and the issue branch checked out for a human.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
 #              [--issue-max-iterations 10] [--issue-max-minutes 120]
-#              [--issue-budget-usd 10]
+#              [--issue-budget-usd 10] [--review-model sonnet]
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
@@ -29,6 +31,7 @@ VERIFY_CMD=""
 ISSUE_MAX_ITERATIONS=10
 ISSUE_MAX_MINUTES=120
 ISSUE_BUDGET_USD=10
+REVIEW_MODEL=sonnet
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -40,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --issue-max-iterations) ISSUE_MAX_ITERATIONS="$2"; shift 2 ;;
     --issue-max-minutes)    ISSUE_MAX_MINUTES="$2"; shift 2 ;;
     --issue-budget-usd)     ISSUE_BUDGET_USD="$2"; shift 2 ;;
+    --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
     -h|--help)              sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
@@ -54,6 +58,11 @@ done
 . "$SCRIPT_DIR/charter.sh"
 # shellcheck source=forge.sh
 . "$SCRIPT_DIR/forge.sh"
+# shellcheck source=../autopilot/agent.sh
+. "$PLUGIN_ROOT/skills/autopilot/agent.sh"
+# shellcheck source=review.sh
+. "$SCRIPT_DIR/review.sh"
+REVIEW_AGENT="$PLUGIN_ROOT/agents/code-reviewer.md"
 
 # ---------------------------------------------------------------------------
 # Preconditions — local and read-only first, so a refused run makes no forge
@@ -64,6 +73,7 @@ command -v git >/dev/null 2>&1 || die "'git' is required"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repo"
 cd "$(git rev-parse --show-toplevel)" || die "cannot cd to repo root"
 [[ -f "$LOOP" ]] || die "autopilot runner not found at $LOOP"
+[[ -f "$REVIEW_AGENT" ]] || die "reviewer charter not found at $REVIEW_AGENT"
 
 BASE="$(git branch --show-current 2>/dev/null || true)"
 case "$BASE" in
@@ -109,6 +119,25 @@ fi
 RUN_ID="${DELIVER_RUN_ID:?}"
 RUN_DIR="tmp/deliver/$RUN_ID"
 mkdir -p "$RUN_DIR"
+RUN_LOG="$RUN_DIR/run-$RUN_ID.jsonl"
+AGENT_STDERR_LOG="$RUN_DIR/claude-stderr.log"
+# A run killed mid-review must not leave the reviewer's worktree behind.
+trap 'review_cleanup' EXIT
+trap 'review_cleanup; exit 130' INT TERM
+
+# deliver_logline <phase> <issue> <round> <verdict> — one row per model call
+# the runner itself makes, in loop.sh's run-log schema (plus issue/round), so
+# /usage-report and the cost sums read deliver's calls like any other.
+deliver_logline() {
+  jq -cn --arg run "$RUN_ID" --arg phase "$1" --arg model "$REVIEW_MODEL" \
+     --argjson issue "$2" --argjson round "$3" --arg verdict "$4" \
+     --argjson dur "${AGENT_LAST_DURATION:-0}" --argjson cost "${AGENT_LAST_COST:-0}" \
+     --argjson in "${AGENT_LAST_IN_TOKENS:-0}" --argjson out "${AGENT_LAST_OUT_TOKENS:-0}" \
+     --argjson rc "${AGENT_LAST_RC:-0}" \
+     '{ts:(now|todate),run_id:$run,iter:0,phase:$phase,model:$model,issue:$issue,round:$round,
+       duration_s:$dur,cost_usd:$cost,input_tokens:$in,output_tokens:$out,exit_code:$rc,
+       verdict:$verdict,holdout_failed:0}' >> "$RUN_LOG" 2>/dev/null || true
+}
 
 # ---------------------------------------------------------------------------
 # The Map.
@@ -154,7 +183,51 @@ tick_map() {
 }
 
 # ---------------------------------------------------------------------------
-# One issue: branch → autopilot → push → PR → verify → squash merge → tick.
+# Independent review of one PR head (review.sh). Returns 0 when the runner's
+# verdict is approve, 1 otherwise; a checkout changed by the review is not an
+# issue failure but a broken safety property, and ends the whole run.
+# ---------------------------------------------------------------------------
+review_issue() {
+  local n="$1" pr="$2" base_sha="$3" head_sha="$4" dir="$5"
+  local round=1 attempt rc out verdict comment="$dir/review-1.comment.md"
+  for attempt in 1 2; do
+    out="$dir/review-$round"
+    review_run "$n" "$round" "$BASE" "$base_sha" "$head_sha" "$dir/PROMPT.md" "$out" "$REVIEW_MODEL"; rc=$?
+    case "$rc" in
+      0) deliver_logline review "$n" "$round" "$(jq -r '.verdict' "$out.json")"; break ;;
+      2) # A failed call (timeout, crash) and an off-contract reply both leave
+         # no verdict; the run log keeps them apart.
+         if [[ "${AGENT_LAST_RC:-0}" -ne 0 ]]; then
+           deliver_logline review "$n" "$round" call_failed
+         else
+           deliver_logline review "$n" "$round" no_verdict
+         fi
+         if [[ "$attempt" -eq 1 ]]; then
+           log "#$n: the reviewer returned no usable verdict — retrying once."
+           continue
+         fi
+         review_comment "$n" "$round" "$head_sha" "$out.md" "" > "$comment"
+         forge_pr_comment "$pr" "$comment" || true
+         log "#$n: no usable review verdict twice — stopping (PR #$pr stays open)."
+         return 1 ;;
+      3) deliver_logline review "$n" "$round" breach
+         die "#$n: SAFETY BREACH — the checkout changed during the review of PR #$pr: $(tr '\n' ' ' < "$out.breach"). Stopping the run; nothing further is pushed or merged." ;;
+      *) log "#$n: could not create the review worktree — stopping."; return 1 ;;
+    esac
+  done
+  review_comment "$n" "$round" "$head_sha" "$out.md" "$out.json" > "$comment"
+  forge_pr_comment "$pr" "$comment" || log "#$n: could not post the review on PR #$pr (continuing)"
+  verdict="$(jq -r '.verdict' "$out.json")"
+  if [[ "$verdict" != "approve" ]]; then
+    log "#$n: review requests changes on PR #$pr — stopping (fix rounds arrive with #63). Findings: $out.json"
+    return 1
+  fi
+  log "#$n: review approved PR #$pr"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# One issue: branch → autopilot → push → PR → review → verify → merge → tick.
 # ---------------------------------------------------------------------------
 deliver_issue() {
   local id="$1" n dir line map_title issue_title labels state title branch
@@ -230,6 +303,9 @@ deliver_issue() {
   pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
     || { log "#$n: opening the PR failed — stopping."; return 1; }
   log "#$n: PR #$pr opened"
+
+  # --- independent review of the pushed head, before anything merges ---
+  review_issue "$n" "$pr" "$(git rev-parse "origin/$BASE")" "$head_sha" "$dir" || return 1
 
   # --- merge (from the base, so the forge never has the head checked out) ---
   git switch -q "$BASE" || return 1
