@@ -156,7 +156,7 @@ CHARTER4="$(charter_from_issue "$WORK/issue4.json" "$WORK/map1.plan" 3)"
 # Static: the forge surface (ADR-0007)
 # ===========================================================================
 echo "-- forge surface"
-GH_CALLERS="$(grep -lE '(^|[;&|(]|[[:space:]])gh[[:space:]]+(issue|pr|api|repo|auth|label|run|release)' skills/deliver/*.sh skills/autopilot/*.sh 2>/dev/null | tr '\n' ' ')"
+GH_CALLERS="$(grep -lE '(^|[;&|(]|[[:space:]])gh[[:space:]]+(issue|pr|api|repo|auth|label|run|release)([[:space:]]|$)' skills/deliver/*.sh skills/autopilot/*.sh 2>/dev/null | tr '\n' ' ')"
 [[ "$GH_CALLERS" == "skills/deliver/forge.sh " ]] \
   && ok "only skills/deliver/forge.sh calls gh" \
   || note "gh is called outside forge.sh: $GH_CALLERS"
@@ -209,7 +209,7 @@ next_num() {
 [[ "${1:-}" == "--version" ]] && { echo "gh version 2.60.0 (fake)"; exit 0; }
 cmd="${1:-} ${2:-}"; shift 2 2>/dev/null || true
 case "$cmd" in
-  "auth status") exit 0 ;;
+  "auth status") [[ -n "${FAKE_GH_UNAUTH:-}" ]] && exit 1; exit 0 ;;
   "issue view")
     f="$S/issues/$1.json"; [[ -f "$f" ]] || { echo "no issue $1" >&2; exit 1; }
     cat "$f" ;;
@@ -250,6 +250,11 @@ case "$cmd" in
         && git -c user.email=gh@fake -c user.name=fake-gh commit -q -m "$subject" -m "$(cat "${b:-/dev/null}")" \
         && git push -q origin "$base" ) || { rm -rf "$tmp"; exit 1; }
     moid="$(git -C "$tmp/c" rev-parse HEAD)"; rm -rf "$tmp"
+    if [[ -n "${FAKE_GH_AFTER_FIRST_MERGE_BODY:-}" && ! -f "$S/.edited" ]]; then
+      touch "$S/.edited"
+      jq --arg l "$FAKE_GH_AFTER_FIRST_MERGE_BODY" '.body |= sub("## Notes"; ($l + "\n\n## Notes"))' \
+        "$S/issues/3.json" > "$S/issues/3.json.tmp" && mv "$S/issues/3.json.tmp" "$S/issues/3.json"
+    fi
     jq --arg m "$moid" '.state="MERGED" | .mergeCommit={oid:$m}' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   *) echo "fake gh: unsupported call: $cmd $*" >&2; exit 64 ;;
 esac
@@ -415,6 +420,51 @@ run_deliver behind
 RC=$?
 [[ "$RC" -eq 1 ]] && grep -q "not in sync with origin" "$WORK/behind/err" \
   && ok "refuses an integration branch that is not in sync with origin" || note "out-of-sync branch: exit $RC"
+
+# --- missing tools: refused before anything is copied or called --------------
+# path_without <dir> <tool>... — a PATH directory holding every executable of
+# the current PATH except the named tools (the test bin's shims included).
+path_without() {
+  local out="$1" p f b skip; shift
+  mkdir -p "$out"
+  local IFS=:
+  for p in $BIN:$PATH; do
+    [[ -d "$p" ]] || continue
+    for f in "$p"/*; do
+      b="${f##*/}"; skip=0
+      for t in "$@"; do [[ "$b" == "$t" ]] && skip=1; done
+      [[ "$skip" -eq 1 || -e "$out/$b" || ! -x "$f" ]] && continue
+      ln -s "$f" "$out/$b"
+    done
+  done
+}
+for tool in jq gh; do
+  new_fixture "no$tool"
+  path_without "$WORK/no$tool/bin" "$tool"
+  ( cd "$WORK/no$tool/repo" && env PATH="$WORK/no$tool/bin" FAKE_GH_DIR="$WORK/no$tool/gh" \
+      XDG_STATE_HOME="$WORK/no$tool/state" \
+      "$(command -v bash)" "$DELIVER_ABS" --map 3 --verify-cmd true >"$WORK/no$tool/out" 2>"$WORK/no$tool/err" )
+  RC=$?
+  [[ "$RC" -eq 1 ]] && grep -q "'$tool'" "$WORK/no$tool/err" \
+    && [[ -z "$(ls -A "$WORK/no$tool/state" 2>/dev/null)" && ! -s "$WORK/no$tool/gh/calls" ]] \
+    && ok "refuses a machine without $tool (exit 1), with no runner copy and no forge call" \
+    || note "without $tool: exit $RC, err: $(tail -1 "$WORK/no$tool/err")"
+done
+new_fixture unauth
+run_deliver unauth FAKE_GH_UNAUTH=1
+RC=$?
+[[ "$RC" -eq 1 ]] && grep -q "not authenticated" "$WORK/unauth/err" \
+  && [[ -z "$(ls -A "$WORK/unauth/state" 2>/dev/null)" ]] \
+  && ok "refuses an unauthenticated gh before copying the runner" \
+  || note "unauthenticated gh: exit $RC, state: $(ls -A "$WORK/unauth/state" 2>/dev/null)"
+
+# --- a Map edited mid-run into an invalid one stops with its own name ----------
+new_fixture midedit
+run_deliver midedit FAKE_GH_AFTER_FIRST_MERGE_BODY='- [ ] #2 Second thing (after: #1)' -- 
+RC=$?
+[[ "$RC" -eq 1 ]] && grep -q "became invalid mid-run" "$WORK/midedit/err" \
+  && ok "a Map edited mid-run into a duplicate line stops with a validation error" \
+  || note "mid-run invalid Map: exit $RC, err: $(tail -1 "$WORK/midedit/err")"
 
 # --- an issue that does not finish stops the run, nothing is opened -----------
 new_fixture stall

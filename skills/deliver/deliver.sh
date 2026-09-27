@@ -86,6 +86,9 @@ git fetch -q origin || die "git fetch origin failed"
 git rev-parse --verify -q "origin/$BASE" >/dev/null || die "'$BASE' is not on origin — push it first."
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$BASE")" ]] \
   || die "'$BASE' is not in sync with origin/$BASE — pull or push first."
+# gh present and authenticated: read-only, and before the runner copy below,
+# so a machine without a usable gh leaves nothing behind.
+MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
 
 # ---------------------------------------------------------------------------
 # Private runner copy. BUILD edits files in this repo; when the repo is the
@@ -106,8 +109,6 @@ fi
 RUN_ID="${DELIVER_RUN_ID:?}"
 RUN_DIR="tmp/deliver/$RUN_ID"
 mkdir -p "$RUN_DIR"
-
-MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
 
 # ---------------------------------------------------------------------------
 # The Map.
@@ -258,6 +259,9 @@ deliver_issue() {
 # ---------------------------------------------------------------------------
 while :; do
   refresh_map || die "cannot re-read map #$MAP"
+  # The Map may have been edited since the last issue; a duplicate or a bad
+  # ref should stop the run with its own name, not as a confusing later error.
+  PROBLEMS="$(map_validate "$MAP_PLAN")" || die "map #$MAP became invalid mid-run: $(printf '%s' "$PROBLEMS" | tr '\n' ';')"
   NEXT="$(select_next_slice "$MAP_PLAN")"; rc=$?
   case "$rc" in
     0) ;;
