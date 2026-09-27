@@ -711,7 +711,7 @@ chmod +x "$AGENT_DIR/bin/claude"
 AGENT_REPO="$(pwd)"
 AGENT_OUT="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_PWD_FILE="$AGENT_DIR/pwd" AGENT_ARGS_FILE="$AGENT_DIR/args" bash -c '
   . "$1/skills/autopilot/agent.sh"
-  AGENT_MAX_TURNS=7
+  AGENT_MAX_TURNS=7; AGENT_STDERR_LOG=rel-stderr.log
   agent_run build sonnet "Read,Grep" acceptEdits "the prompt" "$2/cwd" > "$2/stdout"; rc=$?
   cp "$2/args" "$2/args.first" 2>/dev/null; cp "$2/pwd" "$2/pwd.first" 2>/dev/null
   printf "%s|%s|%s|%s|%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$AGENT_LAST_COST" "$AGENT_LAST_IN_TOKENS" \
@@ -728,6 +728,9 @@ AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
 [[ "$AGENT_L1" == "0|hi there|0.25|3|4|2|5" ]] \
   && ok "agent_run parses result, cost, tokens, turns and cache reads into AGENT_LAST_*" \
   || note "agent_run globals wrong: '$AGENT_L1'"
+[[ -f "$AGENT_DIR/rel-stderr.log" && ! -e "$AGENT_DIR/cwd/rel-stderr.log" ]] \
+  && ok "a relative AGENT_STDERR_LOG resolves against the caller's directory, not the call's cwd" \
+  || note "relative AGENT_STDERR_LOG landed in the wrong place (or nowhere)"
 [[ ! -s "$AGENT_DIR/stdout" ]] \
   && ok "agent_run prints nothing (callers read AGENT_LAST_RESULT, never \$(...))" \
   || note "agent_run wrote to stdout: $(head -c 80 "$AGENT_DIR/stdout")"

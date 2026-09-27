@@ -29,7 +29,9 @@
 
 agent_run() {
   local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5" cwd="${6:-}"
-  local t0 t1 out rc
+  local t0 t1 out rc errlog="${AGENT_STDERR_LOG:-/dev/null}"
+  # Resolve a relative log path before the call changes directory into cwd.
+  [[ "$errlog" == /* ]] || errlog="$PWD/$errlog"
   t0="$(date +%s 2>/dev/null || echo 0)"
   if [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]]; then
     echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
@@ -43,7 +45,7 @@ agent_run() {
       timeout "${AGENT_TIMEOUT:-1200}" claude -p "$prompt" \
         --model "$model" --output-format json \
         --permission-mode "$perm" --allowedTools "$allowed" \
-        --max-turns "${AGENT_MAX_TURNS:-80}" 2>>"${AGENT_STDERR_LOG:-/dev/null}"
+        --max-turns "${AGENT_MAX_TURNS:-80}" 2>>"$errlog"
     )"
     rc=$?
   fi

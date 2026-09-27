@@ -63,6 +63,11 @@ forge_pr_merge() {
   gh pr merge "$1" --squash --match-head-commit "$2" --subject "$3" --body-file "$4"
 }
 
+# forge_pr_comment <pr> <body_file>  — the review report. A comment, not a
+# `gh pr review`: the runner authors the PR with the user's token, and GitHub
+# refuses to let an author approve or request changes on their own PR.
+forge_pr_comment() { gh pr comment "$1" --body-file "$2" >/dev/null; }
+
 # forge_pr_state <pr>  — OPEN | MERGED | CLOSED
 forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'
