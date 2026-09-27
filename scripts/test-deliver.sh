@@ -189,6 +189,22 @@ FENCE_OUT="$(cd "$FENCE_REPO" && review_diff "$(git rev-parse HEAD~1)" "$(git re
 grep -qx '~~~~~~~~diff' <<<"$FENCE_OUT" \
   && ok "diff fence: longer than any tilde run in the diff (7 in the diff → 8)" \
   || note "diff fence: $(grep -m1 'diff$' <<<"$FENCE_OUT")"
+# A removed line and an unchanged context line carrying tilde runs count too.
+# f.md was doc / 7 tildes / code / 7 tildes; keep the first tilde line as
+# context, drop the second, add no tilde line — only context and removed
+# lines carry tildes, and the fence must still be 8.
+( cd "$FENCE_REPO" && printf 'doc\n~~~~~~~\ncode changed\n' > f.md && git add f.md \
+  && git -c user.email=t@t -c user.name=t commit -q -m head2 )
+FENCE_OUT2="$(cd "$FENCE_REPO" && review_diff "$(git rev-parse HEAD~1)" "$(git rev-parse HEAD)")"
+grep -q '^ ~~~~~~~$' <<<"$FENCE_OUT2" && grep -q '^-~~~~~~~$' <<<"$FENCE_OUT2" && ! grep -q '^+~' <<<"$FENCE_OUT2" \
+  && grep -qx '~~~~~~~~diff' <<<"$FENCE_OUT2" \
+  && ok "diff fence: context and removed tilde lines size it too (no added tildes; 7 → 8)" \
+  || note "diff fence (removed/context): $(grep -m1 'diff$' <<<"$FENCE_OUT2")"
+( cd "$FENCE_REPO" && printf 'plain\n' > g.txt && git add g.txt && git -c user.email=t@t -c user.name=t commit -q -m plain )
+FENCE_OUT3="$(cd "$FENCE_REPO" && review_diff "$(git rev-parse HEAD~1)" "$(git rev-parse HEAD)")"
+grep -qx '~~~~~diff' <<<"$FENCE_OUT3" \
+  && ok "diff fence: a diff without tildes gets the 5-tilde default" \
+  || note "diff fence (none): $(grep -m1 'diff$' <<<"$FENCE_OUT3")"
 review_parse 'Could you clarify?' >/dev/null && note "parse: prose was accepted as a verdict" \
   || ok "parse: prose without a JSON block is no verdict"
 review_parse '{"verdict":"lgtm","findings":[]}' >/dev/null && note "parse: an off-contract verdict was accepted" \
