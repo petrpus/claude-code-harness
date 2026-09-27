@@ -17,6 +17,7 @@
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
 #              [--issue-max-iterations 10] [--issue-max-minutes 120]
 #              [--issue-budget-usd 10] [--review-model sonnet]
+#              [--extra-allowed-tools '<csv>']
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
@@ -35,6 +36,7 @@ VERIFY_CMD=""
 ISSUE_MAX_ITERATIONS=10
 ISSUE_MAX_MINUTES=120
 ISSUE_BUDGET_USD=10
+EXTRA_ALLOWED_TOOLS=""
 REVIEW_MODEL=sonnet
 
 log()     { echo "deliver: $*" >&2; }
@@ -47,12 +49,21 @@ while [[ $# -gt 0 ]]; do
     --issue-max-iterations) ISSUE_MAX_ITERATIONS="$2"; shift 2 ;;
     --issue-max-minutes)    ISSUE_MAX_MINUTES="$2"; shift 2 ;;
     --issue-budget-usd)     ISSUE_BUDGET_USD="$2"; shift 2 ;;
+    --extra-allowed-tools)  EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
     -h|--help)              sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 [[ "$MAP" =~ ^[0-9]+$ ]] || die "--map <issue number> is required"
+# ADR-0007: no model phase may hold a forge operation. A BUILD grant that
+# reaches gh or git push (or a blanket Bash) would hand one to the model.
+# Matched with whitespace squeezed out, so "Bash(git  push:*)" or ", Bash ,"
+# cannot slip past; the patterns are written the same way.
+case ",$(printf '%s' "$EXTRA_ALLOWED_TOOLS" | tr -d '[:space:]')," in
+  *",Bash,"*|*"Bash(*"*|*"Bash(gh"*|*"Bash(gitpush"*|*"Bash(git:"*|*"Bash(git*:"*|*"Bash(git)"*)
+    die "--extra-allowed-tools must not grant Bash, gh or git push to autopilot (ADR-0007): '$EXTRA_ALLOWED_TOOLS'" ;;
+esac
 
 # shellcheck source=../autopilot/plan.sh
 . "$PLUGIN_ROOT/skills/autopilot/plan.sh"
@@ -284,7 +295,12 @@ deliver_issue() {
   charter_from_issue "$dir/issue.json" "$MAP_PLAN" "$MAP" > "$dir/PROMPT.md"
 
   # --- autopilot, one run per issue in its own state dir ---
-  bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" \
+  # --extra-allowed-tools reaches autopilot's BUILD only — never the verifier
+  # or the reviewer, and it is the caller's to keep free of gh / git push
+  # (ADR-0007); the runner refuses such entries below.
+  local -a loop_extra=()
+  [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
+  bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
     --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$ISSUE_MAX_MINUTES" \
     --budget-usd "$ISSUE_BUDGET_USD" 2> >(sed 's/^/  /' >&2)
   local loop_rc=$?

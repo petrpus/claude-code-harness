@@ -53,12 +53,15 @@ issue's fault: it ends the run with exit 1, where it is.
    ```bash
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
-     [--review-model sonnet]
+     [--review-model sonnet] [--extra-allowed-tools '<csv>']
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
-   script) unless `--verify-cmd` is given. The `--issue-*` caps are passed to
-   each issue's `loop.sh` run.
+   script) unless `--verify-cmd` is given. The `--issue-*` caps and
+   `--extra-allowed-tools` (appended to autopilot BUILD's allowlist — e.g.
+   `'Bash(bash scripts/test-deliver.sh),Bash(jq:*)'` for a shell project) are
+   passed to each issue's `loop.sh` run. A grant of Bash, `gh` or `git push`
+   is refused (ADR-0007: no model phase holds a forge operation).
 
 ## The review step
 

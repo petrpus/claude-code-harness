@@ -396,6 +396,9 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    if [[ -n "${STUB_BUILD_LOG:-}" ]]; then
+      prev=""; for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && printf '%s\n' "$a" >> "$STUB_BUILD_LOG"; prev="$a"; done
+    fi
     n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
     if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
@@ -548,6 +551,29 @@ grep -q -- '--admin' "$H/gh/calls" && note "guardrail: gh was called with --admi
 grep -E '^pr merge' "$H/gh/calls" | grep -q -- '--match-head-commit [0-9a-f]\{40\}' \
   && ok "guardrail: every merge is pinned to a verified head (--match-head-commit)" \
   || note "guardrail: a merge was not pinned to its head sha"
+
+# --- --extra-allowed-tools reaches BUILD, and never a forge grant ----------------
+new_fixture extra
+run_deliver extra STUB_BUILD_LOG="$WORK/extra/build.log" STUB_REVIEW_LOG="$WORK/extra/review.log" -- --extra-allowed-tools 'Bash(jq:*),Bash(bash scripts/x.sh)'
+RC=$?
+[[ "$RC" -eq 0 ]] && [[ "$(grep -c . "$WORK/extra/build.log")" -ge 2 ]] \
+  && ! grep -v 'Bash(jq:\*),Bash(bash scripts/x.sh)' "$WORK/extra/build.log" | grep -q . \
+  && ok "--extra-allowed-tools is appended to every BUILD call's allowlist" \
+  || note "--extra-allowed-tools: exit $RC, build allowlists: $(sort -u "$WORK/extra/build.log" 2>/dev/null | head -2 | tr '\n' '|')"
+[[ "$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u)" == "Read,Grep,Glob" ]] \
+  && ok "--extra-allowed-tools never reaches the reviewer (its allowlist stays Read,Grep,Glob)" \
+  || note "--extra-allowed-tools: reviewer allowlist was '$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u | tr '\n' '|')'"
+for bad in 'Bash' 'Bash(gh:*)' 'Bash(git push:*)' 'Read, Bash(git  push origin x)' 'Read,Bash(git:*)' 'Bash(*)' 'Glob , Bash '; do
+  new_fixture extrabad
+  run_deliver extrabad -- --extra-allowed-tools "$bad"
+  RC=$?
+  if [[ "$RC" -eq 1 ]] && grep -q 'must not grant Bash, gh or git push' "$WORK/extrabad/err" && [[ ! -s "$WORK/extrabad/gh/calls" ]]; then
+    ok "--extra-allowed-tools '$bad' is refused before any forge call"
+  else
+    note "--extra-allowed-tools '$bad': exit $RC"
+  fi
+  rm -rf "$WORK/extrabad"
+done
 
 # --- refusals ------------------------------------------------------------------
 new_fixture onmain
