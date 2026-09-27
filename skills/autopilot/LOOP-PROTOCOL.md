@@ -38,7 +38,13 @@ dirty-tree guard must not re-trip on the process's own prior state.
 iteration — the new process computes its own baseline hash fresh at startup,
 so an unchanged file can never spin.
 
-## State files (`tmp/autopilot/`)
+## State files (`tmp/autopilot/`, or `--state-dir`)
+
+Every path below is derived from one state directory, `tmp/autopilot/` unless
+`--state-dir <dir>` names another (relative paths resolve against the repo
+root, so an R1 reload lands in the same place). The runner refuses a state
+dir inside the repo that git does not ignore: checkpoint commits are
+`git add -A`, and would otherwise commit the run's own state.
 
 | File | Role |
 |---|---|
@@ -367,6 +373,11 @@ push-from-main and `.env`/secret guards stay live.
 - `--per-call-timeout` (1200s) wraps every `claude -p` and the verify command in
   `timeout`, so one hung call can't defeat `--max-minutes` (which is only checked
   between phases).
+- `--stop-file <path>` is a graceful stop, not a cap: checked before PLAN and at
+  the top of every iteration (ahead of the caps), so a stop requested mid-BUILD
+  lets that iteration's gates and checkpoint finish, then exits **6** with state
+  `stopped`. The file belongs to its creator — the runner never removes it, so
+  resuming with it still present stops again immediately.
 - **Stuck detection (S4A):** on an annotated plan, driven by a per-slice
   `fails` counter (retry → park at 3 → replan once all candidates are parked
   or blocked → abort on the next failure) — see § The stuck ladder above. On
@@ -488,8 +499,9 @@ whichever side has no data in the logs given renders as `—`, not an error.
 
 ## Recovery
 
-A killed run leaves `tmp/autopilot/` intact and the lock is stale-detected on the
-next start. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
+A killed run leaves its state dir intact and the lock is stale-detected on the
+next start. A stopped run (exit 6) is the same, minus the stale lock: remove the
+stop file and `--resume-run`. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
 iteration count and accumulated cost from its `run-<id>.jsonl` instead of starting
 a new run at iteration 0 / cost 0 — a missing log behaves like a fresh run
 (contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let

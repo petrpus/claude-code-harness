@@ -5,7 +5,7 @@
 # hard verify gates, iteration/time/budget caps, per-call timeout, git
 # checkpointing, stuck-detection, a concurrency lock, and a structured JSONL
 # run log. Each iteration is a FRESH `claude -p` session — state lives on disk
-# in tmp/autopilot/, never in a growing context window.
+# in tmp/autopilot/ (or --state-dir), never in a growing context window.
 #
 # See LOOP-PROTOCOL.md for the full protocol and safety rationale.
 #
@@ -15,9 +15,11 @@
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
 #           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
 #           [--escalate-model opus|none] [--no-repo-map] [--resume-run] [--dry-run]
+#           [--state-dir tmp/autopilot] [--stop-file '<path>']
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
-#             cap · 1 runner error (bad preconditions, missing deps).
+#             cap · 6 stopped (--stop-file appeared) · 1 runner error (bad
+#             preconditions, missing deps).
 
 set -uo pipefail
 
@@ -36,16 +38,11 @@ PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERIFIER_AGENT="$PLUGIN_ROOT/agents/verifier.md"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
+# Where the run keeps its state. Every state path is derived from it after the
+# option parser below, so --state-dir can move all of them at once — /deliver
+# runs one autopilot per issue, each in its own directory.
 STATE_DIR="tmp/autopilot"
-PROMPT_FILE="$STATE_DIR/PROMPT.md"
-PLAN_FILE="$STATE_DIR/IMPLEMENTATION_PLAN.md"
-MEMORY_FILE="$STATE_DIR/MEMORY.md"
-FEEDBACK_FILE="$STATE_DIR/FEEDBACK.md"
-STATUS_FILE="$STATE_DIR/status.json"
-LOCK_FILE="$STATE_DIR/lock"
-# S4A: runner-owned per-slice ladder state — written and read only by
-# loop.sh, never named in any prompt (skills/autopilot/slices.sh).
-SLICES_FILE="$STATE_DIR/slices.json"
+STOP_FILE=""
 
 # Defaults (all overridable).
 MAX_ITERATIONS=10
@@ -88,7 +85,9 @@ while [[ $# -gt 0 ]]; do
     --no-repo-map)       REPO_MAP_ENABLED=0; shift ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
-    -h|--help)          sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --state-dir)        STATE_DIR="$2"; shift 2 ;;
+    --stop-file)        STOP_FILE="$2"; shift 2 ;;
+    -h|--help)          sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) log_err "unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -101,6 +100,32 @@ command -v jq     >/dev/null 2>&1 || { log_err "'jq' is required (parses claude 
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_err "not inside a git repo"; exit 1; }
 cd "$(git rev-parse --show-toplevel)" || { log_err "cannot cd to repo root"; exit 1; }
+
+# Relative --state-dir / --stop-file paths resolve against the repo root, not
+# the caller's cwd: an R1 reload re-execs with the original argv from here, so
+# resolving them anywhere else would move the state mid-run.
+STATE_DIR="${STATE_DIR%/}"
+[[ -n "$STATE_DIR" ]] || { log_err "--state-dir must not be empty"; exit 1; }
+PROMPT_FILE="$STATE_DIR/PROMPT.md"
+PLAN_FILE="$STATE_DIR/IMPLEMENTATION_PLAN.md"
+MEMORY_FILE="$STATE_DIR/MEMORY.md"
+FEEDBACK_FILE="$STATE_DIR/FEEDBACK.md"
+STATUS_FILE="$STATE_DIR/status.json"
+LOCK_FILE="$STATE_DIR/lock"
+# S4A: runner-owned per-slice ladder state — written and read only by
+# loop.sh, never named in any prompt (skills/autopilot/slices.sh).
+SLICES_FILE="$STATE_DIR/slices.json"
+
+# Every checkpoint is `git add -A`, so a state dir git does not ignore would
+# commit the run's own charter, plan, logs and lock into the branch under
+# work. A dir outside the repo is git's business not at all (check-ignore
+# exits 128 there), so only "inside and not ignored" (exit 1) is refused.
+git check-ignore -q "$STATE_DIR/.autopilot-probe" 2>/dev/null
+if [[ $? -eq 1 ]]; then
+  log_err "state dir '$STATE_DIR' is not gitignored — checkpoint commits would include the run's own state."
+  log_err "Ignore it (e.g. add 'tmp/' to .gitignore) or pass a --state-dir that is."
+  exit 1
+fi
 
 BRANCH="$(git branch --show-current 2>/dev/null || echo '')"
 if [[ "$BRANCH" == "main" || "$BRANCH" == "master" || -z "$BRANCH" ]]; then
@@ -639,11 +664,25 @@ the plan.
 EOF
 }
 
+# --stop-file: a graceful stop requested from outside (the /deliver runner, or
+# a human who'd rather not kill mid-call). Checked only at iteration
+# boundaries, so a stop never interrupts a claude -p call or a checkpoint
+# commit half-way. The file belongs to whoever created it; the runner never
+# removes it, so a resume with the file still present stops again at once.
+stop_requested() { [[ -n "$STOP_FILE" && -e "$STOP_FILE" ]]; }
+stop_if_requested() {
+  if stop_requested; then
+    log_err "stop file '$STOP_FILE' present — stopping (run $RUN_ID, iter $ITER)."
+    write_status "stopped"; exit 6
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Main loop.
 # ---------------------------------------------------------------------------
-log_err "run $RUN_ID on '$BRANCH' — verify='$VERIFY_CMD', budget=\$$BUDGET_USD, max_iter=$MAX_ITERATIONS, max_min=$MAX_MINUTES"
+log_err "run $RUN_ID on '$BRANCH' — verify='$VERIFY_CMD', budget=\$$BUDGET_USD, max_iter=$MAX_ITERATIONS, max_min=$MAX_MINUTES, state='$STATE_DIR'"
 write_status "starting"
+stop_if_requested
 
 # PLAN phase — only if no plan exists yet.
 if [[ ! -f "$PLAN_FILE" ]]; then
@@ -651,6 +690,10 @@ if [[ ! -f "$PLAN_FILE" ]]; then
 fi
 
 while :; do
+  # A stop request outranks the caps: the caller asked for this state, and
+  # "stopped" tells it the run is resumable, not exhausted. Checked before the
+  # counter moves, so status.json reports the last iteration that ran.
+  stop_if_requested
   ITER=$(( ITER + 1 ))
 
   # R1: a prior iteration's BUILD phase may have edited loop.sh, plan.sh or
