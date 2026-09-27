@@ -205,6 +205,12 @@ FENCE_OUT3="$(cd "$FENCE_REPO" && review_diff "$(git rev-parse HEAD~1)" "$(git r
 grep -qx '~~~~~diff' <<<"$FENCE_OUT3" \
   && ok "diff fence: a diff without tildes gets the 5-tilde default" \
   || note "diff fence (none): $(grep -m1 'diff$' <<<"$FENCE_OUT3")"
+[[ "$(printf 'plain\n' | md_tilde_fence)" == "~~~~~" ]] \
+  && [[ "$(printf 'x\n   ~~~~~~\n' | md_tilde_fence)" == "~~~~~~~" ]] \
+  && [[ "$(printf '+  ~~~~~~\n' | md_tilde_fence)" == "~~~~~~~" ]] \
+  && [[ "$(printf '~~~~~~~~~~~~\n' | md_tilde_fence)" == "~~~~~~~~~~~~~" ]] \
+  && ok "md_tilde_fence: one longer than any run that could close it (indented up to 3, after a diff marker), floor 5" \
+  || note "md_tilde_fence: $(printf 'x\n   ~~~~~~\n' | md_tilde_fence) / $(printf 'x\n    ~~~~~~~~~\n' | md_tilde_fence)"
 review_parse 'Could you clarify?' >/dev/null && note "parse: prose was accepted as a verdict" \
   || ok "parse: prose without a JSON block is no verdict"
 review_parse '{"verdict":"lgtm","findings":[]}' >/dev/null && note "parse: an off-contract verdict was accepted" \
@@ -393,7 +399,7 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
     if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
-      mkdir -p work && echo "issue $n slice $sel" >> "work/issue-$n.txt"
+      [[ ",${STUB_NOWORK_ISSUES:-}," == *",$n,"* ]] || { mkdir -p work && echo "issue $n slice $sel" >> "work/issue-$n.txt"; }
       awk -v id="$sel" 'BEGIN{d=0} { if (!d && $0 ~ ("^- \\[ \\] " id "([[:space:]]|$)")) { sub(/^- \[ \]/, "- [x]"); d=1 } print }' \
         "$plan" > "$plan.tmp" && mv "$plan.tmp" "$plan"
       grep -q '^- \[ \]' "$plan" || sed -i 's/^STATUS: in-progress/STATUS: done/' "$plan"
@@ -677,6 +683,46 @@ run_deliver park2 STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
 RC=$?
 [[ "$RC" -eq 2 ]] && parked_one park2 \
   && ok "park: a repo that already has needs-human parks the same way" || note "park with existing label: exit $RC"
+
+# Running again while #1 still carries needs-human: #1 is left alone (no new
+# branch, no new comment) and #2 is skipped again — partial, not a crash.
+N_COMMENTS="$(jq '.comments | length' "$P/gh/issues/1.json")"
+run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+RC=$?
+[[ "$RC" -eq 2 ]] && [[ "$(jq '.comments | length' "$P/gh/issues/1.json")" -eq "$N_COMMENTS" ]] \
+  && grep -q '#1: labelled needs-human (parked earlier) — left alone' "$P/err" \
+  && grep -q 'skipped (blocked by a parked issue): #2' "$P/err" \
+  && ok "park, run again: a needs-human issue is left alone and its dependents skipped (exit 2, no new comment)" \
+  || note "park rerun with label: exit $RC — $(tail -1 "$P/err")"
+
+# A human removes the label but not the old branch: the run must not die on
+# it — the issue is parked again with that reason, the rest carries on.
+jq '.labels = [{name:"ready-for-agent"}]' "$P/gh/issues/1.json" > "$P/x" && mv "$P/x" "$P/gh/issues/1.json"
+run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+RC=$?
+[[ "$RC" -eq 2 ]] && jq -r '.comments[-1].body' "$P/gh/issues/1.json" | grep -q 'branch `feat/1-first-feature` from an earlier attempt still exists' \
+  && parked_one park \
+  && ok "park, run again without the label: the leftover branch re-parks #1 (with the reason), the run is not killed" \
+  || note "park rerun without label: exit $RC — $(tail -1 "$P/err")"
+
+# verify passes during autopilot but fails on the finished head (it fails
+# only once HEAD is autopilot's final "green" checkpoint).
+new_fixture parkverify
+run_deliver parkverify -- --verify-cmd '! git log -1 --format=%s | grep -q "(green)"'
+RC=$?
+[[ "$RC" -eq 2 ]] && parked_one parkverify \
+  && jq -r '.comments[-1].body' "$WORK/parkverify/gh/issues/1.json" | grep -q 'verify failed on the head' \
+  && ! grep -q '^pr create' "$WORK/parkverify/gh/calls" \
+  && ok "park: verify failing on the finished head parks the issue before anything is pushed" \
+  || note "park on verify: exit $RC — $(tail -1 "$WORK/parkverify/err")"
+
+new_fixture parknowork
+run_deliver parknowork STUB_NOWORK_ISSUES=1
+RC=$?
+[[ "$RC" -eq 2 ]] && parked_one parknowork \
+  && jq -r '.comments[-1].body' "$WORK/parknowork/gh/issues/1.json" | grep -q 'done without a single commit' \
+  && ok "park: autopilot reporting done without a commit parks the issue" \
+  || note "park on no commit: exit $RC — $(tail -1 "$WORK/parknowork/err")"
 
 # --- review verdicts that hold a PR (#59) — the issue is parked (#58) ----------
 new_fixture rvblock

@@ -72,6 +72,8 @@ forge_pr_comment() { gh pr comment "$1" --body-file "$2" >/dev/null; }
 # repo lacks it (gh refuses to add a label that does not exist). An existing
 # label is left exactly as the repo has it.
 forge_label_ensure() {
+  # Every failure is swallowed, "already exists" and real ones alike: the add
+  # that follows is what matters, and it reports its own failure.
   gh label create "$1" --color "$2" --description "$3" >/dev/null 2>&1 || true
 }
 forge_issue_add_label()    { gh issue edit "$1" --add-label "$2" >/dev/null; }    # <number> <label>

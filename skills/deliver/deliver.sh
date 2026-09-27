@@ -238,7 +238,8 @@ review_issue() {
 # ---------------------------------------------------------------------------
 # One issue: branch → autopilot → push → PR → review → verify → merge → tick.
 # ---------------------------------------------------------------------------
-# Returns 0 merged, 10 park (PARK_REASON says why), 1 end the run.
+# Returns 0 merged, 10 park (PARK_REASON says why), 11 already parked (left
+# alone, skipped with its dependents), 1 end the run.
 deliver_issue() {
   local id="$1" n dir line map_title issue_title labels state title branch
   local pr head_sha status_state iters cost merged_sha
@@ -249,6 +250,12 @@ deliver_issue() {
   forge_issue_json "$n" > "$dir/issue.json" || { log "#$n: cannot read the issue"; return 1; }
   state="$(jq -r '.state' "$dir/issue.json")"
   [[ "$state" == "OPEN" ]] || { log "#$n: issue is $state but unticked on the Map — tick it or reopen it."; return 1; }
+  # Parked by an earlier run and not yet released by a human: leave it — no
+  # new branch, no new comment — and skip what waits on it.
+  if jq -e '[.labels[]?.name] | index("needs-human")' "$dir/issue.json" >/dev/null 2>&1; then
+    log "#$n: labelled needs-human (parked earlier) — left alone, with everything that waits on it."
+    return 11
+  fi
 
   # select_next_slice ran in a $(...) subshell; load the globals here.
   plan_load "$MAP_PLAN"
@@ -259,10 +266,13 @@ deliver_issue() {
   title="$(map_pr_title "$map_title" "$issue_title" "$labels")"
   branch="$(map_branch_name "$n" "$title")"
 
+  # A branch left by an earlier attempt (a parked one, typically). Until
+  # resume exists (#61) the runner cannot tell whether that work should be
+  # continued or discarded, so it parks the issue — and only the issue.
   if git rev-parse --verify -q "refs/heads/$branch" >/dev/null \
      || [[ -n "$(git ls-remote --heads origin "$branch" 2>/dev/null)" ]]; then
-    log "#$n: branch '$branch' already exists — resume is not supported yet (#61)."
-    return 1
+    PARK_REASON="branch \`$branch\` from an earlier attempt still exists; delete it (locally and on origin) and close its draft PR to start over — resuming it arrives with #61"
+    return 10
   fi
   log "#$n: $title → $branch"
   CUR_PR=""; CUR_BRANCH=""
@@ -388,14 +398,16 @@ park_issue() {
       jq -r '"- Autopilot: state `\(.state)`, \(.iterations_done) iteration(s), $\(.total_cost_usd)"' "$st" 2>/dev/null
     fi
     echo "- Issues that wait on this one are skipped in this run; independent ones continue."
-    echo "- To retry: resolve the cause, remove \`needs-human\`, and run /deliver on map #$MAP again."
+    echo "- To retry: resolve the cause, delete the issue branch${CUR_BRANCH:+ \`$CUR_BRANCH\`} (locally and on origin)${CUR_PR:+ and close PR #$CUR_PR}, remove \`needs-human\`, and run /deliver on map #$MAP again. While the label is on, /deliver leaves this issue alone."
     if [[ -s "$dir/FEEDBACK.md" ]]; then
+      local fence
+      fence="$(tail -n 40 "$dir/FEEDBACK.md" | md_tilde_fence)"
       echo
       echo "<details><summary>Autopilot's last feedback</summary>"
       echo
-      echo '~~~~~'
+      echo "$fence"
       tail -n 40 "$dir/FEEDBACK.md"
-      echo '~~~~~'
+      echo "$fence"
       echo
       echo "</details>"
     fi
@@ -440,6 +452,7 @@ while :; do
   case "$rc" in
     0)  ;;
     10) park_issue "$(map_issue_number "$NEXT")" ;;
+    11) PARKED+=("$NEXT") ;;
     *)  die "stopped at $NEXT — ${#MERGED[@]} issue(s) merged this run." ;;
   esac
 done
