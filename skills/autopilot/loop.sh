@@ -104,7 +104,7 @@ cd "$(git rev-parse --show-toplevel)" || { log_err "cannot cd to repo root"; exi
 # Relative --state-dir / --stop-file paths resolve against the repo root, not
 # the caller's cwd: an R1 reload re-execs with the original argv from here, so
 # resolving them anywhere else would move the state mid-run.
-STATE_DIR="${STATE_DIR%/}"
+while [[ "$STATE_DIR" == */ && "$STATE_DIR" != / ]]; do STATE_DIR="${STATE_DIR%/}"; done
 [[ -n "$STATE_DIR" ]] || { log_err "--state-dir must not be empty"; exit 1; }
 PROMPT_FILE="$STATE_DIR/PROMPT.md"
 PLAN_FILE="$STATE_DIR/IMPLEMENTATION_PLAN.md"

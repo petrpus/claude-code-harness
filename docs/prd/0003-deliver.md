@@ -279,7 +279,9 @@ also reports `runner-dead` when the lock PID is gone before a terminal state.
    `tmp/` contents, the Design lane (ADR-0003), vendored skills beyond the
    recorded local patches in D9.
 8. A `tmp/autopilot/` directory from 0.5.x still loads; `loop.sh` without the
-   new flags behaves as 0.5.2.
+   new flags behaves as 0.5.2 — with one deliberate exception (#53): a state
+   dir inside the repo that git does not ignore is refused, the default
+   included, because 0.5.2 silently committed it with every checkpoint.
 
 ## Slice map
 

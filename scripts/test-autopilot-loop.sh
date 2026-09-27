@@ -1077,15 +1077,16 @@ S24="$R24/tmp/deliver/run1/issues/7"
   && ok "--state-dir: the lock in the given dir is released on exit" \
   || note "--state-dir: lock left behind in $S24"
 
-# A trailing slash is the same directory, not a different one.
+# Trailing slashes name the same directory, not a different one.
 R24B="$WORK/r24b"; new_repo "$R24B"
 mkdir -p "$R24B/tmp/other"
 mv "$R24B/tmp/autopilot/PROMPT.md" "$R24B/tmp/other/PROMPT.md"
-run_loop "$R24B" progress true --state-dir tmp/other/
+run_loop "$R24B" progress true --state-dir tmp/other//
 RC24B=$?
 [[ "$RC24B" -eq 0 && -f "$R24B/tmp/other/status.json" ]] \
-  && ok "--state-dir: a trailing slash is accepted" \
-  || note "--state-dir with a trailing slash exited $RC24B"
+  && ! grep -q 'tmp/other//' "$WORK/r24b.calls" 2>/dev/null \
+  && ok "--state-dir: trailing slashes are stripped (tmp/other// → tmp/other)" \
+  || note "--state-dir with trailing slashes exited $RC24B or leaked a doubled slash into prompts"
 
 # --- 25. --state-dir: an un-ignored state dir is refused -------------------
 # Checkpoints are `git add -A`; a state dir git tracks would commit the run's
