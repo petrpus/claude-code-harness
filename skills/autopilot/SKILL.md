@@ -80,7 +80,7 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    continues the same run.
 
    If this repo *is* the autopilot harness's own source, a slice can
-   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — the runner
+   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh` — the runner
    notices its own sourced files changed on disk and re-execs itself under the
    same run id before the next iteration (R1), so a live run picks up the fix
    without a human restart. See `LOOP-PROTOCOL.md` § Runner self-reload.
