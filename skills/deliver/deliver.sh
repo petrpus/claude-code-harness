@@ -246,6 +246,9 @@ deliver_issue() {
   n="$(map_issue_number "$id")"
   dir="$RUN_DIR/issues/$n"
   mkdir -p "$dir"
+  # Per-issue state starts empty: every early return below may park, and a
+  # park must never name an earlier issue's PR or branch.
+  CUR_PR=""; CUR_BRANCH=""
 
   forge_issue_json "$n" > "$dir/issue.json" || { log "#$n: cannot read the issue"; return 1; }
   state="$(jq -r '.state' "$dir/issue.json")"
@@ -271,11 +274,10 @@ deliver_issue() {
   # continued or discarded, so it parks the issue — and only the issue.
   if git rev-parse --verify -q "refs/heads/$branch" >/dev/null \
      || [[ -n "$(git ls-remote --heads origin "$branch" 2>/dev/null)" ]]; then
-    PARK_REASON="branch \`$branch\` from an earlier attempt still exists; delete it (locally and on origin) and close its draft PR to start over — resuming it arrives with #61"
+    PARK_REASON="branch \`$branch\` from an earlier attempt still exists; delete it (locally and on origin), and close its PR if it has one, to start over — resuming it arrives with #61"
     return 10
   fi
   log "#$n: $title → $branch"
-  CUR_PR=""; CUR_BRANCH=""
   git switch -q -c "$branch" "origin/$BASE" || return 1
   CUR_BRANCH="$branch"
 

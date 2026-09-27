@@ -705,6 +705,23 @@ RC=$?
   && ok "park, run again without the label: the leftover branch re-parks #1 (with the reason), the run is not killed" \
   || note "park rerun without label: exit $RC — $(tail -1 "$P/err")"
 
+# A later issue hitting a leftover branch, after earlier issues merged in the
+# same run, must be parked in its own name — not with the previous issue's
+# PR and branch (review round 2 of #58 found exactly that).
+new_fixture parklate with4
+git -C "$WORK/parklate/repo" branch feat/4-independent-thing
+run_deliver parklate
+RC=$?
+PL="$WORK/parklate"
+C4="$(jq -r '.comments[-1].body' "$PL/gh/issues/4.json")"
+[[ "$RC" -eq 2 ]] && [[ "$(jq -r '[.labels[].name] | join(",")' "$PL/gh/issues/4.json")" == "needs-human" ]] \
+  && [[ "$C4" == *'branch `feat/4-independent-thing` from an earlier attempt'* ]] \
+  && [[ "$C4" != *"PR: #"* && "$C4" != *"fix/2-second-thing"* ]] \
+  && ! grep -q '^pr ready' "$PL/gh/calls" \
+  && [[ "$(jq -r .state "$PL/gh/prs/6.json")" == "MERGED" ]] \
+  && ok "park: a leftover branch met after earlier merges parks that issue in its own name (no stale PR/branch, no pr ready)" \
+  || note "park late: exit $RC; #4 comment: $(head -3 <<<"$C4" | tr '\n' '|'); pr ready calls: $(grep -c '^pr ready' "$PL/gh/calls")"
+
 # verify passes during autopilot but fails on the finished head (it fails
 # only once HEAD is autopilot's final "green" checkpoint).
 new_fixture parkverify
