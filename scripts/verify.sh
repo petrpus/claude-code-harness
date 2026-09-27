@@ -711,7 +711,7 @@ chmod +x "$AGENT_DIR/bin/claude"
 AGENT_REPO="$(pwd)"
 AGENT_OUT="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_PWD_FILE="$AGENT_DIR/pwd" AGENT_ARGS_FILE="$AGENT_DIR/args" bash -c '
   . "$1/skills/autopilot/agent.sh"
-  AGENT_MAX_TURNS=7; AGENT_STDERR_LOG=rel-stderr.log
+  AGENT_MAX_TURNS=7; AGENT_STDERR_LOG=rel-stderr.log; AGENT_DISALLOWED_TOOLS="Bash,Write"
   agent_run build sonnet "Read,Grep" acceptEdits "the prompt" "$2/cwd" > "$2/stdout"; rc=$?
   cp "$2/args" "$2/args.first" 2>/dev/null; cp "$2/pwd" "$2/pwd.first" 2>/dev/null
   printf "%s|%s|%s|%s|%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$AGENT_LAST_COST" "$AGENT_LAST_IN_TOKENS" \
@@ -737,8 +737,9 @@ AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
 [[ "$(cat "$AGENT_DIR/pwd.first" 2>/dev/null)" == "$AGENT_DIR/cwd" ]] \
   && ok "agent_run runs claude in the given cwd" \
   || note "agent_run cwd was '$(cat "$AGENT_DIR/pwd" 2>/dev/null)'"
-[[ "$AGENT_ARGS_FIRST" == *"--max-turns 7"* && "$AGENT_ARGS_FIRST" == *"--model sonnet"* && "$AGENT_ARGS_FIRST" == *"--allowedTools Read,Grep"* ]] \
-  && ok "agent_run passes model, allowlist and AGENT_MAX_TURNS through" \
+[[ "$AGENT_ARGS_FIRST" == *"--max-turns 7"* && "$AGENT_ARGS_FIRST" == *"--model sonnet"* && "$AGENT_ARGS_FIRST" == *"--allowedTools Read,Grep"* \
+   && "$AGENT_ARGS_FIRST" == *"--disallowedTools Bash,Write"* ]] \
+  && ok "agent_run passes model, allowlist, AGENT_MAX_TURNS and AGENT_DISALLOWED_TOOLS through" \
   || note "agent_run args were: '$AGENT_ARGS_FIRST'"
 [[ "$AGENT_L2" == "3||0" ]] \
   && ok "a failing call returns its exit code with empty result and zero cost" \

@@ -174,6 +174,14 @@ RP="$(review_parse '{"verdict":"changes_requested","findings":[{"id":"I1","sever
 [[ "$(jq -r '.verdict' <<<"$RP" 2>/dev/null)" == "approve" ]] \
   && ok "parse: out-of-scope issues and suggestions never block" \
   || note "parse (out of scope): '$RP'"
+HB=abcdef0123456789abcdef0123456789abcdef01
+RP="$(review_parse "$(printf 'Clean.\n```json\n{"verdict":"approve","findings":[],"head":"%s"}\n```\nThe format example is:\n```json\n{"verdict":"approve","findings":[{"id":"B1","severity":"blocker","in_scope":true}]}\n```\n' "$HB")" "$HB")"
+[[ "$(jq -r '.verdict' <<<"$RP" 2>/dev/null)" == "approve" ]] \
+  && ok "parse: with a head, only a block naming that head counts — a restated example is ignored" \
+  || note "parse (example after the verdict): '$RP'"
+review_parse "$(printf '```json\n{"verdict":"approve","findings":[],"head":"%s"}\n```\n' 1111111111111111111111111111111111111111)" "$HB" >/dev/null \
+  && note "parse: a verdict for another head was accepted" \
+  || ok "parse: a verdict naming a different head is no verdict"
 review_parse 'Could you clarify?' >/dev/null && note "parse: prose was accepted as a verdict" \
   || ok "parse: prose without a JSON block is no verdict"
 review_parse '{"verdict":"lgtm","findings":[]}' >/dev/null && note "parse: an off-contract verdict was accepted" \
@@ -299,15 +307,21 @@ cat > "$BIN/claude" <<'EOF'
 prompt="$*"
 plan="$(printf '%s' "$prompt" | grep -oE '[^[:space:],"]*IMPLEMENTATION_PLAN\.md' | head -1)"
 emit() { printf '{"result":%s,"total_cost_usd":0.01,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1"; }
-review_json() { # verdict findings-json
-  printf 'Report: looked at the diff.\n\n```json\n{"verdict":"%s","findings":%s,"resolved":[]}\n```\n' "$1" "$2"
+review_json() { # verdict findings-json [head]
+  printf 'Report: looked at the diff.\n\n```json\n{"verdict":"%s","findings":%s,"resolved":[],"head":"%s"}\n```\n' "$1" "$2" "${3-$head}"
 }
+head="$(printf '%s' "$prompt" | grep -oE 'Head: `[0-9a-f]{40}`' | head -1 | tr -d '`' | cut -d' ' -f2)"
+common_root() { cd "$(git rev-parse --git-common-dir)/.." && pwd; }
 case "$prompt" in
   *"# Agent: code-reviewer"*)
     if [[ -n "${STUB_REVIEW_LOG:-}" ]]; then
-      tools=""; prev=""
-      for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && tools="$a"; prev="$a"; done
-      printf '%s\t%s\n' "$(pwd)" "$tools" >> "$STUB_REVIEW_LOG"
+      tools=""; dis=""; perm=""; prev=""
+      for a in "$@"; do
+        case "$prev" in --allowedTools) tools="$a" ;; --disallowedTools) dis="$a" ;; --permission-mode) perm="$a" ;; esac
+        prev="$a"
+      done
+      inl=no; [[ "$prompt" == *"### Diff"* && "$prompt" == *"+++ b/work/issue-"* ]] && inl=yes
+      printf '%s\t%s\t%s\t%s\t%s\n' "$(pwd)" "$tools" "$dis" "$perm" "$inl" >> "$STUB_REVIEW_LOG"
     fi
     mode="${STUB_REVIEW:-approve}"
     if [[ "$mode" == "garbage-once" ]]; then
@@ -319,8 +333,20 @@ case "$prompt" in
       liar)       r="$(review_json approve '[{"id":"I1","severity":"issue","file":"a","line":1,"note":"real problem","in_scope":true}]')" ;;
       outofscope) r="$(review_json approve '[{"id":"I1","severity":"issue","file":"b","line":9,"note":"old bug","in_scope":false,"issue_title":"fix: old bug"}]')" ;;
       garbage)    r="I would need more context to review this. Could you clarify the scope?" ;;
-      mutate)     ( cd "$(git rev-parse --git-common-dir)/.." && git switch -q -c scratch-by-reviewer )
+      mutate)     ( cd "$(common_root)" && git switch -q -c scratch-by-reviewer )
                   r="$(review_json approve '[]')" ;;
+      mutate-ref) ( cd "$(common_root)" && git update-ref refs/heads/integration/x "$(git rev-parse HEAD~0^{commit})" "$(git rev-parse integration/x)" 2>/dev/null \
+                      || git update-ref refs/remotes/origin/integration/x "$(git rev-parse HEAD)" )
+                  r="$(review_json approve '[]')" ;;
+      mutate-tmp) ( cd "$(common_root)" && for f in tmp/deliver/*/issues/*/PROMPT.md; do echo "injected" >> "$f"; done )
+                  r="$(review_json approve '[]')" ;;
+      mutate-hook) printf '#!/bin/sh\nexit 0\n' > "$(git rev-parse --git-common-dir)/hooks/pre-push"
+                  r="$(review_json approve '[]')" ;;
+      example-after)
+                  r="$(review_json approve '[]')
+As required, the format example is:
+$(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.ts","line":42,"note":"example","in_scope":true}]' "")" ;;
+      wrong-head) r="$(review_json approve '[]' 0000000000000000000000000000000000000000)" ;;
     esac
     printf '{"result":%s,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$(printf '%s' "$r" | jq -Rs .)"
     exit 0 ;;
@@ -448,10 +474,13 @@ REVIEW_CWDS="$(cut -f1 "$WORK/happy/review.log" 2>/dev/null)"
   && [[ -z "$(git -C "$H/repo" worktree list --porcelain | grep -c '^worktree ' | grep -vx 1)" ]] \
   && ok "review: ran twice, each time in a throwaway worktree (not the checkout), all removed afterwards" \
   || note "review: cwds were: $(tr '\n' ' ' <<<"$REVIEW_CWDS"); worktrees: $(git -C "$H/repo" worktree list | wc -l)"
-REVIEW_TOOLS="$(cut -f2 "$WORK/happy/review.log" | sort -u)"
-[[ "$REVIEW_TOOLS" == "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)" ]] \
-  && ok "review: the reviewer's allowlist is read-only (no Edit/Write, no gh, no state-changing git)" \
-  || note "review: allowlist was '$REVIEW_TOOLS'"
+REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
+[[ "$REVIEW_PERMS" == $'Read,Grep,Glob\tBash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch\tdefault' ]] \
+  && ok "review: no shell and no write tool — Read/Grep/Glob allowed, Bash/Edit/Write disallowed, default mode" \
+  || note "review: permissions were '$(tr '\t' '|' <<<"$REVIEW_PERMS")'"
+[[ "$(cut -f5 "$WORK/happy/review.log" | sort -u)" == "yes" ]] \
+  && ok "review: the runner inlines the commits, stat and diff into the prompt" \
+  || note "review: the diff was not inlined"
 [[ "$(cat "$RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .verdict=="approve")] | length')" -eq 2 ]] \
   && ok "review: both calls are in the run's own log (phase review, issue, verdict, cost)" \
   || note "review: run log rows missing under $RUNDIR"
@@ -610,6 +639,29 @@ RC=$?
   && [[ "$(jq -r .body "$WORK/rvmutate/gh/issues/3.json")" != *"[x]"* ]] \
   && ok "review: a reviewer that moves the runner's checkout fails the whole run, nothing merges" \
   || note "review mutate: exit $RC, err: $(tail -1 "$WORK/rvmutate/err")"
+
+for m in mutate-ref mutate-tmp mutate-hook; do
+  new_fixture "rv$m"
+  run_deliver "rv$m" STUB_REVIEW="$m"
+  RC=$?
+  [[ "$RC" -eq 1 ]] && grep -q 'SAFETY BREACH' "$WORK/rv$m/err" && ! grep -q '^pr merge' "$WORK/rv$m/gh/calls" \
+    && ok "review: $m (a write the checkout's status cannot see) is still a safety breach" \
+    || note "review $m: exit $RC, err: $(tail -1 "$WORK/rv$m/err")"
+done
+
+new_fixture rvexample
+run_deliver rvexample STUB_REVIEW=example-after
+RC=$?
+[[ "$RC" -eq 0 && "$(jq -r .state "$WORK/rvexample/gh/prs/4.json")" == "MERGED" ]] \
+  && ok "review: a clean verdict followed by the restated format example still merges" \
+  || note "review example-after: exit $RC"
+
+new_fixture rvwronghead
+run_deliver rvwronghead STUB_REVIEW=wrong-head
+RC=$?
+[[ "$RC" -eq 1 ]] && held rvwronghead \
+  && ok "review: a verdict for a different head is no verdict (held)" \
+  || note "review wrong-head: exit $RC"
 
 # --- a merge refused by the forge stops the run -------------------------------
 new_fixture refused

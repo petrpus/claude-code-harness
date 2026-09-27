@@ -173,6 +173,9 @@ is nothing to report. Automation reads only this block:
 - `verdict`: `changes_requested` **if and only if** there is an in-scope
   `blocker` or `issue`; otherwise `approve`. Out-of-scope findings and
   suggestions never block.
+- When the caller names the head under review and asks for it, add
+  `"head": "<sha>"` — `/deliver` reads only a block bound to the head it
+  asked about, so the example above can never be mistaken for a verdict.
 
 ### 6. If blockers, fail with findings
 

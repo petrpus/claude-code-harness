@@ -45,20 +45,24 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 Before any PR merges, `agents/code-reviewer.md` reviews its exact head in one
 `claude -p` call on `--review-model` (sonnet by default):
 
-- in a **throwaway `git worktree`** of the head, never in your checkout, with a
-  read-only allowlist (`Read, Grep, Glob`, `git diff/log/show`);
+- with **no shell and no write tool**: `Read, Grep, Glob` only, Bash / Edit /
+  Write disallowed, `default` permission mode. (A git allowlist is not
+  read-only — `git diff --output=<file>` writes.) The runner inlines the
+  commits, stat and diff into the prompt instead;
+- in a **throwaway `git worktree`** of the head, never in your checkout;
 - with the issue's charter inlined — it decides what is in scope;
-- between two snapshots of your checkout (branch, `HEAD`, `git status`,
-  `tmp/.last-verify-status`, worktree list). Any difference is a **safety
-  breach** and ends the whole run: a reviewer that moves `HEAD` would send the
-  next commit or merge to the wrong place (#52).
+- between two snapshots of your checkout: every ref (the base and
+  remote-tracking refs included), `HEAD`, `git status`, the repo's config,
+  hooks and `info/`, the worktree list, and the content of every file under
+  `tmp/`. Any difference is a **safety breach** and ends the whole run (#52).
 
-The reviewer must end with a JSON block; the runner then **recomputes** the
-verdict itself — `changes_requested` if and only if there is an in-scope
-blocker or issue — so a reply that lists a blocker and says "approve" still
-holds the PR. A reply with no usable verdict is retried once, then holds the
-PR (fail closed). The report is posted as a PR comment (GitHub does not let
-the PR's author formally approve it) under a
+The reviewer ends with a JSON block that must name the head under review;
+a block without it (a restated format example, say) is not read. The runner
+then **recomputes** the verdict itself — `changes_requested` if and only if
+there is an in-scope blocker or issue — so a reply that lists a blocker and
+says "approve" still holds the PR. A reply with no usable verdict is retried
+once, then holds the PR (fail closed). The report is posted as a PR comment
+(GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
 
 The runner first copies the plugin to

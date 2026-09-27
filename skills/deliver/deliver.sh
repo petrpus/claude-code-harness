@@ -121,6 +121,9 @@ RUN_DIR="tmp/deliver/$RUN_ID"
 mkdir -p "$RUN_DIR"
 RUN_LOG="$RUN_DIR/run-$RUN_ID.jsonl"
 AGENT_STDERR_LOG="$RUN_DIR/claude-stderr.log"
+# A run killed mid-review must not leave the reviewer's worktree behind.
+trap 'review_cleanup' EXIT
+trap 'review_cleanup; exit 130' INT TERM
 
 # deliver_logline <phase> <issue> <round> <verdict> — one row per model call
 # the runner itself makes, in loop.sh's run-log schema (plus issue/round), so
@@ -192,7 +195,13 @@ review_issue() {
     review_run "$n" "$round" "$BASE" "$base_sha" "$head_sha" "$dir/PROMPT.md" "$out" "$REVIEW_MODEL"; rc=$?
     case "$rc" in
       0) deliver_logline review "$n" "$round" "$(jq -r '.verdict' "$out.json")"; break ;;
-      2) deliver_logline review "$n" "$round" no_verdict
+      2) # A failed call (timeout, crash) and an off-contract reply both leave
+         # no verdict; the run log keeps them apart.
+         if [[ "${AGENT_LAST_RC:-0}" -ne 0 ]]; then
+           deliver_logline review "$n" "$round" call_failed
+         else
+           deliver_logline review "$n" "$round" no_verdict
+         fi
          if [[ "$attempt" -eq 1 ]]; then
            log "#$n: the reviewer returned no usable verdict — retrying once."
            continue
