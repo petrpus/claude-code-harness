@@ -69,6 +69,16 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    `--extra-allowed-tools <list>` appends to BUILD's `--allowedTools`
    allowlist for a project that needs one more command.
 
+   `--state-dir <dir>` (default `tmp/autopilot`) moves every state file —
+   charter, plan, memory, feedback, status, run log, lock — to another
+   directory; `/deliver` uses one per issue. A relative path resolves against
+   the repo root, and the runner refuses a directory inside the repo that git
+   does not ignore (checkpoints are `git add -A`). `--stop-file <path>` asks
+   for a graceful stop: the runner checks it at every iteration boundary and,
+   once the file exists, lets the current iteration finish and exits 6 with
+   state `stopped`. It never deletes the file — remove it, then `--resume-run`
+   continues the same run.
+
    If this repo *is* the autopilot harness's own source, a slice can
    legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — the runner
    notices its own sourced files changed on disk and re-execs itself under the
@@ -113,7 +123,9 @@ on `--escalate-model` after its 2nd (back to `--build-model` once it ticks;
 blocked a single replan unparks everything — a second failure after that
 replan aborts. A plan with no real slice ids falls back to the pre-S4A rule
 verbatim (same fingerprint twice → replan, third time → abort).
-Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
+Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck ·
+6 stopped (`--stop-file`) · 1 precondition error. Budget cap and stuck share 4;
+`status.json .state` (`budget-cap` vs `stuck`) tells them apart.
 
 Gate (d) parses the verifier's output three ways, not just pass/fail: a reply
 that isn't a JSON object with a boolean `.pass` (refusal prose, a clarifying

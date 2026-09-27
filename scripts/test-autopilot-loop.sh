@@ -65,7 +65,11 @@ cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 [[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
 prompt="$*"
-plan="tmp/autopilot/IMPLEMENTATION_PLAN.md"
+# The plan path comes from the prompt, not a hardcoded tmp/autopilot/: every
+# phase that touches the plan names it (loop.sh interpolates $PLAN_FILE), and
+# --state-dir moves it. Fallback keeps any prompt that doesn't name it working.
+plan="$(printf '%s' "$prompt" | grep -oE '[^[:space:],"]*IMPLEMENTATION_PLAN\.md' | head -1)"
+plan="${plan:-tmp/autopilot/IMPLEMENTATION_PLAN.md}"
 # S4B: a call's own `--model <name>` token is right there in `$*` (loop.sh
 # passes it as a separate argv word, and prompt="$*" joins everything with
 # spaces) — cheap enough to grep for rather than threading a new stub arg
@@ -102,6 +106,9 @@ case "$prompt" in
     emit '"planned"'
     ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    # --stop-file: simulate a caller requesting a stop while BUILD is busy.
+    # The runner must finish this iteration and stop at the next boundary.
+    [[ -n "${STUB_TOUCH_AFTER_BUILD:-}" ]] && touch "$STUB_TOUCH_AFTER_BUILD"
     # S2 (holdout scenarios): if this run is checking that holdout content
     # never reaches BUILD, flag it — the outer test asserts the file this
     # writes to stays empty.
@@ -1042,6 +1049,130 @@ EMPTY_RC_23=$?
 [[ "$EMPTY_RC_23" -eq 0 ]] \
   && ok "report.sh exits 0 against a directory with no run logs" \
   || note "report.sh exited $EMPTY_RC_23 against an empty directory — expected 0"
+
+# --- 24. --state-dir: a run lives entirely in the given directory ----------
+# /deliver runs one autopilot per issue, each in its own state dir. The whole
+# run — charter, plan, logs, status, lock — must follow the flag, and the
+# default tmp/autopilot/ must stay untouched.
+R24="$WORK/r24"; new_repo "$R24"
+mkdir -p "$R24/tmp/deliver/run1/issues/7"
+mv "$R24/tmp/autopilot/PROMPT.md" "$R24/tmp/deliver/run1/issues/7/PROMPT.md"
+run_loop "$R24" progress true --state-dir tmp/deliver/run1/issues/7
+RC24=$?
+S24="$R24/tmp/deliver/run1/issues/7"
+[[ "$RC24" -eq 0 ]] \
+  && ok "--state-dir: a five-slice run completes in a custom state dir (exit 0)" \
+  || note "--state-dir run exited $RC24 — expected 0 ($(tail -2 "$WORK/r24.err" 2>/dev/null | tr '\n' ' '))"
+[[ -f "$S24/IMPLEMENTATION_PLAN.md" && -f "$S24/status.json" && -f "$S24/MEMORY.md" ]] \
+  && ls "$S24"/run-*.jsonl >/dev/null 2>&1 \
+  && ok "--state-dir: plan, status, memory and run log all land in the given dir" \
+  || note "--state-dir: expected plan/status/memory/run log under $S24"
+[[ "$(jq -r '.state' "$S24/status.json" 2>/dev/null)" == "done" ]] \
+  && ok "--state-dir: status.json in the given dir reports done" \
+  || note "--state-dir: status.json state is '$(jq -r '.state' "$S24/status.json" 2>/dev/null)', expected done"
+[[ -z "$(ls -A "$R24/tmp/autopilot" 2>/dev/null)" ]] \
+  && ok "--state-dir: the default tmp/autopilot/ is left untouched" \
+  || note "--state-dir: files appeared in tmp/autopilot/: $(ls -A "$R24/tmp/autopilot" | tr '\n' ' ')"
+[[ ! -f "$S24/lock" ]] \
+  && ok "--state-dir: the lock in the given dir is released on exit" \
+  || note "--state-dir: lock left behind in $S24"
+
+# Trailing slashes name the same directory, not a different one.
+R24B="$WORK/r24b"; new_repo "$R24B"
+mkdir -p "$R24B/tmp/other"
+mv "$R24B/tmp/autopilot/PROMPT.md" "$R24B/tmp/other/PROMPT.md"
+run_loop "$R24B" progress true --state-dir tmp/other//
+RC24B=$?
+[[ "$RC24B" -eq 0 && -f "$R24B/tmp/other/status.json" ]] \
+  && ! grep -q 'tmp/other//' "$WORK/r24b.calls" 2>/dev/null \
+  && ok "--state-dir: trailing slashes are stripped (tmp/other// → tmp/other)" \
+  || note "--state-dir with trailing slashes exited $RC24B or leaked a doubled slash into prompts"
+
+# --- 25. --state-dir: an un-ignored state dir is refused -------------------
+# Checkpoints are `git add -A`; a state dir git tracks would commit the run's
+# own charter, logs and lock into the branch.
+R25="$WORK/r25"; new_repo "$R25"
+mkdir -p "$R25/state"
+cp "$R25/tmp/autopilot/PROMPT.md" "$R25/state/PROMPT.md"
+git -C "$R25" add state/PROMPT.md >/dev/null 2>&1
+git -C "$R25" commit -q -m "add state"
+run_loop "$R25" progress true --state-dir state
+RC25=$?
+[[ "$RC25" -eq 1 ]] && grep -q "not gitignored" "$WORK/r25.err" 2>/dev/null \
+  && ok "--state-dir: a state dir git does not ignore is refused (exit 1)" \
+  || note "--state-dir: un-ignored state dir exited $RC25 — expected 1 with a 'not gitignored' error"
+[[ "$(git -C "$R25" log --oneline | wc -l | tr -d ' ')" -eq 2 ]] \
+  && ok "--state-dir: the refused run made no checkpoint commit" \
+  || note "--state-dir: the refused run still committed"
+
+# --- 26. --stop-file: a stop requested mid-run ends it at the next boundary -
+# The stub touches the stop file during the first BUILD; the runner must let
+# that iteration finish (gates + checkpoint) and exit 6 before the second.
+R26="$WORK/r26"; new_repo "$R26"
+STOP26="$R26/tmp/deliver-STOP"
+( cd "$R26" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_TOUCH_AFTER_BUILD="$STOP26" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+      --stop-file tmp/deliver-STOP \
+    >"$WORK/r26.out" 2>"$WORK/r26.err" )
+RC26=$?
+[[ "$RC26" -eq 6 ]] \
+  && ok "--stop-file: a stop requested during BUILD exits 6" \
+  || note "--stop-file run exited $RC26 — expected 6"
+[[ "$(jq -r '.state' "$R26/tmp/autopilot/status.json" 2>/dev/null)" == "stopped" ]] \
+  && ok "--stop-file: status.json reports stopped" \
+  || note "--stop-file: status.json state is '$(jq -r '.state' "$R26/tmp/autopilot/status.json" 2>/dev/null)', expected stopped"
+[[ "$(jq -r '.iterations_done' "$R26/tmp/autopilot/status.json" 2>/dev/null)" == "1" ]] \
+  && ok "--stop-file: the running iteration finished; status.json counts exactly 1" \
+  || note "--stop-file: iterations_done is '$(jq -r '.iterations_done' "$R26/tmp/autopilot/status.json" 2>/dev/null)', expected 1"
+R26_LOG="$(git -C "$R26" log --oneline 2>/dev/null)"
+case "$R26_LOG" in
+  *"iteration 1 "*) ok "--stop-file: the interrupted iteration was still checkpointed" ;;
+  *)                note "--stop-file: no checkpoint commit for iteration 1" ;;
+esac
+[[ -z "$(git -C "$R26" status --porcelain 2>/dev/null)" && ! -f "$R26/tmp/autopilot/lock" ]] \
+  && ok "--stop-file: the stop leaves a clean tree and releases the lock" \
+  || note "--stop-file: dirty tree or lock left after stop"
+[[ -f "$STOP26" ]] \
+  && ok "--stop-file: the runner leaves the stop file to its owner" \
+  || note "--stop-file: the runner deleted the stop file"
+
+# Resuming with the file removed continues the same run to completion.
+rm -f "$STOP26"
+( cd "$R26" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+      --stop-file tmp/deliver-STOP --resume-run \
+    >"$WORK/r26b.out" 2>"$WORK/r26b.err" )
+RC26B=$?
+[[ "$RC26B" -eq 0 && "$(ls "$R26"/tmp/autopilot/run-*.jsonl | wc -l | tr -d ' ')" -eq 1 ]] \
+  && ok "--stop-file: --resume-run after the stop finishes the same run (exit 0, one run log)" \
+  || note "--stop-file: resume after stop exited $RC26B / $(ls "$R26"/tmp/autopilot/run-*.jsonl | wc -l | tr -d ' ') run logs — expected 0 / 1"
+
+# A stop file already present at start stops before PLAN spends anything.
+R26C="$WORK/r26c"; new_repo "$R26C"
+touch "$R26C/tmp/STOP"
+run_loop "$R26C" progress true --stop-file tmp/STOP
+RC26C=$?
+[[ "$RC26C" -eq 6 ]] && ! grep -q "PLAN phase" "$WORK/r26c.calls" 2>/dev/null \
+  && ok "--stop-file: a stop file present at start exits 6 before the PLAN call" \
+  || note "--stop-file: pre-existing stop file exited $RC26C (or PLAN still ran) — expected 6 with no PLAN call"
+
+# --- 27. --state-dir + --resume-run: the prior run is found in the given dir -
+R27="$WORK/r27"; new_repo "$R27"
+S27="$R27/tmp/deliver/run1/issues/9"
+mkdir -p "$S27"
+mv "$R27/tmp/autopilot/PROMPT.md" "$S27/PROMPT.md"
+printf -- '- [ ] slice 1\n- [ ] slice 2\n\nSTATUS: in-progress\n' > "$S27/IMPLEMENTATION_PLAN.md"
+PRIOR27="20260101T000000Z-424242"
+printf '{"ts":"2026-01-01T00:00:00Z","run_id":"%s","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.5,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}\n' "$PRIOR27" \
+  > "$S27/run-$PRIOR27.jsonl"
+( cd "$R27" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 \
+      --state-dir tmp/deliver/run1/issues/9 --resume-run \
+    >"$WORK/r27.out" 2>"$WORK/r27.err" )
+RC27=$?
+[[ "$RC27" -eq 2 && "$(jq -r '.run_id' "$S27/status.json" 2>/dev/null)" == "$PRIOR27" ]] \
+  && ok "--state-dir + --resume-run adopts the run log found in the given dir" \
+  || note "--state-dir + --resume-run exited $RC27, run '$(jq -r '.run_id' "$S27/status.json" 2>/dev/null)' — expected 2 and $PRIOR27"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then
