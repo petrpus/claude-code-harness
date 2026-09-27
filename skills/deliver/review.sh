@@ -28,7 +28,9 @@
 # recomputes the verdict from its findings by the rule in code-reviewer.md.
 
 REVIEW_ALLOWED_TOOLS="Read,Grep,Glob"
-REVIEW_DISALLOWED_TOOLS="Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
+# Explicit, not left to allowlist omission: Task/Agent could start a subagent
+# carrying its own tool grant (a shell, say), reopening the hole this closes.
+REVIEW_DISALLOWED_TOOLS="Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,Agent,TodoWrite,Skill"
 REVIEW_PERMISSION_MODE="default"
 REVIEW_MAX_DIFF_BYTES="${REVIEW_MAX_DIFF_BYTES:-300000}"
 REVIEW_WT=""   # the live throwaway worktree, for review_cleanup
@@ -54,23 +56,31 @@ review_snapshot() {
 # the diff cut at REVIEW_MAX_DIFF_BYTES with a note (the full head is in the
 # reviewer's working directory to Read).
 review_diff() {
-  local base="$1" head="$2" diff bytes
+  local base="$1" head="$2" diff bytes fence longest
+  diff="$(git diff "$base...$head" 2>/dev/null)"
+  # Fence with tildes, one longer than any tilde run that opens a line of the
+  # diff: backtick fences collide with every Markdown file that has code
+  # blocks, and a fixed tilde fence with any diff that happens to use one.
+  longest="$(printf '%s\n' "$diff" | grep -oE '^[+ -]?~+' | tr -d '+ -' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+  (( longest < 4 )) && longest=4
+  fence="$(printf '%*s' $(( longest + 1 )) '' | tr ' ' '~')"
   echo "### Commits"; echo
   git log --format='- %h %s' "$base..$head" 2>/dev/null
-  echo; echo "### Diff stat"; echo; echo '~~~~~'
+  echo; echo "### Diff stat"; echo; echo "$fence"
   git diff --stat "$base...$head" 2>/dev/null
-  echo '~~~~~'; echo; echo "### Diff"; echo
-  diff="$(git diff "$base...$head" 2>/dev/null)"
+  echo "$fence"; echo; echo "### Diff"; echo
+  # ${#diff} and ${diff:0:N} count characters under a UTF-8 locale (the
+  # normal case), so the cut never splits a multi-byte character there.
   bytes="${#diff}"
-  echo '~~~~~diff'
+  echo "${fence}diff"
   if (( bytes > REVIEW_MAX_DIFF_BYTES )); then
     printf '%s\n' "${diff:0:$REVIEW_MAX_DIFF_BYTES}"
-    echo '~~~~~'
+    echo "$fence"
     echo
     echo "(diff truncated at $REVIEW_MAX_DIFF_BYTES of $bytes characters — Read the changed files listed in the stat above from your working directory for the rest)"
   else
     printf '%s\n' "$diff"
-    echo '~~~~~'
+    echo "$fence"
   fi
 }
 

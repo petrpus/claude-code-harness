@@ -182,6 +182,13 @@ RP="$(review_parse "$(printf 'Clean.\n```json\n{"verdict":"approve","findings":[
 review_parse "$(printf '```json\n{"verdict":"approve","findings":[],"head":"%s"}\n```\n' 1111111111111111111111111111111111111111)" "$HB" >/dev/null \
   && note "parse: a verdict for another head was accepted" \
   || ok "parse: a verdict naming a different head is no verdict"
+FENCE_REPO="$WORK/fence"; mkdir -p "$FENCE_REPO"
+( cd "$FENCE_REPO" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m base \
+  && printf 'doc\n~~~~~~~\ncode\n~~~~~~~\n' > f.md && git add f.md && git -c user.email=t@t -c user.name=t commit -q -m head )
+FENCE_OUT="$(cd "$FENCE_REPO" && review_diff "$(git rev-parse HEAD~1)" "$(git rev-parse HEAD)")"
+grep -qx '~~~~~~~~diff' <<<"$FENCE_OUT" \
+  && ok "diff fence: longer than any tilde run in the diff (7 in the diff → 8)" \
+  || note "diff fence: $(grep -m1 'diff$' <<<"$FENCE_OUT")"
 review_parse 'Could you clarify?' >/dev/null && note "parse: prose was accepted as a verdict" \
   || ok "parse: prose without a JSON block is no verdict"
 review_parse '{"verdict":"lgtm","findings":[]}' >/dev/null && note "parse: an off-contract verdict was accepted" \
@@ -475,7 +482,7 @@ REVIEW_CWDS="$(cut -f1 "$WORK/happy/review.log" 2>/dev/null)"
   && ok "review: ran twice, each time in a throwaway worktree (not the checkout), all removed afterwards" \
   || note "review: cwds were: $(tr '\n' ' ' <<<"$REVIEW_CWDS"); worktrees: $(git -C "$H/repo" worktree list | wc -l)"
 REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
-[[ "$REVIEW_PERMS" == $'Read,Grep,Glob\tBash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch\tdefault' ]] \
+[[ "$REVIEW_PERMS" == $'Read,Grep,Glob\tBash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,Agent,TodoWrite,Skill\tdefault' ]] \
   && ok "review: no shell and no write tool — Read/Grep/Glob allowed, Bash/Edit/Write disallowed, default mode" \
   || note "review: permissions were '$(tr '\t' '|' <<<"$REVIEW_PERMS")'"
 [[ "$(cut -f5 "$WORK/happy/review.log" | sort -u)" == "yes" ]] \
