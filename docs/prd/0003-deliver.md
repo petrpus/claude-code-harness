@@ -1,6 +1,6 @@
 # PRD 0003 — `/deliver`: a Map of issues to merged PRs, one command (0.6.0)
 
-Status: **grilled — issues cut** (see § Slice map) · Date: 2026-09-27
+Status: **grilled — issues cut** (#53–#67; map #68) · Date: 2026-09-27
 ADRs: **new: [0007](../adr/0007-runner-may-merge-model-may-not.md) (runner may merge, model may not — supersedes PRD 0002 contract item 4), [0008](../adr/0008-map-issue-is-the-delivery-contract.md) (Map issue format)** · builds on [0005](../adr/0005-plan-dag-in-implementation-plan.md) (plan grammar reused for the issue graph)
 Glossary: [CONTEXT.md](../../CONTEXT.md). This PRD splits **Slice** (a plan item inside one autopilot run) from **Issue** (one branch, one PR) and adds **Map**, **Delivery run**, **Integration branch**, **Review round**, **Follow-up** and **Parked issue**.
 
@@ -285,21 +285,21 @@ also reports `runner-dead` when the lock PID is gone before a terminal state.
 
 | Id | Issue | Title | Blocked by | Label |
 |---|---|---|---|---|
-| D0a | | loop.sh `--state-dir` + `--stop-file` seams | — | ready-for-agent |
-| D0b | | Iteration gates see the whole iteration; BUILD loses git add/commit | — | ready-for-agent |
-| D0c | | Extract `agent.sh`; fix the loop-test plugin copy | — | ready-for-agent |
-| D0d | | Resume fidelity + `detect_verify_cmd` | — | ready-for-agent |
-| D1 | | Tracer bullet: `deliver.sh --map` → branch → loop.sh → PR → verify → squash merge → tick | D0a | ready-for-agent |
-| D2 | | Park failing issues, skip dependents | D1 | ready-for-agent |
-| D3 | | Independent review in a throwaway worktree (reviewer contract, #52) | D1, D0c | ready-for-agent |
-| D4 | | Review fix rounds + follow-up issues | D2, D3 | ready-for-agent |
-| D5 | | CI wait + base-moved handling | D2 | ready-for-agent |
-| D6 | | State, resume, stop, global caps | D2 | ready-for-agent |
-| D7 | | Final integration → default PR; `--allow-main` / `--create-integration` | D1 | ready-for-agent |
-| D8 | | `/deliver` skill: pre-flight, tmux, Monitor, status/stop/resume | D6, D7 | ready-for-agent |
-| D9 | | MAP-FORMAT + label alignment across to-prd / to-issues / start-feature / implement-issue / next | — | ready-for-agent |
-| D10 | | Docs, glossary, harness-doctor/init for 0.6.0 | D4, D5, D8, D9 | ready-for-agent |
-| D11 | | Release 0.6.0 (**HITL**) | D10 | needs-grill |
+| D0a | #53 | loop.sh `--state-dir` + `--stop-file` seams | — | ready-for-agent |
+| D0b | #54 | Iteration gates see the whole iteration; BUILD loses git add/commit | — | ready-for-agent |
+| D0c | #55 | Extract `agent.sh`; fix the loop-test plugin copy | — | ready-for-agent |
+| D0d | #56 | Resume fidelity + `detect_verify_cmd` | — | ready-for-agent |
+| D1 | #57 | Tracer bullet: `deliver.sh --map` → branch → loop.sh → PR → verify → squash merge → tick | D0a | ready-for-agent |
+| D2 | #58 | Park failing issues, skip dependents | D1 | ready-for-agent |
+| D3 | #59 | Independent review in a throwaway worktree (reviewer contract, #52) | D1, D0c | ready-for-agent |
+| D4 | #63 | Review fix rounds + follow-up issues | D2, D3 | ready-for-agent |
+| D5 | #60 | CI wait + base-moved handling | D2 | ready-for-agent |
+| D6 | #61 | State, resume, stop, global caps | D2 | ready-for-agent |
+| D7 | #62 | Final integration → default PR; `--allow-main` / `--create-integration` | D1 | ready-for-agent |
+| D8 | #65 | `/deliver` skill: pre-flight, tmux, Monitor, status/stop/resume | D6, D7 | ready-for-agent |
+| D9 | #64 | MAP-FORMAT + label alignment across to-prd / to-issues / start-feature / implement-issue / next | D3 (reviewer contract) | ready-for-agent |
+| D10 | #66 | Docs, glossary, harness-doctor/init for 0.6.0 | D4, D5, D8, D9 | ready-for-agent |
+| D11 | #67 | Release 0.6.0 (**HITL**) | D10 | needs-grill |
 
 ## Test strategy
 
