@@ -457,6 +457,12 @@ LOOP_SRC_DIR="$(dirname "$LOOP_ABS")"
 cp "$LOOP_ABS" "$PLUGIN_COPY/skills/autopilot/loop.sh"
 cp "$LOOP_SRC_DIR/plan.sh" "$PLUGIN_COPY/skills/autopilot/plan.sh"
 cp "$LOOP_SRC_DIR/allowlist.sh" "$PLUGIN_COPY/skills/autopilot/allowlist.sh"
+# Every file loop.sh sources must be in the copy: a missing one is sourced
+# with an error the runner does not stop on, and its functions then fail
+# silently — slices.sh was missing here until #55, so tests 10-11 ran the
+# ladder as no-ops.
+cp "$LOOP_SRC_DIR/slices.sh" "$PLUGIN_COPY/skills/autopilot/slices.sh"
+cp "$LOOP_SRC_DIR/agent.sh" "$PLUGIN_COPY/skills/autopilot/agent.sh"
 cp agents/verifier.md "$PLUGIN_COPY/agents/verifier.md"
 COPY_LOOP="$PLUGIN_COPY/skills/autopilot/loop.sh"
 
@@ -1173,6 +1179,46 @@ RC27=$?
 [[ "$RC27" -eq 2 && "$(jq -r '.run_id' "$S27/status.json" 2>/dev/null)" == "$PRIOR27" ]] \
   && ok "--state-dir + --resume-run adopts the run log found in the given dir" \
   || note "--state-dir + --resume-run exited $RC27, run '$(jq -r '.run_id' "$S27/status.json" 2>/dev/null)' — expected 2 and $PRIOR27"
+
+# --- 28. every call's cost reaches the budget, verifier calls included ------
+# The verifier used to be called as `VOUT="$(run_claude ...)"`: the subshell
+# logged its cost to the run log but dropped it from the in-memory total the
+# budget cap and status.json read. A five-slice run is 1 PLAN + 5 BUILD +
+# 5 verifier calls = 11 calls; at $0.10 each the total must be $1.10, not the
+# $0.60 that leaves the verifier out.
+R28="$WORK/r28"; new_repo "$R28"
+( cd "$R28" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_COST_PER_CALL=0.1 \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r28.out" 2>"$WORK/r28.err" )
+RC28=$?
+TOTAL28="$(jq -r '.total_cost_usd' "$R28/tmp/autopilot/status.json" 2>/dev/null)"
+LOGSUM28="$(cat "$R28"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase != "iteration") | .cost_usd // 0] | add')"
+[[ "$RC28" -eq 0 ]] && jq -en --argjson t "${TOTAL28:-0}" '($t - 1.1 | fabs) < 0.0001' >/dev/null 2>&1 \
+  && ok "status.json total cost counts all 11 calls, verifier included (\$$TOTAL28)" \
+  || note "status.json total cost is \$$TOTAL28 (exit $RC28) — expected \$1.1; verifier cost dropped?"
+jq -en --argjson t "${TOTAL28:-0}" --argjson l "${LOGSUM28:-0}" '($t - $l | fabs) < 0.0001' >/dev/null 2>&1 \
+  && ok "the in-memory total equals the run log's per-call sum (\$$LOGSUM28)" \
+  || note "in-memory total \$$TOTAL28 != run log per-call sum \$$LOGSUM28"
+
+# --- 29. --dry-run calls no model and logs no model rows --------------------
+# A preview run must spend nothing and leave the run log as small as before
+# agent.sh: no plan/build/verify_agent rows from calls that never happened.
+R29="$WORK/r29"; new_repo "$R29"
+( cd "$R29" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_CALL_LOG="$WORK/r29.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 --dry-run \
+    >"$WORK/r29.out" 2>"$WORK/r29.err" )
+[[ ! -s "$WORK/r29.calls" ]] \
+  && ok "--dry-run never invokes claude" \
+  || note "--dry-run invoked claude $(wc -l < "$WORK/r29.calls") time(s)"
+PHASES29="$(cat "$R29"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r '.phase' | sort -u | tr '\n' ' ')"
+case " $PHASES29 " in
+  *" plan "*|*" build "*|*" replan "*) note "--dry-run logged model-call rows: $PHASES29" ;;
+  *) ok "--dry-run logs no plan/build/replan rows (phases: ${PHASES29:-none})" ;;
+esac
+[[ "$(cat "$R29"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="verify_agent" and .duration_s > 0)] | length')" -eq 0 ]] \
+  && [[ "$(jq -r '.total_cost_usd' "$R29/tmp/autopilot/status.json" 2>/dev/null)" == "0" ]] \
+  && ok "--dry-run spends \$0 and records no timed verifier call" \
+  || note "--dry-run recorded a cost or a timed verifier call"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

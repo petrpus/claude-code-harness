@@ -690,6 +690,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# agent_run() (skills/autopilot/agent.sh) is the single model-call seam for
+# loop.sh and /deliver. Its contract is "print nothing, leave the answer in
+# AGENT_LAST_*" — the echo-your-answer contract it replaced let loop.sh drop
+# every verifier call's cost in a `$(...)` subshell.
+section "autopilot model-call core (agent.sh)"
+AGENT_DIR="$(mktemp -d)"
+mkdir -p "$AGENT_DIR/bin" "$AGENT_DIR/cwd"
+cat > "$AGENT_DIR/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+pwd > "$AGENT_PWD_FILE"
+printf '%s\n' "$*" > "$AGENT_ARGS_FILE"
+case "${STUB_AGENT_MODE:-ok}" in
+  ok)    printf '{"result":"hi there","total_cost_usd":0.25,"num_turns":2,"usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":5}}\n' ;;
+  fail)  echo "not json at all"; exit 3 ;;
+  sleep) sleep 5 ;;
+esac
+STUB
+chmod +x "$AGENT_DIR/bin/claude"
+AGENT_REPO="$(pwd)"
+AGENT_OUT="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_PWD_FILE="$AGENT_DIR/pwd" AGENT_ARGS_FILE="$AGENT_DIR/args" bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  AGENT_MAX_TURNS=7
+  agent_run build sonnet "Read,Grep" acceptEdits "the prompt" "$2/cwd" > "$2/stdout"; rc=$?
+  cp "$2/args" "$2/args.first" 2>/dev/null; cp "$2/pwd" "$2/pwd.first" 2>/dev/null
+  printf "%s|%s|%s|%s|%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$AGENT_LAST_COST" "$AGENT_LAST_IN_TOKENS" \
+    "$AGENT_LAST_OUT_TOKENS" "$AGENT_LAST_TURNS" "$AGENT_LAST_CACHE_READ"
+  STUB_AGENT_MODE=fail agent_run build sonnet "Read" acceptEdits "p"; rc=$?
+  printf "%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$AGENT_LAST_COST"
+  AGENT_TIMEOUT=1 STUB_AGENT_MODE=sleep agent_run build sonnet "Read" acceptEdits "p"; echo "$?"
+  rm -f "$2/args"; AGENT_DRY_RUN=1 agent_run plan opus "Read" acceptEdits "p" 2>/dev/null; rc=$?
+  printf "%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$([[ -f "$2/args" ]] && echo called || echo not-called)"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+AGENT_L1="$(sed -n 1p <<<"$AGENT_OUT")"; AGENT_L2="$(sed -n 2p <<<"$AGENT_OUT")"
+AGENT_L3="$(sed -n 3p <<<"$AGENT_OUT")"; AGENT_L4="$(sed -n 4p <<<"$AGENT_OUT")"
+AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
+[[ "$AGENT_L1" == "0|hi there|0.25|3|4|2|5" ]] \
+  && ok "agent_run parses result, cost, tokens, turns and cache reads into AGENT_LAST_*" \
+  || note "agent_run globals wrong: '$AGENT_L1'"
+[[ ! -s "$AGENT_DIR/stdout" ]] \
+  && ok "agent_run prints nothing (callers read AGENT_LAST_RESULT, never \$(...))" \
+  || note "agent_run wrote to stdout: $(head -c 80 "$AGENT_DIR/stdout")"
+[[ "$(cat "$AGENT_DIR/pwd.first" 2>/dev/null)" == "$AGENT_DIR/cwd" ]] \
+  && ok "agent_run runs claude in the given cwd" \
+  || note "agent_run cwd was '$(cat "$AGENT_DIR/pwd" 2>/dev/null)'"
+[[ "$AGENT_ARGS_FIRST" == *"--max-turns 7"* && "$AGENT_ARGS_FIRST" == *"--model sonnet"* && "$AGENT_ARGS_FIRST" == *"--allowedTools Read,Grep"* ]] \
+  && ok "agent_run passes model, allowlist and AGENT_MAX_TURNS through" \
+  || note "agent_run args were: '$AGENT_ARGS_FIRST'"
+[[ "$AGENT_L2" == "3||0" ]] \
+  && ok "a failing call returns its exit code with empty result and zero cost" \
+  || note "failing call: '$AGENT_L2' — expected '3||0'"
+[[ "$AGENT_L3" == "124" ]] \
+  && ok "AGENT_TIMEOUT bounds a hung call (exit 124)" \
+  || note "hung call returned '$AGENT_L3', expected 124"
+[[ "$AGENT_L4" == "0|dry-run|not-called" ]] \
+  && ok "AGENT_DRY_RUN returns a zero-cost dry-run result without calling claude" \
+  || note "dry run: '$AGENT_L4'"
+rm -rf "$AGENT_DIR"
+
+# ---------------------------------------------------------------------------
 section "code-map renders repo-map"
 CODE_MAP_SKILL="skills/code-map/SKILL.md"
 if [[ -f "$CODE_MAP_SKILL" ]]; then

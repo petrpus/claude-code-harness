@@ -365,6 +365,13 @@ with write access is a safety and consistency hole. The loop never uses
 `--dangerously-skip-permissions`; plugin hooks fire in headless mode, so
 push-from-main and `.env`/secret guards stay live.
 
+Every call — PLAN, BUILD, replan, the verifier — goes through `agent_run()` in
+`agent.sh`, the single model-call seam shared with `/deliver` (and the one a
+second backend would plug into, #42). It prints nothing and leaves the answer
+and its cost in `AGENT_LAST_*`, so no caller can drop a call's cost by
+capturing its output in a `$(...)` subshell — the way the verifier's cost used
+to go missing from the budget.
+
 ## Caps & stuck detection
 
 - `--max-iterations` (default 10), `--max-minutes` (120), `--budget-usd` (10).
@@ -402,7 +409,7 @@ Per-call row:
 ```
 
 `runner_reload` (R1) is logged once, immediately before the `exec` that
-re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — it costs nothing and
+re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh` — it costs nothing and
 carries no tokens, but marks exactly where a run's identity carried across a
 process replacement, which matters when reading `iter` back out as a
 monotonic sequence.
@@ -508,6 +515,6 @@ a new run at iteration 0 / cost 0 — a missing log behaves like a fresh run
 you `git reset` to any clean point. On abort, `FEEDBACK.md` holds the last
 failure for a human to read.
 
-A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`
+A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh`
 does not need a manual restart at all — see Runner self-reload (R1) above; it
 re-execs itself under the same run id automatically.

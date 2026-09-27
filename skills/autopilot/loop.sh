@@ -116,6 +116,12 @@ LOCK_FILE="$STATE_DIR/lock"
 # loop.sh, never named in any prompt (skills/autopilot/slices.sh).
 SLICES_FILE="$STATE_DIR/slices.json"
 
+# agent_run() knobs (agent.sh), from this run's flags.
+AGENT_TIMEOUT="$PER_CALL_TIMEOUT"
+AGENT_MAX_TURNS="$MAX_TURNS"
+AGENT_DRY_RUN="$DRY_RUN"
+AGENT_STDERR_LOG="$STATE_DIR/claude-stderr.log"
+
 # Every checkpoint is `git add -A`, so a state dir git does not ignore would
 # commit the run's own charter, plan, logs and lock into the branch under
 # work. A dir outside the repo is git's business not at all (check-ignore
@@ -163,9 +169,12 @@ fi
 # file, same reasoning as plan.sh/allowlist.sh.
 # shellcheck source=slices.sh
 . "$SCRIPT_DIR/slices.sh"
+# The model-call core (claude -p + timeout + JSON parse), shared with /deliver.
+# shellcheck source=agent.sh
+. "$SCRIPT_DIR/agent.sh"
 
 # R1: bash parses this script's function bodies once, at startup — a slice
-# whose job is to fix loop.sh/plan.sh/allowlist.sh/slices.sh therefore never
+# whose job is to fix loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh therefore never
 # changes the behaviour of the very process running it, only the next run a
 # human starts by hand. runner_files_hash() lets each iteration notice its own
 # sourced files changed on disk since startup and re-exec itself (see the
@@ -174,7 +183,7 @@ fi
 # a clock skew — never triggers a spurious reload.
 runner_files_hash() {
   local f
-  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh" "$SCRIPT_DIR/slices.sh"; do
+  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh" "$SCRIPT_DIR/slices.sh" "$SCRIPT_DIR/agent.sh"; do
       [[ -f "$f" ]] && cat "$f"
     done
   } | cksum
@@ -214,7 +223,7 @@ mkdir -p "$STATE_DIR"
 
 # Run identity: fresh, resumed (--resume-run — a human restarting a killed or
 # stopped process), or reloaded (R1 — this exact process re-exec'ing itself
-# after a slice edited loop.sh/plan.sh/allowlist.sh/slices.sh; the AUTOPILOT_* vars are
+# after a slice edited loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh; the AUTOPILOT_* vars are
 # its own handoff to itself, set right before the exec at the top of the main
 # loop below). A reload always wins when both are present, since it also
 # appends --resume-run to argv.
@@ -361,37 +370,24 @@ write_status() { # state
      > "$STATUS_FILE" 2>/dev/null || true
 }
 
-# Run a claude -p call under a wall-clock timeout, capture JSON, accumulate cost.
-# Echoes the assistant result text on stdout; returns claude's exit code.
+# Every model call goes through agent_run() (agent.sh); this wrapper adds the
+# loop's own bookkeeping — the run's cost total and one run-log row. Like
+# agent_run it prints nothing: callers read AGENT_LAST_RESULT, never
+# `$(run_claude ...)`, whose subshell would drop the cost it just added.
 run_claude() { # phase model allowed_tools permission_mode prompt_text
-  local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5"
-  local t0 t1 dur out cost intok outtok rc turns cache_read cache_creation
-  t0="$(now_epoch)"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
-    echo '{"result":"dry-run","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}'
-    return 0
-  fi
-  out="$(timeout "$PER_CALL_TIMEOUT" claude -p "$prompt" \
-          --model "$model" --output-format json \
-          --permission-mode "$perm" --allowedTools "$allowed" \
-          --max-turns "$MAX_TURNS" 2>>"$STATE_DIR/claude-stderr.log")"
-  rc=$?
-  t1="$(now_epoch)"; dur=$(( t1 - t0 ))
-  cost="$(printf '%s' "$out" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)"
-  intok="$(printf '%s' "$out" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)"
-  outtok="$(printf '%s' "$out" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)"
-  # S3A: still --output-format json (never stream-json), just two more `.usage`
-  # reads. num_turns and the cache fields are absent from a plain "ok"/dry-run
-  # stub result, hence the `// 0` defaults — never a hard requirement on shape.
-  turns="$(printf '%s' "$out" | jq -r '.num_turns // 0' 2>/dev/null || echo 0)"
-  cache_read="$(printf '%s' "$out" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)"
-  cache_creation="$(printf '%s' "$out" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)"
-  TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${cost:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
-  logline "$phase" "$model" "$dur" "${cost:-0}" "${intok:-0}" "${outtok:-0}" "$rc" "" 0 \
-    "${turns:-0}" "${cache_read:-0}" "${cache_creation:-0}"
-  printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null || echo ""
-  return $rc
+  local phase="$1" model="$2" rc
+  agent_run "$@"; rc=$?
+  # A dry run makes no call: nothing was spent and nothing belongs in the run
+  # log (the pre-agent.sh contract — a preview run's log stays as small as it
+  # always was).
+  [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]] && return "$rc"
+  TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${AGENT_LAST_COST:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
+  # S3A: num_turns and the cache fields are absent from a plain "ok"/dry-run
+  # stub result; agent_run reads them as 0 — never a hard requirement on shape.
+  logline "$phase" "$model" "$AGENT_LAST_DURATION" "${AGENT_LAST_COST:-0}" \
+    "${AGENT_LAST_IN_TOKENS:-0}" "${AGENT_LAST_OUT_TOKENS:-0}" "$rc" "" 0 \
+    "${AGENT_LAST_TURNS:-0}" "${AGENT_LAST_CACHE_READ:-0}" "${AGENT_LAST_CACHE_CREATION:-0}"
+  return "$rc"
 }
 
 over_budget() { jq -en --argjson c "$TOTAL_COST" --argjson b "$BUDGET_USD" '$c >= $b' >/dev/null 2>&1; }
@@ -705,7 +701,7 @@ while :; do
   # iteration — the new process computes its own baseline hash at startup, so
   # an unchanged file can never spin.
   if [[ "$(runner_files_hash)" != "$STARTUP_RUNNER_HASH" ]]; then
-    log_err "loop.sh/plan.sh/allowlist.sh/slices.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
+    log_err "loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
     logline "runner_reload" "-" 0 0 0 0 0 "reload"
     write_status "reloading"
     AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
@@ -912,7 +908,8 @@ while :; do
     holdout_notice_once
     HOLDOUT_CONTENT="$(holdout_content)"
     VERIFY_PROMPT_TEXT="$(verify_prompt "$HOLDOUT_CONTENT")"
-    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
+    run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT"
+    VOUT="$AGENT_LAST_RESULT"
     VERDICT="$(parse_verdict "$VOUT")"
     if [[ "$VERDICT" == "no_verdict" ]]; then
       # R2: a verifier that declined to judge (refusal, clarifying question,
@@ -921,7 +918,8 @@ while :; do
       # one retry: if it's also inconclusive, the gate itself is broken and
       # that becomes the (still-blocking) failure below.
       log_err "verifier returned no verdict — retrying once against the same diff."
-      VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
+      run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT"
+      VOUT="$AGENT_LAST_RESULT"
       VERDICT="$(parse_verdict "$VOUT")"
     fi
     HOLDOUT_FAILED_IDS="$(parse_holdout_ids "$VOUT")"
