@@ -37,6 +37,8 @@ agent_run() {
     rc=0
   else
     out="$(
+      # 125: "could not even start the command" (the xargs/env convention),
+      # so an unusable cwd is told apart from anything claude itself returns.
       if [[ -n "$cwd" ]]; then cd "$cwd" || exit 125; fi
       timeout "${AGENT_TIMEOUT:-1200}" claude -p "$prompt" \
         --model "$model" --output-format json \

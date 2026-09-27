@@ -1200,6 +1200,26 @@ jq -en --argjson t "${TOTAL28:-0}" --argjson l "${LOGSUM28:-0}" '($t - $l | fabs
   && ok "the in-memory total equals the run log's per-call sum (\$$LOGSUM28)" \
   || note "in-memory total \$$TOTAL28 != run log per-call sum \$$LOGSUM28"
 
+# --- 29. --dry-run calls no model and logs no model rows --------------------
+# A preview run must spend nothing and leave the run log as small as before
+# agent.sh: no plan/build/verify_agent rows from calls that never happened.
+R29="$WORK/r29"; new_repo "$R29"
+( cd "$R29" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_CALL_LOG="$WORK/r29.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 --dry-run \
+    >"$WORK/r29.out" 2>"$WORK/r29.err" )
+[[ ! -s "$WORK/r29.calls" ]] \
+  && ok "--dry-run never invokes claude" \
+  || note "--dry-run invoked claude $(wc -l < "$WORK/r29.calls") time(s)"
+PHASES29="$(cat "$R29"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r '.phase' | sort -u | tr '\n' ' ')"
+case " $PHASES29 " in
+  *" plan "*|*" build "*|*" replan "*) note "--dry-run logged model-call rows: $PHASES29" ;;
+  *) ok "--dry-run logs no plan/build/replan rows (phases: ${PHASES29:-none})" ;;
+esac
+[[ "$(cat "$R29"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="verify_agent" and .duration_s > 0)] | length')" -eq 0 ]] \
+  && [[ "$(jq -r '.total_cost_usd' "$R29/tmp/autopilot/status.json" 2>/dev/null)" == "0" ]] \
+  && ok "--dry-run spends \$0 and records no timed verifier call" \
+  || note "--dry-run recorded a cost or a timed verifier call"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "test-autopilot-loop: PASS"

@@ -377,6 +377,10 @@ write_status() { # state
 run_claude() { # phase model allowed_tools permission_mode prompt_text
   local phase="$1" model="$2" rc
   agent_run "$@"; rc=$?
+  # A dry run makes no call: nothing was spent and nothing belongs in the run
+  # log (the pre-agent.sh contract — a preview run's log stays as small as it
+  # always was).
+  [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]] && return "$rc"
   TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${AGENT_LAST_COST:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
   # S3A: num_turns and the cache fields are absent from a plain "ok"/dry-run
   # stub result; agent_run reads them as 0 — never a hard requirement on shape.
