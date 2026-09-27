@@ -24,6 +24,8 @@
 #      failing open *silently*.
 #   7. scripts/test-autopilot-loop.sh — drives loop.sh end-to-end against a
 #      stub `claude`, so the runner's gating decisions are exercised for free.
+#      scripts/test-deliver.sh does the same for skills/deliver/deliver.sh,
+#      against a bare git remote and a fake `gh`.
 #   8. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
@@ -356,6 +358,21 @@ if [[ -f scripts/test-autopilot-loop.sh ]]; then
   fi
 else
   note "scripts/test-autopilot-loop.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# /deliver holds every forge operation (ADR-0007), so its tests run against a
+# bare git remote and a fake gh — offline, and asserting on the commands the
+# runner actually ran (no force push, no --admin, merges pinned to a head).
+section "deliver runner (map → PR → merge)"
+if [[ -f scripts/test-deliver.sh ]]; then
+  if bash scripts/test-deliver.sh; then
+    ok "deliver runner passed"
+  else
+    note "deliver runner failed (see above)"
+  fi
+else
+  note "scripts/test-deliver.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------
