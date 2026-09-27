@@ -52,18 +52,25 @@ review_snapshot() {
   return 0
 }
 
+# md_tilde_fence — stdin text; prints a tilde fence one longer than any
+# tilde run that could open or close a fence inside it (optionally after a
+# diff's +/-/space marker and up to three spaces of indent), never shorter
+# than five. Backtick fences collide with every Markdown file that has code
+# blocks; a fixed tilde fence with any text that happens to use one.
+md_tilde_fence() {
+  local longest
+  longest="$(grep -oE '^[+ -]?[ ]{0,3}~+' | tr -cd '~\n' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+  (( longest < 4 )) && longest=4
+  printf '%*s' $(( longest + 1 )) '' | tr ' ' '~'
+}
+
 # review_diff <base_sha> <head_sha> — commits, stat and the diff itself,
 # the diff cut at REVIEW_MAX_DIFF_BYTES with a note (the full head is in the
 # reviewer's working directory to Read).
 review_diff() {
-  local base="$1" head="$2" diff bytes fence longest
+  local base="$1" head="$2" diff bytes fence
   diff="$(git diff "$base...$head" 2>/dev/null)"
-  # Fence with tildes, one longer than any tilde run that opens a line of the
-  # diff: backtick fences collide with every Markdown file that has code
-  # blocks, and a fixed tilde fence with any diff that happens to use one.
-  longest="$(printf '%s\n' "$diff" | grep -oE '^[+ -]?~+' | tr -d '+ -' | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
-  (( longest < 4 )) && longest=4
-  fence="$(printf '%*s' $(( longest + 1 )) '' | tr ' ' '~')"
+  fence="$(printf '%s\n' "$diff" | md_tilde_fence)"
   echo "### Commits"; echo
   git log --format='- %h %s' "$base..$head" 2>/dev/null
   echo; echo "### Diff stat"; echo; echo "$fence"
