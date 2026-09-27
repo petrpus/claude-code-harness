@@ -274,8 +274,21 @@ case "$cmd" in
     f="$S/issues/$1.json"; [[ -f "$f" ]] || { echo "no issue $1" >&2; exit 1; }
     cat "$f" ;;
   "issue edit")
-    f="$S/issues/$1.json"; b="$(arg --body-file "$@")" || exit 64
-    jq --rawfile body "$b" '.body = $body' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+    f="$S/issues/$1.json"; [[ -f "$f" ]] || exit 1
+    if b="$(arg --body-file "$@")"; then
+      jq --rawfile body "$b" '.body = $body' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    elif l="$(arg --add-label "$@")"; then
+      grep -qx "$l" "$S/labels" 2>/dev/null || { echo "could not add label: '$l' not found" >&2; exit 1; }
+      jq --arg l "$l" '.labels = ((.labels // []) | map(select(.name != $l)) + [{name:$l}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    elif l="$(arg --remove-label "$@")"; then
+      jq --arg l "$l" '.labels = ((.labels // []) | map(select(.name != $l)))' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    else exit 64; fi ;;
+  "label create")
+    grep -qx "$1" "$S/labels" 2>/dev/null && { echo "label already exists" >&2; exit 1; }
+    echo "$1" >> "$S/labels" ;;
+  "pr ready")
+    f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; has --undo "$@" || exit 64
+    jq '.isDraft = true' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   "issue comment")
     f="$S/issues/$1.json"; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -377,8 +390,8 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
-    if [[ "${STUB_MODE:-progress}" == "progress" ]]; then
-      n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
+    n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
+    if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
       mkdir -p work && echo "issue $n slice $sel" >> "work/issue-$n.txt"
       awk -v id="$sel" 'BEGIN{d=0} { if (!d && $0 ~ ("^- \\[ \\] " id "([[:space:]]|$)")) { sub(/^- \[ \]/, "- [x]"); d=1 } print }' \
@@ -396,7 +409,7 @@ chmod +x "$BIN/claude"
 #   integration/x, a clone on integration/x, and a fake-gh store holding
 #   issues #1 (feature), #2 (bug, after #1) and map #3.
 new_fixture() {
-  local d="$WORK/$1"
+  local d="$WORK/$1" with4="${2:-}"
   mkdir -p "$d/gh/issues" "$d/state"
   git init -q --bare --initial-branch=main "$d/remote.git"
   git clone -q "$d/remote.git" "$d/repo" 2>/dev/null
@@ -419,6 +432,16 @@ new_fixture() {
   jq -n --rawfile body <(printf '<!-- deliver:map v1 -->\nTest map.\n\n## Delivery\n- [ ] #2 Second thing (after: #1)\n- [ ] #1 feat(a): first feature\n\n## Notes\nnothing\n') \
      '{number:3,title:"Map: test",url:"https://github.com/o/r/issues/3",state:"OPEN",labels:[{name:"map"}],comments:[],body:$body}' \
      > "$d/gh/issues/3.json"
+  printf 'map\nready-for-agent\nbug\n' > "$d/gh/labels"
+  if [[ "$with4" == "with4" ]]; then
+    # #4 is independent of #1/#2 — it must still merge when #1 is parked.
+    jq -n '{number:4,title:"Independent thing",url:"https://github.com/o/r/issues/4",state:"OPEN",
+            labels:[{name:"ready-for-agent"}],comments:[],
+            body:"## What to build\nAn unrelated thing.\n\n## Acceptance criteria\n- [ ] it works"}' \
+       > "$d/gh/issues/4.json"
+    jq '.body |= sub("## Notes"; "- [ ] #4 feat: independent thing\n\n## Notes")' "$d/gh/issues/3.json" > "$d/x" \
+      && mv "$d/x" "$d/gh/issues/3.json"
+  fi
 }
 
 # run_deliver <name> [extra env as VAR=value...] -- [deliver args...]
@@ -596,39 +619,77 @@ RC=$?
   && ok "a Map edited mid-run into a duplicate line stops with a validation error" \
   || note "mid-run invalid Map: exit $RC, err: $(tail -1 "$WORK/midedit/err")"
 
-# --- an issue that does not finish stops the run, nothing is opened -----------
-new_fixture stall
-run_deliver stall STUB_MODE=stall -- --issue-max-iterations 2
-RC=$?
-S="$WORK/stall"
-[[ "$RC" -eq 1 ]] && ! grep -q '^pr create' "$S/gh/calls" \
-  && [[ "$(jq -r .body "$S/gh/issues/3.json")" != *"[x]"* ]] \
-  && ok "an issue whose autopilot run does not finish stops the run: no PR, nothing ticked" \
-  || note "stalled issue: exit $RC, calls: $(grep -c . "$S/gh/calls")"
-[[ "$(git -C "$S/remote.git" rev-parse integration/x)" == "$(git -C "$S/remote.git" rev-parse main)" ]] \
-  && ok "a stopped run leaves integration/x untouched" || note "stalled run moved integration/x"
-
-# --- review verdicts that hold a PR (#59) --------------------------------------
-# held <name> <what> — the run stopped at #1 with PR #4 open and unmerged,
-# nothing ticked and integration/x untouched.
+# parked_one <name> — issue #1 is parked: labelled needs-human (and no longer
+# ready-for-agent), one comment saying it was parked, the Map unticked.
+parked_one() {
+  local d="$WORK/$1"
+  [[ "$(jq -r '[.labels[].name] | sort | join(",")' "$d/gh/issues/1.json")" == "needs-human" ]] \
+    && jq -r '.comments[-1].body' "$d/gh/issues/1.json" | grep -q '^\*\*Parked by `/deliver`\*\*' \
+    && [[ "$(jq -r .body "$d/gh/issues/3.json")" == *"- [ ] #1 "* ]]
+}
+# held <name> — #1 got as far as PR #4, which is now a draft, unmerged; #1 is
+# parked, #2 (after #1) was skipped, integration/x is untouched, and the
+# checkout is back on integration/x, clean.
 held() {
   local d="$WORK/$1"
   [[ "$(jq -r .state "$d/gh/prs/4.json" 2>/dev/null)" == "OPEN" ]] \
+    && [[ "$(jq -r .isDraft "$d/gh/prs/4.json" 2>/dev/null)" == "true" ]] \
     && ! grep -q '^pr merge' "$d/gh/calls" \
-    && [[ "$(jq -r .body "$d/gh/issues/3.json")" != *"[x]"* ]] \
-    && [[ "$(git -C "$d/remote.git" rev-parse integration/x)" == "$(git -C "$d/remote.git" rev-parse main)" ]]
+    && parked_one "$1" \
+    && [[ ! -f "$d/gh/prs/5.json" ]] \
+    && [[ "$(git -C "$d/remote.git" rev-parse integration/x)" == "$(git -C "$d/remote.git" rev-parse main)" ]] \
+    && [[ "$(git -C "$d/repo" branch --show-current)" == "integration/x" && -z "$(git -C "$d/repo" status --porcelain)" ]]
 }
+
+# --- parking (#58): an issue that does not finish is set aside ----------------
+# #1 stalls in autopilot; #2 waits on #1; #4 is independent. #1 is parked,
+# #2 skipped, #4 still delivered — and the run says so with exit 2.
+new_fixture park with4
+run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+RC=$?
+P="$WORK/park"
+[[ "$RC" -eq 2 ]] && ok "park: a stalled issue parks, the run carries on and ends partial (exit 2)" \
+  || note "park: exit $RC — $(tail -2 "$P/err" | tr '\n' '|')"
+parked_one park && ! grep -q '^pr create.*--head feat/1-' "$P/gh/calls" \
+  && jq -r '.comments[-1].body' "$P/gh/issues/1.json" | grep -q "autopilot ended 'stuck'\|autopilot ended 'iteration-cap'" \
+  && jq -r '.comments[-1].body' "$P/gh/issues/1.json" | grep -q 'Autopilot: state `' \
+  && ok "park: #1 is labelled needs-human (ready-for-agent removed), commented with the cause and autopilot's state, no PR" \
+  || note "park: #1 labels=$(jq -c '[.labels[].name]' "$P/gh/issues/1.json") comment=$(jq -r '.comments[-1].body' "$P/gh/issues/1.json" | head -1)"
+grep -qx 'needs-human' "$P/gh/labels" \
+  && ok "park: the needs-human label is created when the repo lacks it" || note "park: needs-human label not created"
+MAPB="$(jq -r .body "$P/gh/issues/3.json")"
+[[ "$MAPB" == *"- [ ] #1 "* && "$MAPB" == *"- [ ] #2 "* && "$MAPB" == *"- [x] #4 "* ]] \
+  && [[ "$(git -C "$P/remote.git" log --format=%s main..integration/x)" == "feat: independent thing (#5)" ]] \
+  && ok "park: #2 (after #1) is skipped, independent #4 is still delivered — one commit on integration/x" \
+  || note "park: map=$(printf '%s' "$MAPB" | grep '#' | tr '\n' '|') log=$(git -C "$P/remote.git" log --format=%s main..integration/x | tr '\n' '|')"
+grep -q 'parked: #1' "$P/err" && grep -q 'skipped (blocked by a parked issue): #2' "$P/err" \
+  && ok "park: the run's summary names what was parked and what was skipped" \
+  || note "park: summary line missing: $(tail -1 "$P/err")"
+[[ "$(git -C "$P/repo" branch --show-current)" == "integration/x" && -z "$(git -C "$P/repo" status --porcelain)" ]] \
+  && git -C "$P/repo" rev-parse --verify -q refs/heads/feat/1-first-feature >/dev/null \
+  && ok "park: the checkout ends clean on integration/x; the parked issue's branch is kept for a human" \
+  || note "park: checkout on '$(git -C "$P/repo" branch --show-current)' or branch feat/1-first-feature gone"
+
+# An existing needs-human label is used as is, not an error.
+new_fixture park2
+echo needs-human >> "$WORK/park2/gh/labels"
+run_deliver park2 STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+RC=$?
+[[ "$RC" -eq 2 ]] && parked_one park2 \
+  && ok "park: a repo that already has needs-human parks the same way" || note "park with existing label: exit $RC"
+
+# --- review verdicts that hold a PR (#59) — the issue is parked (#58) ----------
 new_fixture rvblock
 run_deliver rvblock STUB_REVIEW=blocker
 RC=$?
-[[ "$RC" -eq 1 ]] && held rvblock && jq -r '.comments[0].body' "$WORK/rvblock/gh/prs/4.json" | grep -q 'Runner verdict: changes_requested' \
-  && ok "review: an in-scope blocker holds the PR open, posts the review, merges nothing" \
+[[ "$RC" -eq 2 ]] && held rvblock && jq -r '.comments[0].body' "$WORK/rvblock/gh/prs/4.json" | grep -q 'Runner verdict: changes_requested' \
+  && ok "review: an in-scope blocker parks the issue — PR back to draft, review posted, nothing merged, #2 skipped (exit 2)" \
   || note "review blocker: exit $RC"
 
 new_fixture rvliar
 run_deliver rvliar STUB_REVIEW=liar
 RC=$?
-[[ "$RC" -eq 1 ]] && held rvliar \
+[[ "$RC" -eq 2 ]] && held rvliar \
   && jq -r '.comments[0].body' "$WORK/rvliar/gh/prs/4.json" | grep -qF '**Runner verdict: changes_requested** (reviewer said: approve)' \
   && ok "review: 'approve' with an in-scope issue is overruled by the runner" \
   || note "review liar: exit $RC"
@@ -643,9 +704,9 @@ RC=$?
 new_fixture rvgarbage
 run_deliver rvgarbage STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log"
 RC=$?
-[[ "$RC" -eq 1 ]] && held rvgarbage && [[ "$(grep -c . "$WORK/rvgarbage/review.log")" -eq 2 ]] \
+[[ "$RC" -eq 2 ]] && held rvgarbage && [[ "$(grep -c . "$WORK/rvgarbage/review.log")" -eq 2 ]] \
   && jq -r '.comments[0].body' "$WORK/rvgarbage/gh/prs/4.json" | grep -q 'Runner verdict: no verdict' \
-  && ok "review: no usable verdict is retried once, then holds the PR (fail closed)" \
+  && ok "review: no usable verdict is retried once, then parks the issue (fail closed)" \
   || note "review garbage: exit $RC, calls $(grep -c . "$WORK/rvgarbage/review.log" 2>/dev/null)"
 
 new_fixture rvretry
@@ -682,16 +743,19 @@ RC=$?
 new_fixture rvwronghead
 run_deliver rvwronghead STUB_REVIEW=wrong-head
 RC=$?
-[[ "$RC" -eq 1 ]] && held rvwronghead \
-  && ok "review: a verdict for a different head is no verdict (held)" \
+[[ "$RC" -eq 2 ]] && held rvwronghead \
+  && ok "review: a verdict for a different head is no verdict (parked)" \
   || note "review wrong-head: exit $RC"
 
-# --- a merge refused by the forge stops the run -------------------------------
+# --- a merge refused by the forge parks the issue -----------------------------
 new_fixture refused
 run_deliver refused FAKE_GH_MERGE_FAIL=1
 RC=$?
-[[ "$RC" -eq 1 ]] && grep -q "merge of PR #4 refused" "$WORK/refused/err" \
-  && [[ "$(jq -r .body "$WORK/refused/gh/issues/3.json")" != *"[x]"* ]] \
-  && ok "a refused merge stops the run and ticks nothing" || note "refused merge: exit $RC"
+R="$WORK/refused"
+[[ "$RC" -eq 2 ]] && parked_one refused && [[ "$(jq -r .isDraft "$R/gh/prs/4.json")" == "true" ]] \
+  && [[ "$(git -C "$R/remote.git" rev-parse integration/x)" == "$(git -C "$R/remote.git" rev-parse main)" ]] \
+  && jq -r '.comments[-1].body' "$WORK/refused/gh/issues/1.json" | grep -q 'the forge refused to merge PR #4' \
+  && ok "a merge refused by the forge parks the issue (PR back to draft, reason in the comment)" \
+  || note "refused merge: exit $RC"
 
 finish

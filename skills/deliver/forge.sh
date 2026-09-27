@@ -68,6 +68,19 @@ forge_pr_merge() {
 # refuses to let an author approve or request changes on their own PR.
 forge_pr_comment() { gh pr comment "$1" --body-file "$2" >/dev/null; }
 
+# forge_label_ensure <name> <color> <description> — create the label if the
+# repo lacks it (gh refuses to add a label that does not exist). An existing
+# label is left exactly as the repo has it.
+forge_label_ensure() {
+  gh label create "$1" --color "$2" --description "$3" >/dev/null 2>&1 || true
+}
+forge_issue_add_label()    { gh issue edit "$1" --add-label "$2" >/dev/null; }    # <number> <label>
+forge_issue_remove_label() { gh issue edit "$1" --remove-label "$2" >/dev/null; } # <number> <label>
+
+# forge_pr_draft <pr> — back to draft: a parked issue's PR must not look
+# ready to merge to a human skimming the PR list.
+forge_pr_draft() { gh pr ready "$1" --undo >/dev/null; }
+
 # forge_pr_state <pr>  — OPEN | MERGED | CLOSED
 forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'

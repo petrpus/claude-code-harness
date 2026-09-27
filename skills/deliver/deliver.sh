@@ -5,10 +5,13 @@
 # blocking-edge order. docs/prd/0003-deliver.md, ADR-0007, ADR-0008.
 #
 # Every issue PR gets an independent review (agents/code-reviewer.md, in a
-# throwaway worktree, #59) before it may merge. Not built yet: fix rounds,
-# parking, CI wait, resume, the /deliver launcher — so a review that requests
-# changes, like any other failure, stops the run where it is, with the PR open
-# and the issue branch checked out for a human.
+# throwaway worktree, #59) before it may merge. An issue that cannot get there
+# — autopilot did not finish, verify failed on its head, the review held it,
+# the forge refused the merge — is PARKED (#58): labelled needs-human, its PR
+# back to draft, a comment saying why; issues that depend on it are skipped
+# and independent ones continue. A failure of the machinery itself (the forge
+# unreachable, a dirty checkout, a review that touched the checkout) ends the
+# run instead. Not built yet: fix rounds, CI wait, resume, the launcher.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
@@ -17,7 +20,8 @@
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
-# 1 precondition failure, or an issue that did not make it to a merge.
+# 1 precondition or runner failure · 2 partial (an issue was parked; its
+# dependents were skipped).
 
 set -uo pipefail
 
@@ -145,6 +149,10 @@ deliver_logline() {
 MAP_BODY="$RUN_DIR/map.body.md"
 MAP_PLAN="$RUN_DIR/map.plan.md"
 MERGED=()   # issue numbers merged by this run
+PARKED=()   # issue refs (#N) parked by this run
+PARK_REASON=""   # set by deliver_issue before it returns 10
+CUR_PR=""        # the PR of the issue in flight, once opened
+CUR_BRANCH=""    # its branch, once created
 
 # refresh_map — re-read the Map from the forge (the source of truth: a human
 # may tick a line by hand mid-run) and re-apply this run's own merges, so a
@@ -184,8 +192,9 @@ tick_map() {
 
 # ---------------------------------------------------------------------------
 # Independent review of one PR head (review.sh). Returns 0 when the runner's
-# verdict is approve, 1 otherwise; a checkout changed by the review is not an
-# issue failure but a broken safety property, and ends the whole run.
+# verdict is approve, 10 (park) when the review holds the PR, 1 when the
+# review could not run; a checkout changed by the review is not an issue
+# failure but a broken safety property, and ends the whole run.
 # ---------------------------------------------------------------------------
 review_issue() {
   local n="$1" pr="$2" base_sha="$3" head_sha="$4" dir="$5"
@@ -208,8 +217,8 @@ review_issue() {
          fi
          review_comment "$n" "$round" "$head_sha" "$out.md" "" > "$comment"
          forge_pr_comment "$pr" "$comment" || true
-         log "#$n: no usable review verdict twice — stopping (PR #$pr stays open)."
-         return 1 ;;
+         PARK_REASON="the reviewer returned no usable verdict twice (PR #$pr)"
+         return 10 ;;
       3) deliver_logline review "$n" "$round" breach
          die "#$n: SAFETY BREACH — the checkout changed during the review of PR #$pr: $(tr '\n' ' ' < "$out.breach"). Stopping the run; nothing further is pushed or merged." ;;
       *) log "#$n: could not create the review worktree — stopping."; return 1 ;;
@@ -219,8 +228,8 @@ review_issue() {
   forge_pr_comment "$pr" "$comment" || log "#$n: could not post the review on PR #$pr (continuing)"
   verdict="$(jq -r '.verdict' "$out.json")"
   if [[ "$verdict" != "approve" ]]; then
-    log "#$n: review requests changes on PR #$pr — stopping (fix rounds arrive with #63). Findings: $out.json"
-    return 1
+    PARK_REASON="the review requests changes on PR #$pr (fix rounds arrive with #63)"
+    return 10
   fi
   log "#$n: review approved PR #$pr"
   return 0
@@ -229,6 +238,7 @@ review_issue() {
 # ---------------------------------------------------------------------------
 # One issue: branch → autopilot → push → PR → review → verify → merge → tick.
 # ---------------------------------------------------------------------------
+# Returns 0 merged, 10 park (PARK_REASON says why), 1 end the run.
 deliver_issue() {
   local id="$1" n dir line map_title issue_title labels state title branch
   local pr head_sha status_state iters cost merged_sha
@@ -255,7 +265,9 @@ deliver_issue() {
     return 1
   fi
   log "#$n: $title → $branch"
+  CUR_PR=""; CUR_BRANCH=""
   git switch -q -c "$branch" "origin/$BASE" || return 1
+  CUR_BRANCH="$branch"
 
   charter_from_issue "$dir/issue.json" "$MAP_PLAN" "$MAP" > "$dir/PROMPT.md"
 
@@ -265,18 +277,28 @@ deliver_issue() {
     --budget-usd "$ISSUE_BUDGET_USD" 2> >(sed 's/^/  /' >&2)
   local loop_rc=$?
   status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
-  if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
-    log "#$n: autopilot ended '$status_state' (exit $loop_rc) — stopping. State: $dir"
+  # Exit 1 is autopilot refusing to start (its preconditions) — the machinery,
+  # not this issue. Anything else short of done is this issue not finishing.
+  if [[ "$loop_rc" -eq 1 ]]; then
+    log "#$n: autopilot refused to start (exit 1) — stopping the run. State: $dir"
     return 1
   fi
   [[ -z "$(git status --porcelain)" ]] || { log "#$n: autopilot left a dirty tree — stopping."; return 1; }
-  [[ "$(git rev-list --count "origin/$BASE..HEAD")" -gt 0 ]] || { log "#$n: autopilot finished without a commit — stopping."; return 1; }
+  if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
+    PARK_REASON="autopilot ended '$status_state' (exit $loop_rc) without finishing"
+    return 10
+  fi
+  if [[ "$(git rev-list --count "origin/$BASE..HEAD")" -eq 0 ]]; then
+    PARK_REASON="autopilot reported done without a single commit"
+    return 10
+  fi
 
   # --- verify the exact head that will be merged ---
   head_sha="$(git rev-parse HEAD)"
   if ! bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1; then
-    log "#$n: verify failed on $head_sha — stopping. Log: $dir/final-verify.log"
-    return 1
+    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
+    PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
+    return 10
   fi
   [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
     || { log "#$n: verify changed the checkout — stopping."; return 1; }
@@ -302,16 +324,19 @@ deliver_issue() {
   forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
   pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
     || { log "#$n: opening the PR failed — stopping."; return 1; }
+  CUR_PR="$pr"
   log "#$n: PR #$pr opened"
 
   # --- independent review of the pushed head, before anything merges ---
-  review_issue "$n" "$pr" "$(git rev-parse "origin/$BASE")" "$head_sha" "$dir" || return 1
+  review_issue "$n" "$pr" "$(git rev-parse "origin/$BASE")" "$head_sha" "$dir"
+  local review_rc=$?
+  [[ "$review_rc" -eq 0 ]] || return "$review_rc"
 
   # --- merge (from the base, so the forge never has the head checked out) ---
   git switch -q "$BASE" || return 1
   if ! forge_pr_merge "$pr" "$head_sha" "$title (#$pr)" "$dir/pr-body.md" > "$dir/merge.log" 2>&1; then
-    log "#$n: merge of PR #$pr refused — stopping. $(tail -1 "$dir/merge.log")"
-    return 1
+    PARK_REASON="the forge refused to merge PR #$pr: $(tail -1 "$dir/merge.log")"
+    return 10
   fi
   [[ "$(forge_pr_state "$pr")" == "MERGED" ]] || { log "#$n: PR #$pr is not MERGED after merge — stopping."; return 1; }
 
@@ -331,6 +356,69 @@ deliver_issue() {
 }
 
 # ---------------------------------------------------------------------------
+# Park an issue: leave it for a human, say why, and keep going. The issue
+# branch stays (local, and on the remote once pushed) for inspection.
+# ---------------------------------------------------------------------------
+park_issue() {
+  local n="$1" dir="$RUN_DIR/issues/$1" comment="$RUN_DIR/issues/$1/park-comment.md"
+  local st="$RUN_DIR/issues/$1/status.json"
+  log "#$n: PARKED — $PARK_REASON"
+  # Back to the base so the next issue starts clean; anything else means the
+  # checkout is not in the state the runner left it, and parking stops there.
+  [[ -z "$(git status --porcelain)" ]] || die "#$n: cannot park — the checkout is dirty."
+  git switch -q "$BASE" || die "#$n: cannot park — cannot switch back to '$BASE'."
+  [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$BASE")" ]] \
+    || die "#$n: cannot park — '$BASE' no longer matches origin/$BASE."
+
+  forge_label_ensure needs-human d93f0b "Parked by /deliver: needs a human decision before an agent retries it"
+  forge_issue_add_label "$n" needs-human || log "#$n: could not add the needs-human label"
+  forge_issue_remove_label "$n" ready-for-agent 2>/dev/null || true
+  if [[ -n "$CUR_PR" ]]; then
+    forge_pr_draft "$CUR_PR" || log "#$n: could not turn PR #$CUR_PR back into a draft"
+  fi
+  {
+    echo "**Parked by \`/deliver\`** (run \`$RUN_ID\`, map #$MAP): $PARK_REASON."
+    echo
+    if [[ -n "$CUR_PR" ]]; then
+      echo "- PR: #$CUR_PR (back to draft) · branch \`$CUR_BRANCH\`"
+    elif [[ -n "$CUR_BRANCH" ]]; then
+      echo "- Branch: \`$CUR_BRANCH\` (local to the machine that ran /deliver; not pushed)"
+    fi
+    if [[ -f "$st" ]]; then
+      jq -r '"- Autopilot: state `\(.state)`, \(.iterations_done) iteration(s), $\(.total_cost_usd)"' "$st" 2>/dev/null
+    fi
+    echo "- Issues that wait on this one are skipped in this run; independent ones continue."
+    echo "- To retry: resolve the cause, remove \`needs-human\`, and run /deliver on map #$MAP again."
+    if [[ -s "$dir/FEEDBACK.md" ]]; then
+      echo
+      echo "<details><summary>Autopilot's last feedback</summary>"
+      echo
+      echo '~~~~~'
+      tail -n 40 "$dir/FEEDBACK.md"
+      echo '~~~~~'
+      echo
+      echo "</details>"
+    fi
+  } > "$comment"
+  forge_issue_comment "$n" "$comment" || log "#$n: could not post the parking comment"
+  PARKED+=("#$n")
+}
+
+# finish — report what this run did and exit 0 (everything merged) or 2.
+finish() {
+  local i skipped=()
+  plan_load "$MAP_PLAN"
+  for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
+    [[ "${PLAN_ROW_TICKED[$i]}" == "1" ]] && continue
+    [[ " ${PARKED[*]:-} " == *" ${PLAN_IDS[$i]} "* ]] && continue
+    skipped+=("${PLAN_IDS[$i]}")
+  done
+  log "map #$MAP: ${#MERGED[@]} merged this run${PARKED[*]:+, parked: ${PARKED[*]}}${skipped[*]:+, skipped (blocked by a parked issue): ${skipped[*]}}."
+  [[ ${#PARKED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]] && exit 0
+  exit 2
+}
+
+# ---------------------------------------------------------------------------
 # Walk the issue graph.
 # ---------------------------------------------------------------------------
 while :; do
@@ -338,12 +426,20 @@ while :; do
   # The Map may have been edited since the last issue; a duplicate or a bad
   # ref should stop the run with its own name, not as a confusing later error.
   PROBLEMS="$(map_validate "$MAP_PLAN")" || die "map #$MAP became invalid mid-run: $(printf '%s' "$PROBLEMS" | tr '\n' ';')"
-  NEXT="$(select_next_slice "$MAP_PLAN")"; rc=$?
+  # Parked issues are passed as parked slices: select_next_slice never picks
+  # them or anything that waits on them (rc 3 once only those are left).
+  NEXT="$(select_next_slice "$MAP_PLAN" "$(IFS=,; echo "${PARKED[*]:-}")")"; rc=$?
   case "$rc" in
     0) ;;
-    1) log "map #$MAP: every Delivery line is merged (${#MERGED[@]} this run)."; exit 0 ;;
+    1|3) finish ;;
     2) die "map #$MAP has a dependency cycle in its after: edges" ;;
-    *) die "map #$MAP: nothing left that can start (select rc $rc)" ;;
+    *) die "map #$MAP: unexpected scheduler result (select rc $rc)" ;;
   esac
-  deliver_issue "$NEXT" || die "stopped at $NEXT — ${#MERGED[@]} issue(s) merged this run."
+  PARK_REASON=""
+  deliver_issue "$NEXT"; rc=$?
+  case "$rc" in
+    0)  ;;
+    10) park_issue "$(map_issue_number "$NEXT")" ;;
+    *)  die "stopped at $NEXT — ${#MERGED[@]} issue(s) merged this run." ;;
+  esac
 done

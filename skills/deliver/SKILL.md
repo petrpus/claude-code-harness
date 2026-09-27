@@ -18,11 +18,31 @@ tick the Map line.
 The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
-> **Status: in progress (map #68).** Built: the straight path (#57) and the
-> independent review (#59). Not yet: review fix rounds, parking a failing
-> issue, CI wait, resume, the tmux launcher. Any failure — including a review
-> that requests changes — stops the run with the PR open and the issue branch
-> checked out.
+> **Status: in progress (map #68).** Built: the straight path (#57), the
+> independent review (#59) and parking (#58). Not yet: review fix rounds, CI
+> wait, resume, the tmux launcher.
+
+## When an issue does not make it
+
+An issue that cannot reach its merge is **parked** and the run carries on:
+autopilot did not finish (stuck, or an iteration / time / budget cap), it
+finished without a commit, verify failed on its head, the review held its PR
+(changes requested, or no usable verdict twice), or the forge refused the
+merge. Parking:
+
+- labels the issue `needs-human` (created if the repo lacks it) and removes
+  `ready-for-agent`;
+- turns its PR, if one was opened, back into a draft;
+- comments on the issue with the cause, autopilot's state and cost, and
+  autopilot's last feedback;
+- keeps the issue branch (local, and on the remote once pushed) for a human.
+
+Issues that wait on a parked one (transitively) are **skipped**; independent
+ones continue. The run ends with exit **2** and a summary naming both lists.
+
+A failure of the machinery itself — the forge unreachable, autopilot refusing
+to start, a dirty checkout, a review that changed the checkout — is not an
+issue's fault: it ends the run with exit 1, where it is.
 
 ## How to run (terminal)
 
@@ -82,5 +102,5 @@ edits the script running it.
   readable by `/usage-report`), and per issue `issues/<N>/` (autopilot state
   dir: charter, plan, run log, status, PR body, `review-<k>.md/.json`).
 
-Exit codes: 0 every Delivery line merged · 1 precondition failure or an issue
-that did not reach its merge.
+Exit codes: 0 every Delivery line merged · 1 precondition or runner failure ·
+2 partial (something was parked, and whatever waits on it skipped).
