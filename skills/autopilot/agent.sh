@@ -20,6 +20,13 @@
 #     AGENT_STDERR_LOG  where claude's stderr is appended (default /dev/null)
 #     AGENT_DISALLOWED_TOOLS  optional --disallowedTools list: tools the call
 #                       may not use even if a permission mode would allow them
+#     AGENT_BASH_TIMEOUT_MS  the Bash tool's default and maximum command time
+#                       inside the call (default: AGENT_TIMEOUT). Claude Code's
+#                       own default is 2 minutes — shorter than many verify
+#                       commands, so BUILD never saw verify finish (#86).
+#     AGENT_TRANSCRIPT_DIR  if set, each call's reply is kept there as
+#                       <seq>-<phase>.md, so a failed iteration can be read
+#                       instead of inferred
 #
 #   Results (globals, set by every call, dry runs included):
 #     AGENT_LAST_RC, AGENT_LAST_JSON, AGENT_LAST_RESULT, AGENT_LAST_COST,
@@ -113,7 +120,9 @@ agent_run() {
     local -a extra=()
     [[ -n "${AGENT_DISALLOWED_TOOLS:-}" ]] && extra=(--disallowedTools "$AGENT_DISALLOWED_TOOLS")
     agent_noforge_dir || true
+    local bash_ms="${AGENT_BASH_TIMEOUT_MS:-$(( ${AGENT_TIMEOUT:-1200} * 1000 ))}"
     out="$(
+      export BASH_DEFAULT_TIMEOUT_MS="$bash_ms" BASH_MAX_TIMEOUT_MS="$bash_ms"
       # No private gh dir means credentials cannot be withheld: refuse the
       # call (125, like an unusable cwd) rather than run it with them.
       [[ -n "$AGENT_NOFORGE_DIR" && -d "$AGENT_NOFORGE_DIR" ]] || exit 125
@@ -147,5 +156,17 @@ agent_run() {
   IFS=$'\t' read -r AGENT_LAST_COST AGENT_LAST_IN_TOKENS AGENT_LAST_OUT_TOKENS \
     AGENT_LAST_TURNS AGENT_LAST_CACHE_READ AGENT_LAST_CACHE_CREATION <<<"$fields"
   AGENT_LAST_RESULT="$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" || AGENT_LAST_RESULT=""
+  if [[ -n "${AGENT_TRANSCRIPT_DIR:-}" ]] && mkdir -p "$AGENT_TRANSCRIPT_DIR" 2>/dev/null; then
+    # Continue after the files already there: a resumed or reloaded run is a
+    # new process, and must not overwrite the replies of the one before.
+    # Assumes one writer per directory (loop.sh's lock guarantees it for its
+    # state dir); give a second writer its own directory.
+    if [[ -z "${AGENT_CALL_SEQ:-}" ]]; then
+      AGENT_CALL_SEQ="$(find "$AGENT_TRANSCRIPT_DIR" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    AGENT_CALL_SEQ=$(( AGENT_CALL_SEQ + 1 ))
+    printf '<!-- %s · model %s · exit %s · %ss -->\n%s\n' "$phase" "$model" "$rc" "$AGENT_LAST_DURATION" \
+      "$AGENT_LAST_RESULT" > "$AGENT_TRANSCRIPT_DIR/$(printf '%03d' "$AGENT_CALL_SEQ")-$phase.md" 2>/dev/null || true
+  fi
   return "$rc"
 }

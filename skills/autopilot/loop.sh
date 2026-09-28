@@ -121,6 +121,9 @@ AGENT_TIMEOUT="$PER_CALL_TIMEOUT"
 AGENT_MAX_TURNS="$MAX_TURNS"
 AGENT_DRY_RUN="$DRY_RUN"
 AGENT_STDERR_LOG="$STATE_DIR/claude-stderr.log"
+# Every model reply is kept (calls/<seq>-<phase>.md): the run log records
+# that an iteration failed, the reply says why (#86).
+AGENT_TRANSCRIPT_DIR="$STATE_DIR/calls"
 
 # Every checkpoint is `git add -A`, so a state dir git does not ignore would
 # commit the run's own charter, plan, logs and lock into the branch under
@@ -386,8 +389,12 @@ write_status() { # state
 # agent_run it prints nothing: callers read AGENT_LAST_RESULT, never
 # `$(run_claude ...)`, whose subshell would drop the cost it just added.
 run_claude() { # phase model allowed_tools permission_mode prompt_text
-  local phase="$1" model="$2" rc
+  local phase="$1" model="$2" rc keep_dir="${AGENT_TRANSCRIPT_DIR:-}"
+  # A verifier that saw holdout scenarios may quote them, and calls/ sits in
+  # the state dir BUILD reads: its reply is not kept then (ADR-0006).
+  [[ "$phase" == "verify_agent" && -n "${HOLDOUT_CONTENT:-}" ]] && AGENT_TRANSCRIPT_DIR=""
   agent_run "$@"; rc=$?
+  AGENT_TRANSCRIPT_DIR="$keep_dir"
   # A dry run makes no call: nothing was spent and nothing belongs in the run
   # log (the pre-agent.sh contract — a preview run's log stays as small as it
   # always was).

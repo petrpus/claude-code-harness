@@ -778,6 +778,7 @@ cat > "$AGENT_DIR/bin/claude" <<'STUB'
   echo "GIT_ASKPASS=${GIT_ASKPASS-<unset>}"
   echo "LAST_HELPER=[$(git config --get-all credential.helper | tail -1)]"
   echo "USER_NAME=$(git config --get user.name)"
+  echo "BASH_TIMEOUTS=${BASH_DEFAULT_TIMEOUT_MS-<unset>}/${BASH_MAX_TIMEOUT_MS-<unset>}"
 } > "$AGENT_ENV_FILE"
 printf '{"result":"ok","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
 STUB
@@ -786,10 +787,24 @@ AGENT_CALLER="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$
   GH_TOKEN=caller-token GITHUB_TOKEN=caller-token2 SSH_AUTH_SOCK=/tmp/caller.sock \
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=kept-by-env bash -c '
   . "$1/skills/autopilot/agent.sh"
-  agent_run build sonnet "Read" acceptEdits "p"
+  AGENT_TIMEOUT=900 AGENT_TRANSCRIPT_DIR="$2/calls" agent_run build sonnet "Read" acceptEdits "p"
+  AGENT_TIMEOUT=900 AGENT_TRANSCRIPT_DIR="$2/calls" agent_run verify_agent haiku "Read" acceptEdits "p"
   echo "$GH_TOKEN|$SSH_AUTH_SOCK|${GH_CONFIG_DIR-<unset>}|$GIT_CONFIG_COUNT"
-' _ "$AGENT_REPO" 2>/dev/null)"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
 AGENT_ENV="$(cat "$AGENT_DIR/env" 2>/dev/null)"
+grep -qx 'BASH_TIMEOUTS=900000/900000' <<<"$AGENT_ENV" \
+  && ok "the model's Bash tool may run a command as long as the call itself (AGENT_TIMEOUT → BASH_*_TIMEOUT_MS)" \
+  || note "Bash tool timeouts in the call: $(grep BASH_TIMEOUTS <<<"$AGENT_ENV")"
+[[ -f "$AGENT_DIR/calls/001-build.md" && -f "$AGENT_DIR/calls/002-verify_agent.md" ]] \
+  && grep -q '^ok$' "$AGENT_DIR/calls/001-build.md" && head -1 "$AGENT_DIR/calls/001-build.md" | grep -q 'build · model sonnet · exit 0' \
+  && ok "AGENT_TRANSCRIPT_DIR keeps each call's reply as <seq>-<phase>.md" \
+  || note "transcripts: $(ls "$AGENT_DIR/calls" 2>/dev/null | tr '\n' ' ')"
+AGENT_SEQ2="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE=/dev/null bash -c '
+  . "$1/skills/autopilot/agent.sh"; AGENT_TRANSCRIPT_DIR="$2/calls" agent_run plan opus "Read" acceptEdits "p"
+  ls "$2/calls" | tr "\n" " "' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+[[ "$AGENT_SEQ2" == "001-build.md 002-verify_agent.md 003-plan.md " ]] \
+  && ok "a new process continues the numbering instead of overwriting earlier replies" \
+  || note "transcript numbering across processes: '$AGENT_SEQ2'"
 grep -qx 'GH_TOKEN=<unset>' <<<"$AGENT_ENV" && grep -qx 'GITHUB_TOKEN=<unset>' <<<"$AGENT_ENV" \
   && grep -qx 'SSH_AUTH_SOCK=<unset>' <<<"$AGENT_ENV" && grep -qx 'GH_CONFIG_DIR_EMPTY=yes' <<<"$AGENT_ENV" \
   && ok "the model call sees no gh token, no ssh agent and an empty gh config dir (ADR-0007)" \
