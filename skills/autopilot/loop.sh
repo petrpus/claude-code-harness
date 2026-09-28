@@ -272,13 +272,14 @@ HOLDOUT_NOTICE_SHOWN=0
 # ---------------------------------------------------------------------------
 # Logging + status helpers.
 # ---------------------------------------------------------------------------
-# The clock is read with bash's own printf (bash >= 4.2), not `date`: no
-# external program, no fork that can fail under load. It used to be
+# The clock is read with bash's own printf (bash >= 4.2), not `date`, and
+# straight into a variable (clock_now VAR) — no external program and no
+# `$(…)` subshell, so no fork that can fail under load. It used to be
 # `date +%s || echo 0`, and a failed read at startup made START_EPOCH 0 — the
 # first cap check then reported ~29 million minutes elapsed and ended a
 # healthy run as "time-cap" (#78).
-now_epoch() { local t; printf -v t '%(%s)T' -1; echo "$t"; }
-printf -v START_EPOCH '%(%s)T' -1
+clock_now() { printf -v "$1" '%(%s)T' -1; }
+clock_now START_EPOCH
 # A start time that is not a plausible epoch is never used for a cap.
 if [[ ! "$START_EPOCH" =~ ^[0-9]+$ ]] || (( START_EPOCH < 1000000000 )); then
   log_err "cannot read the clock (got '$START_EPOCH') — refusing to start rather than misreport a time cap."
@@ -401,7 +402,8 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
 }
 
 over_budget() { jq -en --argjson c "$TOTAL_COST" --argjson b "$BUDGET_USD" '$c >= $b' >/dev/null 2>&1; }
-elapsed_min() { echo $(( ( $(now_epoch) - START_EPOCH ) / 60 )); }
+# elapsed_min_into VAR — whole minutes since START_EPOCH, into VAR (no fork).
+elapsed_min_into() { local now; clock_now now; printf -v "$1" '%s' $(( ( now - START_EPOCH ) / 60 )); }
 
 append_feedback() { printf '\n## Iteration %s — %s\n%s\n' "${ITER:-0}" "$1" "$2" >> "$FEEDBACK_FILE"; }
 
@@ -724,19 +726,20 @@ while :; do
   if [[ "$ITER" -gt "$MAX_ITERATIONS" ]]; then
     log_err "iteration cap ($MAX_ITERATIONS) reached."; write_status "iteration-cap"; exit 2
   fi
-  if [[ "$(elapsed_min)" -ge "$MAX_MINUTES" ]]; then
+  elapsed_min_into ELAPSED_MIN
+  if [[ "$ELAPSED_MIN" -ge "$MAX_MINUTES" ]]; then
     log_err "time cap ($MAX_MINUTES min) reached."; write_status "time-cap"; exit 3
   fi
   if over_budget; then
     log_err "budget cap (\$$BUDGET_USD) reached (spent \$$TOTAL_COST)."; write_status "budget-cap"; exit 4
   fi
 
-  log_err "── iteration $ITER (elapsed $(elapsed_min)m, spent \$$TOTAL_COST)"
+  log_err "── iteration $ITER (elapsed ${ELAPSED_MIN}m, spent \$$TOTAL_COST)"
   write_status "building"
 
   # S3A: per-iteration metrics start here — wall clock and cost are measured
   # against this iteration's own baseline, not the run's running total.
-  ITER_T0="$(now_epoch)"
+  clock_now ITER_T0
   ITER_COST_START="$TOTAL_COST"
 
   TICKED_BEFORE="$(count_ticked)"
@@ -888,12 +891,12 @@ while :; do
   # whenever the plan wasn't complete, which meant incremental work was checked
   # in as "wip" without the runner ever verifying it.
   write_status "verifying"
-  VERIFY_T0="$(now_epoch)"
+  clock_now VERIFY_T0
   # BUILD can edit the verify command's script, so the runner runs it without
   # forge credentials, like a model call (ADR-0007, agent.sh).
   agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1
   VERIFY_RC=$?
-  VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+  clock_now VERIFY_T1; VERIFY_S=$(( VERIFY_T1 - VERIFY_T0 ))
   if [[ "$VERIFY_RC" -eq 0 ]]; then
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
   elif [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
@@ -986,7 +989,7 @@ while :; do
   # "none". files_changed counts changed-file rows from `git diff --stat`
   # (each ends in a " | " hunk marker) against the last checkpoint, i.e. this
   # iteration's own uncommitted work.
-  ITER_WALL=$(( $(now_epoch) - ITER_T0 ))
+  clock_now ITER_T1; ITER_WALL=$(( ITER_T1 - ITER_T0 ))
   ITER_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "$ITER_COST_START" '$a - $b' 2>/dev/null || echo 0)"
   # `grep -c` prints a count (even "0") whether or not it matched, but under
   # pipefail its own exit-1-on-no-match would still make an `|| echo 0` fallback
