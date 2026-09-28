@@ -790,6 +790,23 @@ grep -qx 'LAST_HELPER=\[\]' <<<"$AGENT_ENV" && grep -qx 'GIT_SSH_COMMAND=false' 
 [[ "$AGENT_CALLER" == "caller-token|/tmp/caller.sock|<unset>|1" ]] \
   && ok "the caller keeps its own credentials after the call" \
   || note "caller env after the call: '$AGENT_CALLER'"
+# If the private gh dir cannot be made, credentials cannot be withheld: both
+# entry points must refuse (125) and run nothing.
+rm -f "$AGENT_DIR/env" "$AGENT_DIR/ran"
+AGENT_REFUSE="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$AGENT_DIR/env" \
+  TMPDIR="$AGENT_DIR/does-not-exist" bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  agent_run build sonnet "Read" acceptEdits "p"; a=$?
+  agent_run_without_forge_credentials touch "$2/ran"; b=$?
+  echo "$a|$b|$AGENT_LAST_RC|${AGENT_LAST_RESULT}"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+[[ "$AGENT_REFUSE" == "125|125|125|" && ! -e "$AGENT_DIR/env" && ! -e "$AGENT_DIR/ran" ]] \
+  && ok "no private dir → agent_run and agent_run_without_forge_credentials refuse (125) and run nothing" \
+  || note "refusal path: '$AGENT_REFUSE', model ran: $([[ -e "$AGENT_DIR/env" ]] && echo yes || echo no), command ran: $([[ -e "$AGENT_DIR/ran" ]] && echo yes || echo no)"
+AGENT_CLEAN="$(cd "$AGENT_DIR" && bash -c '
+  . "$1/skills/autopilot/agent.sh"; agent_noforge_dir; d="$AGENT_NOFORGE_DIR"; agent_cleanup
+  [[ -n "$d" && ! -e "$d" ]] && echo removed' _ "$AGENT_REPO")"
+[[ "$AGENT_CLEAN" == "removed" ]] && ok "agent_cleanup removes the private dir" || note "agent_cleanup left the dir"
 rm -rf "$AGENT_DIR"
 
 # ---------------------------------------------------------------------------

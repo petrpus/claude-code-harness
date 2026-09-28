@@ -51,8 +51,10 @@
 # does NOT stop a model that deliberately points them back (`git -c
 # credential.helper=store push`, `GH_CONFIG_DIR=~/.config/gh gh …`), because
 # the model runs as the same user and can read those files. That needs an
-# OS / network sandbox (see ADR-0007). A remote that needs no credentials (a
-# local path) is out of reach of either.
+# OS / network sandbox (see ADR-0007). Also out of reach of the environment:
+# a remote that needs no credentials (a local path), a ~/.netrc entry (git's
+# https transport reads it directly), and a bare `ssh` with a passphrase-less
+# key speaking the git protocol itself.
 # agent_noforge_dir — ensure AGENT_NOFORGE_DIR is an empty private dir (one
 # per process, reused). Returns 1 if it cannot be made.
 agent_noforge_dir() {
@@ -60,6 +62,13 @@ agent_noforge_dir() {
     AGENT_NOFORGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-noforge.XXXXXX" 2>/dev/null)" || AGENT_NOFORGE_DIR=""
   fi
   [[ -n "$AGENT_NOFORGE_DIR" && -d "$AGENT_NOFORGE_DIR" ]]
+}
+
+# agent_cleanup — remove the private dir; for the caller's EXIT trap.
+agent_cleanup() {
+  [[ -n "${AGENT_NOFORGE_DIR:-}" && -d "$AGENT_NOFORGE_DIR" ]] && rmdir "$AGENT_NOFORGE_DIR" 2>/dev/null
+  AGENT_NOFORGE_DIR=""
+  return 0
 }
 
 # agent_run_without_forge_credentials <cmd> [args…] — run a command the

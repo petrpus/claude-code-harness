@@ -60,7 +60,9 @@ Decision 2 is enforced in layers, and they are not equally strong:
    points them back (`git -c credential.helper=store push`,
    `GH_CONFIG_DIR=~/.config/gh gh …`): the model runs as the same user and
    can read those files. A plaintext `~/.git-credentials` makes that easier;
-   `harness-doctor` flags it.
+   `harness-doctor` flags it. The environment cannot withhold a `~/.netrc`
+   entry (git's https transport reads it directly) or keep a bare `ssh` with
+   a passphrase-less key from speaking the git protocol itself.
 3. **An OS or network sandbox** around model calls — the only layer that
    holds against a deliberate model. Not built; researched in #79.
 

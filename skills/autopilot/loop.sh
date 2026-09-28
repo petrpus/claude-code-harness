@@ -256,7 +256,7 @@ else
 fi
 [[ "${AUTOPILOT_LOCK_OWNED:-0}" -eq 1 ]] || echo "$$ $RUN_ID" > "$LOCK_FILE"
 RUN_LOG="$STATE_DIR/run-$RUN_ID.jsonl"
-trap 'rm -f "$LOCK_FILE"' EXIT
+trap 'rm -f "$LOCK_FILE"; agent_cleanup' EXIT
 
 # Holdout scenarios (docs/adr/0006-*.md): hidden by location, not by tool
 # denial. Default lives outside the worktree, one directory per run, so BUILD
@@ -704,6 +704,8 @@ while :; do
     log_err "loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
     logline "runner_reload" "-" 0 0 0 0 0 "reload"
     write_status "reloading"
+    # exec skips the EXIT trap; the new process makes its own private dir.
+    agent_cleanup
     AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
       AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_LOCK_OWNED=1 \
       exec bash "$SELF" "${ORIG_ARGV[@]}" --resume-run
@@ -879,12 +881,18 @@ while :; do
   VERIFY_T0="$(now_epoch)"
   # BUILD can edit the verify command's script, so the runner runs it without
   # forge credentials, like a model call (ADR-0007, agent.sh).
-  if agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
-    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+  agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1
+  VERIFY_RC=$?
+  VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
+  if [[ "$VERIFY_RC" -eq 0 ]]; then
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
+  elif [[ "$VERIFY_RC" -eq 125 && ! -s "$STATE_DIR/verify.log" ]]; then
+    # The wrapper refused before running anything: not a verify failure.
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 125 "fail"
+    FAIL_REASON="the verify command was not run: forge credentials could not be withheld (no private temp dir)"
+    FP="verify_cmd"
   else
-    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
-    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 1 "fail"
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 "$VERIFY_RC" "fail"
     FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
     FP="verify_cmd"
   fi

@@ -125,6 +125,10 @@ directly (ADR-0007 § Three layers). Prefer `gh auth setup-git` (or an OS
 keychain helper), then remove the `store` helper and the file." Never print
 the file's content.
 
+If `~/.netrc` exists and has a `machine github.com` / `machine
+api.github.com` line (check with `grep -c`, never print the file) → 🟠 with
+the same reasoning: git's https transport reads it without any helper.
+
 ## Output
 
 ```markdown
