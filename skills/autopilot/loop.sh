@@ -244,7 +244,7 @@ elif [[ "$RESUME" -eq 1 ]]; then
   if [[ -n "$LATEST_LOG" ]]; then
     RUN_ID="$(basename "$LATEST_LOG" .jsonl)"; RUN_ID="${RUN_ID#run-}"
     ITER="$(jq -s 'map(.iter // 0) | max // 0' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
-    TOTAL_COST="$(jq -s '[.[].cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+    TOTAL_COST="$(jq -s '[.[] | select(.phase!="iteration") | .cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
   else
     # No prior log to resume from — missing state is never an error
     # (contract item 8), so this behaves like a fresh run.

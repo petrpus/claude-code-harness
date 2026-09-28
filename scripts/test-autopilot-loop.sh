@@ -566,6 +566,36 @@ COST_IS_TWO="$(jq -n --argjson v "${RESUMED_COST:--1}" '$v == 2' 2>/dev/null)"
   && ok "--resume-run's cost total starts from the prior run's \$2 (1.25+0.75), not \$0" \
   || note "--resume-run's cost total is '$RESUMED_COST', expected 2 (summed from the prior log)"
 
+# --- 12b. --resume-run excludes a phase:"iteration" row's own cost_usd from --
+# the resumed total, even when that row is non-zero, so a per-iteration ------
+# summary cost is never double-counted on top of the per-call rows it summarizes
+R12B="$WORK/r12b"; new_repo "$R12B"
+cat > "$R12B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12B="20260101T000000Z-999998"
+cat > "$R12B/tmp/autopilot/run-$PRIOR_RUN_ID_12B.jsonl" <<EOF
+{"ts":"2026-01-01T00:00:00Z","run_id":"$PRIOR_RUN_ID_12B","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"2026-01-01T00:00:01Z","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"2026-01-01T00:00:02Z","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"iteration","model":"-","duration_s":0,"cost_usd":2.00,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+EOF
+( cd "$R12B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12b.out" 2>"$WORK/r12b.err" )
+RC12B=$?
+[[ "$RC12B" -eq 2 ]] \
+  && ok "--resume-run (non-zero iteration-row cost) adopts the prior iteration count (hits the iteration cap immediately)" \
+  || note "--resume-run (non-zero iteration-row cost) exited $RC12B — expected 2 (iteration cap)"
+
+RESUMED_COST_12B="$(jq -r '.total_cost_usd // -1' "$R12B/tmp/autopilot/status.json" 2>/dev/null)"
+COST_IS_TWO_12B="$(jq -n --argjson v "${RESUMED_COST_12B:--1}" '$v == 2' 2>/dev/null)"
+[[ "$COST_IS_TWO_12B" == "true" ]] \
+  && ok "--resume-run's cost total excludes the phase:\"iteration\" row's \$2 (1.25+0.75=2, not 4)" \
+  || note "--resume-run's cost total is '$RESUMED_COST_12B', expected 2 (the iteration row's \$2 must not be added on top)"
+
 # --- 13. R2: a verifier stuck on "no verdict" still aborts, and FEEDBACK.md --
 # names the malfunction instead of quoting the refusal as findings ----------
 R13="$WORK/r13"; new_repo "$R13"
