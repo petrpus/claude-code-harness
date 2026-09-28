@@ -750,6 +750,64 @@ AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
 [[ "$AGENT_L4" == "0|dry-run|not-called" ]] \
   && ok "AGENT_DRY_RUN returns a zero-cost dry-run result without calling claude" \
   || note "dry run: '$AGENT_L4'"
+
+# ADR-0007: the model call runs without forge credentials; the caller keeps
+# its own. The stub reports what it sees; the caller's environment is checked
+# after the call.
+cat > "$AGENT_DIR/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+{
+  echo "GH_TOKEN=${GH_TOKEN-<unset>}"
+  echo "GITHUB_TOKEN=${GITHUB_TOKEN-<unset>}"
+  echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK-<unset>}"
+  echo "GH_CONFIG_DIR_EMPTY=$([[ -d "${GH_CONFIG_DIR:-/nonexistent}" && -z "$(ls -A "$GH_CONFIG_DIR")" ]] && echo yes || echo no)"
+  echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND-<unset>}"
+  echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT-<unset>}"
+  echo "GIT_ASKPASS=${GIT_ASKPASS-<unset>}"
+  echo "LAST_HELPER=[$(git config --get-all credential.helper | tail -1)]"
+  echo "USER_NAME=$(git config --get user.name)"
+} > "$AGENT_ENV_FILE"
+printf '{"result":"ok","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+STUB
+chmod +x "$AGENT_DIR/bin/claude"
+AGENT_CALLER="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$AGENT_DIR/env" \
+  GH_TOKEN=caller-token GITHUB_TOKEN=caller-token2 SSH_AUTH_SOCK=/tmp/caller.sock \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=kept-by-env bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  agent_run build sonnet "Read" acceptEdits "p"
+  echo "$GH_TOKEN|$SSH_AUTH_SOCK|${GH_CONFIG_DIR-<unset>}|$GIT_CONFIG_COUNT"
+' _ "$AGENT_REPO" 2>/dev/null)"
+AGENT_ENV="$(cat "$AGENT_DIR/env" 2>/dev/null)"
+grep -qx 'GH_TOKEN=<unset>' <<<"$AGENT_ENV" && grep -qx 'GITHUB_TOKEN=<unset>' <<<"$AGENT_ENV" \
+  && grep -qx 'SSH_AUTH_SOCK=<unset>' <<<"$AGENT_ENV" && grep -qx 'GH_CONFIG_DIR_EMPTY=yes' <<<"$AGENT_ENV" \
+  && ok "the model call sees no gh token, no ssh agent and an empty gh config dir (ADR-0007)" \
+  || note "model call env: $(tr '\n' ' ' <<<"$AGENT_ENV")"
+grep -qx 'LAST_HELPER=\[\]' <<<"$AGENT_ENV" && grep -qx 'GIT_SSH_COMMAND=false' <<<"$AGENT_ENV" \
+  && grep -qx 'GIT_TERMINAL_PROMPT=0' <<<"$AGENT_ENV" && grep -qx 'GIT_ASKPASS=false' <<<"$AGENT_ENV" \
+  && grep -qx 'USER_NAME=kept-by-env' <<<"$AGENT_ENV" \
+  && ok "git in the model call has its credential helpers cleared, no prompt, no ssh — earlier GIT_CONFIG_* entries kept" \
+  || note "model call git env: $(tr '\n' ' ' <<<"$AGENT_ENV")"
+[[ "$AGENT_CALLER" == "caller-token|/tmp/caller.sock|<unset>|1" ]] \
+  && ok "the caller keeps its own credentials after the call" \
+  || note "caller env after the call: '$AGENT_CALLER'"
+# If the private gh dir cannot be made, credentials cannot be withheld: both
+# entry points must refuse (125) and run nothing.
+rm -f "$AGENT_DIR/env" "$AGENT_DIR/ran"
+AGENT_REFUSE="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$AGENT_DIR/env" \
+  TMPDIR="$AGENT_DIR/does-not-exist" bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  agent_run build sonnet "Read" acceptEdits "p"; a=$?
+  agent_run_without_forge_credentials touch "$2/ran"; b=$?; r1="$AGENT_REFUSED"
+  unset TMPDIR; agent_run_without_forge_credentials bash -c "exit 125"; c=$?; r2="$AGENT_REFUSED"
+  echo "$a|$b|$AGENT_LAST_RC|${AGENT_LAST_RESULT}|$r1|$c|$r2"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+[[ "$AGENT_REFUSE" == "125|125|125||1|125|0" && ! -e "$AGENT_DIR/env" && ! -e "$AGENT_DIR/ran" ]] \
+  && ok "no private dir → both entry points refuse (125, AGENT_REFUSED=1) and run nothing; a command's own 125 is not a refusal" \
+  || note "refusal path: '$AGENT_REFUSE', model ran: $([[ -e "$AGENT_DIR/env" ]] && echo yes || echo no), command ran: $([[ -e "$AGENT_DIR/ran" ]] && echo yes || echo no)"
+AGENT_CLEAN="$(cd "$AGENT_DIR" && bash -c '
+  . "$1/skills/autopilot/agent.sh"; agent_noforge_dir; d="$AGENT_NOFORGE_DIR"; agent_cleanup
+  [[ -n "$d" && ! -e "$d" ]] && echo removed' _ "$AGENT_REPO")"
+[[ "$AGENT_CLEAN" == "removed" ]] && ok "agent_cleanup removes the private dir" || note "agent_cleanup left the dir"
 rm -rf "$AGENT_DIR"
 
 # ---------------------------------------------------------------------------

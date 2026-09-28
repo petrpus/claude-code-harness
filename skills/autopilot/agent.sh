@@ -28,6 +28,71 @@
 #
 #   Missing fields (a stub, a crashed call, a dry run) read as 0 / "" — the
 #   output shape is never a hard requirement. Needs jq and coreutils timeout.
+#
+#   Every call runs WITHOUT forge credentials (ADR-0007): see
+#   agent_withhold_forge_credentials below. A model phase that reaches `gh`
+#   or `git push` anyway — through a script it edited and may run, say —
+#   meets an unauthenticated gh and a git with no credential source.
+
+# agent_withhold_forge_credentials — call inside the subshell that runs the
+# model, never in the runner's own shell (the runner keeps its credentials
+# for the forge operations it alone performs):
+#   - gh: tokens in the environment unset, GH_CONFIG_DIR pointed at an empty
+#     private dir — gh then has no host and no keyring entry to use;
+#   - git over https: every credential helper cleared (an empty
+#     credential.helper appended through GIT_CONFIG_COUNT resets the whole
+#     list, the URL-specific `gh auth git-credential` and a plaintext `store`
+#     included), and no prompt or askpass to fall back on;
+#   - git over ssh: no agent socket, and an ssh command that always fails.
+#
+# What this does and does not stop: it stops a model phase from acting on the
+# forge by accident or by following instructions (an issue body that says
+# "push this") — the credentials are simply not where gh and git look. It
+# does NOT stop a model that deliberately points them back (`git -c
+# credential.helper=store push`, `GH_CONFIG_DIR=~/.config/gh gh …`), because
+# the model runs as the same user and can read those files. That needs an
+# OS / network sandbox (see ADR-0007). Also out of reach of the environment:
+# a remote that needs no credentials (a local path), a ~/.netrc entry (git's
+# https transport reads it directly), and a bare `ssh` with a passphrase-less
+# key speaking the git protocol itself.
+# agent_noforge_dir — ensure AGENT_NOFORGE_DIR is an empty private dir (one
+# per process, reused). Returns 1 if it cannot be made.
+agent_noforge_dir() {
+  if [[ -z "${AGENT_NOFORGE_DIR:-}" || ! -d "$AGENT_NOFORGE_DIR" ]]; then
+    AGENT_NOFORGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-noforge.XXXXXX" 2>/dev/null)" || AGENT_NOFORGE_DIR=""
+  fi
+  [[ -n "$AGENT_NOFORGE_DIR" && -d "$AGENT_NOFORGE_DIR" ]]
+}
+
+# agent_cleanup — remove the private dir; for the caller's EXIT trap.
+# rmdir, never rm -rf: the dir is meant to stay empty, and if anything ever
+# wrote into it, leaving it for a human beats deleting what we did not create.
+agent_cleanup() {
+  [[ -n "${AGENT_NOFORGE_DIR:-}" && -d "$AGENT_NOFORGE_DIR" ]] && rmdir "$AGENT_NOFORGE_DIR" 2>/dev/null
+  AGENT_NOFORGE_DIR=""
+  return 0
+}
+
+# agent_run_without_forge_credentials <cmd> [args…] — run a command the
+# runner executes but a model may have written (the verify command, which
+# BUILD can edit) under the same withheld credentials as a model call.
+# Returns the command's exit code, or 125 with AGENT_REFUSED=1 when
+# credentials cannot be withheld and nothing ran — the flag, not the code,
+# tells a refusal apart from a command that itself exits 125.
+agent_run_without_forge_credentials() {
+  AGENT_REFUSED=0
+  agent_noforge_dir || { AGENT_REFUSED=1; return 125; }
+  ( agent_withhold_forge_credentials; "$@" )
+}
+
+agent_withhold_forge_credentials() {
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN SSH_AUTH_SOCK
+  export GH_CONFIG_DIR="${AGENT_NOFORGE_DIR:?}"
+  export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=false SSH_ASKPASS=false GIT_SSH_COMMAND=false
+  local n="${GIT_CONFIG_COUNT:-0}"
+  export "GIT_CONFIG_KEY_$n=credential.helper" "GIT_CONFIG_VALUE_$n="
+  export GIT_CONFIG_COUNT=$(( n + 1 ))
+}
 
 agent_run() {
   local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5" cwd="${6:-}"
@@ -42,7 +107,12 @@ agent_run() {
   else
     local -a extra=()
     [[ -n "${AGENT_DISALLOWED_TOOLS:-}" ]] && extra=(--disallowedTools "$AGENT_DISALLOWED_TOOLS")
+    agent_noforge_dir || true
     out="$(
+      # No private gh dir means credentials cannot be withheld: refuse the
+      # call (125, like an unusable cwd) rather than run it with them.
+      [[ -n "$AGENT_NOFORGE_DIR" && -d "$AGENT_NOFORGE_DIR" ]] || exit 125
+      agent_withhold_forge_credentials
       # 125: "could not even start the command" (the xargs/env convention),
       # so an unusable cwd is told apart from anything claude itself returns.
       if [[ -n "$cwd" ]]; then cd "$cwd" || exit 125; fi
