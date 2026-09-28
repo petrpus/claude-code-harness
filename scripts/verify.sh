@@ -440,6 +440,17 @@ if [[ -f skills/autopilot/allowlist.sh ]]; then
     else
       note "detect_verify_cmd: $desc: got '$out' (rc=$rc), want '$want_cmd' (rc=$want_rc)"
     fi
+    # A fixture that detects a command must get exactly that command's grant
+    # from verify_grants, with no broad interpreter prefix (Bash(bash:*),
+    # Bash(make:*)) that would hand BUILD arbitrary shell/make access.
+    if [[ "$rc" -eq 0 ]]; then
+      local grants; grants="$(verify_grants "$out")"
+      if [[ "$grants" == *"Bash($out)"* && "$grants" != *'Bash(bash:*)'* && "$grants" != *'Bash(make:*)'* ]]; then
+        ok "verify_grants for detected '$out': narrow"
+      else
+        note "verify_grants for detected '$out': got '$grants'"
+      fi
+    fi
   }
   detect_case 'npm project' \
     'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json' \
