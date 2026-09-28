@@ -119,6 +119,16 @@ forge_pr_checks() {
   return 0
 }
 
+# forge_ci_failed_log <run_id> [lines]  — tail of a failed run's log
+# (`gh run view <id> --log-failed`), <lines> lines (default 200; ci_wait's
+# fix round, #60). Best-effort: a gh failure (rotated log, bad id) yields an
+# empty string rather than stopping the caller — losing the log tail is a
+# reason to hand the model less context, not to skip the fix round.
+forge_ci_failed_log() {
+  local run="$1" lines="${2:-200}"
+  gh run view "$run" --log-failed 2>/dev/null | tail -n "$lines"
+}
+
 # forge_grant_violations <allowed_tools_csv>
 #   Pure: which Claude Code permission rules in the list would hand a model
 #   phase a forge operation (ADR-0007), or cannot be shown not to. Echoes one

@@ -56,7 +56,7 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 . skills/deliver/forge.sh
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+echo "DEBUG WORK=$WORK" >&2
 
 # ===========================================================================
 # Unit: map.sh
@@ -375,6 +375,14 @@ case "$cmd" in
     total="$(wc -l < "$script" | tr -d ' ')"
     [[ "$cnt" -gt "$total" ]] && cnt="$total"
     sed -n "${cnt}p" "$script" ;;
+  "run view")
+    # forge_ci_failed_log (#60): the fake run's log lives at $S/runs/<id>.log;
+    # a run with no log on file (an id that never came from a /runs/ link in
+    # a fixture's checks script) prints nothing, like a real run whose log
+    # rotated away.
+    id="$1"; shift; has --log-failed "$@" || exit 64
+    f="$S/runs/$id.log"; [[ -f "$f" ]] && cat "$f"
+    exit 0 ;;
   "pr comment")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -825,12 +833,30 @@ job_ci_pending_green() {
   echo $? > "$WORK/cigreen/rc"
 }
 job_ci_fail() {
+  # A checks script that stays FAILURE forever (its one line repeats): the
+  # fix round (#60) gets tried once — the stub `claude` "fixes" it, ticking
+  # C1 — but the CI script still says FAILURE on the second poll, so this is
+  # "CI red twice", parked without a third attempt.
   new_fixture cifail
   mkdir -p "$WORK/cifail/gh/ci"
   printf '%s\n' '[{"name":"build","state":"FAILURE","bucket":"fail","link":"http://x/1"}]' \
     > "$WORK/cifail/gh/ci/4"
-  run_deliver cifail -- --ci-poll-seconds 0 --ci-grace-seconds 0
+  run_deliver cifail -- --ci-poll-seconds 0 --ci-grace-seconds 0 --issue-max-iterations 2
   echo $? > "$WORK/cifail/rc"
+}
+job_ci_fail_then_green() {
+  # Red on the first poll, green on the second (the fix round's own ci_wait):
+  # the failed check's link names a run id the fake gh has a log for, so the
+  # fix round's plan item carries a real log tail.
+  new_fixture cifixgreen
+  mkdir -p "$WORK/cifixgreen/gh/ci" "$WORK/cifixgreen/gh/runs"
+  printf '%s\n%s\n' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/555/job/1"}]' \
+    '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"https://github.com/o/r/actions/runs/555/job/1"}]' \
+    > "$WORK/cifixgreen/gh/ci/4"
+  printf 'Error: something exploded\nBuild failed at step 3\n' > "$WORK/cifixgreen/gh/runs/555.log"
+  run_deliver cifixgreen -- --ci-poll-seconds 0 --ci-grace-seconds 0 --issue-max-iterations 2
+  echo $? > "$WORK/cifixgreen/rc"
 }
 job_ci_timeout() {
   new_fixture citimeout
@@ -882,6 +908,7 @@ bg job_baseadv_conflict
 bg job_ci_none
 bg job_ci_pending_green
 bg job_ci_fail
+bg job_ci_fail_then_green
 bg job_ci_timeout
 wait
 
@@ -1291,15 +1318,31 @@ CG_RUNDIR="$(ls -d "$CG"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && ok "CI: pending polled until green, then merged (no 'no CI' note once CI reported)" \
   || note "ci pending->green: exit $RC, pr checks calls $(grep -c '^pr checks 4' "$CG/gh/calls" 2>/dev/null)"
 
-# a failed check parks the issue (PR back to draft), a fix round arrives with #63.
+# a failed check gets one fix round (#60); still red after it parks the issue.
 CF="$WORK/cifail"
 RC="$(cat "$CF/rc")"
+CF_RUNDIR="$(ls -d "$CF"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
 [[ "$RC" -eq 2 ]] && held cifail \
-  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qF 'CI failed on PR #4: build' \
-  && ok "CI: a failed check parks the issue with the failed check names (PR back to draft, #2 skipped)" \
-  || note "ci fail: exit $RC"
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qF 'CI failed again on PR #4 after fix round 1: build' \
+  && grep -q '^- \[x\] C1 Fix red CI: build$' "$CF_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && [[ "$(cat "$CF_RUNDIR"/run-*.jsonl 2>/dev/null | jq -cs '[.[] | select(.phase=="ci" and .issue==1 and .verdict=="fail")] | map(.round) | sort')" == "[1,2]" ]] \
+  && ok "CI: a red check gets one fix round (the fix round itself ran, C1 ticked); still red after it parks (PR back to draft, #2 skipped)" \
+  || note "ci fail twice: exit $RC, comment: $(jq -r '.comments[-1].body' "$CF/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
 
-# CI stuck pending past the timeout parks the issue too.
+# red then green: the fix round's log tail lands in the plan, C1 gets ticked,
+# and the re-verified, re-pushed head merges once CI is green.
+CX="$WORK/cifixgreen"
+RC="$(cat "$CX/rc")"
+CX_RUNDIR="$(ls -d "$CX"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CX/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$CX/gh/prs/5.json")" == "MERGED" ]] \
+  && grep -q '^- \[x\] C1 Fix red CI: build$' "$CX_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && grep -qF 'Build failed at step 3' "$CX_RUNDIR/issues/1/ci-fail-1.log" \
+  && [[ "$(cat "$CX_RUNDIR"/run-*.jsonl 2>/dev/null | jq -cs '[.[] | select(.phase=="ci" and .issue==1)] | map(.round) | sort')" == "[1,2]" ]] \
+  && ok "CI: a red check's fix round can turn CI green — merged, plan shows C1 ticked, run log records both CI polls" \
+  || note "ci fix round to green: exit $RC, plan: $(grep -c '\[x\]' "$CX_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" 2>/dev/null)"
+
+# CI stuck pending past the timeout parks the issue too, no fix round (it
+# never actually failed).
 CT="$WORK/citimeout"
 RC="$(cat "$CT/rc")"
 [[ "$RC" -eq 2 ]] && held citimeout \
