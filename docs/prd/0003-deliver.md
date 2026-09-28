@@ -319,7 +319,10 @@ also reports `runner-dead` when the lock PID is gone before a terminal state.
 ## Test strategy
 
 `scripts/test-deliver.sh`, a new section of `scripts/verify.sh`, offline and
-under ~30 s:
+under ~10 s: independent e2e fixtures run in parallel (each already lives
+under its own `$WORK/<name>/`), capped at `${TEST_DELIVER_JOBS:-$(nproc)}`
+concurrent jobs; `TEST_DELIVER_JOBS=1` runs them sequentially for a small box
+or a deterministic trace:
 
 - **Fixtures:** a bare `remote.git`; a clone with `main` and `integration/x`;
   `PATH` stubs. Stub `claude` extends the loop stub (plan path read from the

@@ -444,7 +444,11 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf '{"result":%s,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$(printf '%s' "$r" | jq -Rs .)"
     exit 0 ;;
   *"PLAN phase"*|*"autonomous run is stuck"*)
-    printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
+    if [[ "${STUB_PLAN_SLICES:-1}" == "2" ]]; then
+      printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
+    else
+      printf -- '- [ ] S1 — the work\n\nSTATUS: in-progress\n' > "$plan"
+    fi
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
     [[ -n "${STUB_BUILD_SLEEP:-}" ]] && sleep "$STUB_BUILD_SLEEP"
@@ -519,16 +523,259 @@ run_deliver() {
   [[ "${1:-}" == "--" ]] && shift
   ( cd "$d/repo" && env PATH="$BIN:$PATH" FAKE_GH_DIR="$d/gh" XDG_STATE_HOME="$d/state" \
       GIT_CMD_LOG="$d/git.calls" ${envs[@]+"${envs[@]}"} \
-      bash "$DELIVER_ABS" --map 3 --verify-cmd true --issue-max-iterations 6 "$@" \
+      bash "$DELIVER_ABS" --map 3 --verify-cmd true --issue-max-iterations 1 "$@" \
       >"$d/out" 2>"$d/err" )
 }
 
+
+# path_without <dir> <tool>... — a PATH directory holding every executable of
+# the current PATH except the named tools (the test bin's shims included).
+path_without() {
+  local out="$1" p f b skip; shift
+  mkdir -p "$out"
+  local IFS=:
+  for p in $BIN:$PATH; do
+    [[ -d "$p" ]] || continue
+    for f in "$p"/*; do
+      b="${f##*/}"; skip=0
+      for t in "$@"; do [[ "$b" == "$t" ]] && skip=1; done
+      [[ "$skip" -eq 1 || -e "$out/$b" || ! -x "$f" ]] && continue
+      ln -s "$f" "$out/$b"
+    done
+  done
+}
+
+# parked_one <name> — issue #1 is parked: labelled needs-human (and no longer
+# ready-for-agent), one comment saying it was parked, the Map unticked.
+parked_one() {
+  local d="$WORK/$1"
+  [[ "$(jq -r '[.labels[].name] | sort | join(",")' "$d/gh/issues/1.json")" == "needs-human" ]] \
+    && jq -r '.comments[-1].body' "$d/gh/issues/1.json" | grep -q '^\*\*Parked by `/deliver`\*\*' \
+    && [[ "$(jq -r .body "$d/gh/issues/3.json")" == *"- [ ] #1 "* ]]
+}
+# held <name> — #1 got as far as PR #4, which is now a draft, unmerged; #1 is
+# parked, #2 (after #1) was skipped, integration/x is untouched, and the
+# checkout is back on integration/x, clean.
+held() {
+  local d="$WORK/$1"
+  [[ "$(jq -r .state "$d/gh/prs/4.json" 2>/dev/null)" == "OPEN" ]] \
+    && [[ "$(jq -r .isDraft "$d/gh/prs/4.json" 2>/dev/null)" == "true" ]] \
+    && ! grep -q '^pr merge' "$d/gh/calls" \
+    && parked_one "$1" \
+    && [[ ! -f "$d/gh/prs/5.json" ]] \
+    && [[ "$(git -C "$d/remote.git" rev-parse integration/x)" == "$(git -C "$d/remote.git" rev-parse main)" ]] \
+    && [[ "$(git -C "$d/repo" branch --show-current)" == "integration/x" && -z "$(git -C "$d/repo" status --porcelain)" ]]
+}
+
+EXTRABAD_VALUES=('Bash' 'Bash(env gh:*)' 'Read, Bash(/usr/bin/git  push origin x)')
+PCTBAD_VALUES=(1.5 0)
+
+# ===========================================================================
+# Fixture jobs run in parallel, capped at $TEST_DELIVER_JOBS (default:
+# nproc), so the wall time below is the slowest single fixture, not the sum
+# of all of them. Every fixture already lives under its own $WORK/<name>/
+# (remote, repo, gh store, XDG state — see new_fixture/run_deliver above),
+# and the git/gh/claude shims log to per-fixture STUB_*_LOG/STATE paths, so
+# no job touches another job's state; the only thing a job produces that the
+# assertions below need is its exit code, written to $WORK/<name>/rc since a
+# background job's $? does not reach the parent shell.
+#
+# The park fixture's two reruns are a genuine exception: they mutate and
+# re-read the same $WORK/park/ state the first park job left behind, so they
+# stay foreground calls placed after the initial `wait`, not jobs.
+# ===========================================================================
+JOBS_CAP="${TEST_DELIVER_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+[[ "$JOBS_CAP" =~ ^[0-9]+$ && "$JOBS_CAP" -ge 1 ]] || JOBS_CAP=4
+bg() { # bg <job-fn> [args...] — semaphore over background jobs via wait -n
+  while [[ "$(jobs -pr | wc -l)" -ge "$JOBS_CAP" ]]; do wait -n 2>/dev/null || break; done
+  "$@" &
+}
+
+job_happy() {
+  new_fixture happy
+  git -C "$WORK/happy/remote.git" rev-parse main > "$WORK/happy/main_before"
+  run_deliver happy STUB_REVIEW_LOG="$WORK/happy/review.log"
+  echo $? > "$WORK/happy/rc"
+}
+job_extra() {
+  new_fixture extra
+  run_deliver extra STUB_BUILD_LOG="$WORK/extra/build.log" STUB_REVIEW_LOG="$WORK/extra/review.log" -- --extra-allowed-tools 'Bash(jq:*),Bash(bash scripts/x.sh)'
+  echo $? > "$WORK/extra/rc"
+}
+job_extrabad() { # <index> <grant>
+  local name="extrabad$1"
+  new_fixture "$name"
+  run_deliver "$name" -- --extra-allowed-tools "$2"
+  echo $? > "$WORK/$name/rc"
+}
+job_nocreds() {
+  new_fixture nocreds
+  run_deliver nocreds GH_TOKEN=runner-token STUB_FORGE_PROBE="$WORK/nocreds/probe" -- \
+    --verify-cmd "gh auth status >/dev/null 2>&1; echo verify-gh=\$? >> '$WORK/nocreds/probe'; true"
+  echo $? > "$WORK/nocreds/rc"
+}
+job_pct() {
+  new_fixture pct
+  run_deliver pct STUB_BUILD_SLEEP=4 -- --per-call-timeout 2 --issue-max-iterations 1
+  echo $? > "$WORK/pct/rc"
+}
+job_pctbad() { # <index> <seconds>
+  local name="pctbad$1"
+  new_fixture "$name"
+  run_deliver "$name" -- --per-call-timeout "$2"
+  echo $? > "$WORK/$name/rc"
+}
+job_pace() {
+  new_fixture pace
+  run_deliver pace STUB_PLAN_SLICES=2 -- --issue-max-iterations 2 --verify-cmd "echo v >> '$WORK/pace/count'"
+  echo $? > "$WORK/pace/rc"
+}
+job_paceall() {
+  new_fixture paceall
+  run_deliver paceall STUB_PLAN_SLICES=2 -- --issue-max-iterations 2 --verify-cmd "echo v >> '$WORK/paceall/count'" --verify-every-iteration
+  echo $? > "$WORK/paceall/rc"
+}
+job_pacebad() {
+  new_fixture pacebad
+  run_deliver pacebad -- --verify-every-iteration --iteration-verify-cmd true
+  echo $? > "$WORK/pacebad/rc"
+}
+job_onmain() {
+  new_fixture onmain
+  git -C "$WORK/onmain/repo" switch -q main
+  run_deliver onmain
+  echo $? > "$WORK/onmain/rc"
+}
+job_dirty() {
+  new_fixture dirty
+  echo junk > "$WORK/dirty/repo/untracked.txt"
+  run_deliver dirty
+  echo $? > "$WORK/dirty/rc"
+}
+job_nomap() {
+  new_fixture nomap
+  jq '.body = "no delivery section here"' "$WORK/nomap/gh/issues/3.json" > "$WORK/nomap/x" && mv "$WORK/nomap/x" "$WORK/nomap/gh/issues/3.json"
+  run_deliver nomap
+  echo $? > "$WORK/nomap/rc"
+}
+job_behind() {
+  new_fixture behind
+  git -C "$WORK/behind/repo" commit -q --allow-empty -m "local only"
+  run_deliver behind
+  echo $? > "$WORK/behind/rc"
+}
+job_notool() { # <tool>
+  local tool="$1"
+  new_fixture "no$tool"
+  path_without "$WORK/no$tool/bin" "$tool"
+  ( cd "$WORK/no$tool/repo" && env PATH="$WORK/no$tool/bin" FAKE_GH_DIR="$WORK/no$tool/gh" \
+      XDG_STATE_HOME="$WORK/no$tool/state" \
+      "$(command -v bash)" "$DELIVER_ABS" --map 3 --verify-cmd true >"$WORK/no$tool/out" 2>"$WORK/no$tool/err" )
+  echo $? > "$WORK/no$tool/rc"
+}
+job_unauth() {
+  new_fixture unauth
+  run_deliver unauth FAKE_GH_UNAUTH=1
+  echo $? > "$WORK/unauth/rc"
+}
+job_midedit() {
+  new_fixture midedit
+  run_deliver midedit FAKE_GH_AFTER_FIRST_MERGE_BODY='- [ ] #2 Second thing (after: #1)' --
+  echo $? > "$WORK/midedit/rc"
+}
+job_park() {
+  new_fixture park with4
+  run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+  echo $? > "$WORK/park/rc"
+}
+job_park2() {
+  new_fixture park2
+  echo needs-human >> "$WORK/park2/gh/labels"
+  run_deliver park2 STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+  echo $? > "$WORK/park2/rc"
+}
+job_parklate() {
+  new_fixture parklate with4
+  git -C "$WORK/parklate/repo" branch feat/4-independent-thing
+  run_deliver parklate
+  echo $? > "$WORK/parklate/rc"
+}
+job_parkverify() {
+  new_fixture parkverify
+  run_deliver parkverify -- --verify-cmd '! git log -1 --format=%s | grep -q "(green)"'
+  echo $? > "$WORK/parkverify/rc"
+}
+job_parknowork() {
+  new_fixture parknowork
+  run_deliver parknowork STUB_NOWORK_ISSUES=1
+  echo $? > "$WORK/parknowork/rc"
+}
+job_rvblock()   { new_fixture rvblock;    run_deliver rvblock    STUB_REVIEW=blocker;                                                  echo $? > "$WORK/rvblock/rc"; }
+job_rvliar()    { new_fixture rvliar;     run_deliver rvliar     STUB_REVIEW=liar;                                                     echo $? > "$WORK/rvliar/rc"; }
+job_rvoos()     { new_fixture rvoos;      run_deliver rvoos      STUB_REVIEW=outofscope;                                               echo $? > "$WORK/rvoos/rc"; }
+job_rvgarbage() { new_fixture rvgarbage;  run_deliver rvgarbage  STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log";      echo $? > "$WORK/rvgarbage/rc"; }
+job_rvretry()   { new_fixture rvretry;    run_deliver rvretry    STUB_REVIEW=garbage-once STUB_REVIEW_STATE="$WORK/rvretry/review.state"; echo $? > "$WORK/rvretry/rc"; }
+job_rvmutate()  { new_fixture rvmutate;   run_deliver rvmutate   STUB_REVIEW=mutate;                                                    echo $? > "$WORK/rvmutate/rc"; }
+job_rvmutatevariant() { # <mutate-ref|mutate-tmp|mutate-hook>
+  local m="$1" name="rv$1"
+  new_fixture "$name"
+  run_deliver "$name" STUB_REVIEW="$m"
+  echo $? > "$WORK/$name/rc"
+}
+job_rvexample()   { new_fixture rvexample;   run_deliver rvexample   STUB_REVIEW=example-after; echo $? > "$WORK/rvexample/rc"; }
+job_rvwronghead() { new_fixture rvwronghead; run_deliver rvwronghead STUB_REVIEW=wrong-head;     echo $? > "$WORK/rvwronghead/rc"; }
+job_refused() {
+  new_fixture refused
+  run_deliver refused FAKE_GH_MERGE_FAIL=1
+  echo $? > "$WORK/refused/rc"
+}
+
+bg job_happy
+bg job_extra
+for i in "${!EXTRABAD_VALUES[@]}"; do bg job_extrabad "$i" "${EXTRABAD_VALUES[$i]}"; done
+bg job_nocreds
+bg job_pct
+for i in "${!PCTBAD_VALUES[@]}"; do bg job_pctbad "$i" "${PCTBAD_VALUES[$i]}"; done
+bg job_pace
+bg job_paceall
+bg job_pacebad
+bg job_onmain
+bg job_dirty
+bg job_nomap
+bg job_behind
+bg job_notool jq
+bg job_notool gh
+bg job_unauth
+bg job_midedit
+bg job_park
+bg job_park2
+bg job_parklate
+bg job_parkverify
+bg job_parknowork
+bg job_rvblock
+bg job_rvliar
+bg job_rvoos
+bg job_rvgarbage
+bg job_rvretry
+bg job_rvmutate
+bg job_rvmutatevariant mutate-ref
+bg job_rvmutatevariant mutate-tmp
+bg job_rvmutatevariant mutate-hook
+bg job_rvexample
+bg job_rvwronghead
+bg job_refused
+wait
+
+# ===========================================================================
+# Assertions — same fixtures, same order, same wording as before parallelism;
+# only $? became "$(cat .../rc)" since a background job's exit code does not
+# reach this shell any other way.
+# ===========================================================================
+
 # --- happy path: two dependent issues ----------------------------------------
-new_fixture happy
-MAIN_BEFORE="$(git -C "$WORK/happy/remote.git" rev-parse main)"
-run_deliver happy STUB_REVIEW_LOG="$WORK/happy/review.log"
-RC=$?
 H="$WORK/happy"
+MAIN_BEFORE="$(cat "$WORK/happy/main_before")"
+RC="$(cat "$WORK/happy/rc")"
 [[ "$RC" -eq 0 ]] && ok "happy path: two dependent issues delivered (exit 0)" \
   || note "happy path exited $RC: $(tail -3 "$H/err" | tr '\n' '|')"
 SUBJECTS="$(git -C "$H/remote.git" log --format=%s "$MAIN_BEFORE..integration/x")"
@@ -572,6 +819,10 @@ RUNDIR="$(ls -d "$H"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && grep -q '^- #2 Second thing — delivered by its own issue' "$RUNDIR/issues/1/PROMPT.md" \
   && ok "happy path: per-issue autopilot state dirs hold the charter, status and PR body" \
   || note "happy path: per-issue state missing under $RUNDIR"
+PHASES=",$(cat "$RUNDIR"issues/1/run-*.jsonl 2>/dev/null | jq -r '.phase' | sort -u | tr '\n' ',')"
+[[ "$PHASES" == *",plan,"* && "$PHASES" == *",build,"* ]] \
+  && ok "happy path: issue #1's own run log shows loop.sh actually ran a plan and a build phase" \
+  || note "happy path: issue #1's run log phases were: $PHASES"
 
 # --- the review step on the happy path (#59) ---------------------------------
 for pr in 4 5; do
@@ -611,9 +862,7 @@ grep -E '^pr merge' "$H/gh/calls" | grep -q -- '--match-head-commit [0-9a-f]\{40
   || note "guardrail: a merge was not pinned to its head sha"
 
 # --- --extra-allowed-tools reaches BUILD, and never a forge grant ----------------
-new_fixture extra
-run_deliver extra STUB_BUILD_LOG="$WORK/extra/build.log" STUB_REVIEW_LOG="$WORK/extra/review.log" -- --extra-allowed-tools 'Bash(jq:*),Bash(bash scripts/x.sh)'
-RC=$?
+RC="$(cat "$WORK/extra/rc")"
 [[ "$RC" -eq 0 ]] && [[ "$(grep -c . "$WORK/extra/build.log")" -ge 2 ]] \
   && ! grep -v 'Bash(jq:\*),Bash(bash scripts/x.sh)' "$WORK/extra/build.log" | grep -q . \
   && ok "--extra-allowed-tools is appended to every BUILD call's allowlist" \
@@ -621,23 +870,18 @@ RC=$?
 [[ "$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u)" == "Read,Grep,Glob" ]] \
   && ok "--extra-allowed-tools never reaches the reviewer (its allowlist stays Read,Grep,Glob)" \
   || note "--extra-allowed-tools: reviewer allowlist was '$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u | tr '\n' '|')'"
-for bad in 'Bash' 'Bash(env gh:*)' 'Read, Bash(/usr/bin/git  push origin x)'; do
-  new_fixture extrabad
-  run_deliver extrabad -- --extra-allowed-tools "$bad"
-  RC=$?
-  if [[ "$RC" -eq 1 ]] && grep -q 'extra-allowed-tools refused (ADR-0007)' "$WORK/extrabad/err" && [[ ! -s "$WORK/extrabad/gh/calls" ]]; then
+for i in "${!EXTRABAD_VALUES[@]}"; do
+  bad="${EXTRABAD_VALUES[$i]}"; name="extrabad$i"
+  RC="$(cat "$WORK/$name/rc")"
+  if [[ "$RC" -eq 1 ]] && grep -q 'extra-allowed-tools refused (ADR-0007)' "$WORK/$name/err" && [[ ! -s "$WORK/$name/gh/calls" ]]; then
     ok "--extra-allowed-tools '$bad' is refused before any forge call"
   else
     note "--extra-allowed-tools '$bad': exit $RC"
   fi
-  rm -rf "$WORK/extrabad"
 done
 
 # --- a model phase has no forge credentials; the runner has its own (#77) ------
-new_fixture nocreds
-run_deliver nocreds GH_TOKEN=runner-token STUB_FORGE_PROBE="$WORK/nocreds/probe" -- \
-  --verify-cmd "gh auth status >/dev/null 2>&1; echo verify-gh=\$? >> '$WORK/nocreds/probe'; true"
-RC=$?
+RC="$(cat "$WORK/nocreds/rc")"
 PROBE="$(sort -u "$WORK/nocreds/probe" 2>/dev/null | tr '\n' ' ')"
 [[ "$RC" -eq 0 ]] && [[ "$PROBE" == "gh=4 helper=[] token=<unset> verify-gh=4 " ]] \
   && grep -q '^UNAUTH auth status' "$WORK/nocreds/gh/calls" \
@@ -647,18 +891,15 @@ PROBE="$(sort -u "$WORK/nocreds/probe" 2>/dev/null | tr '\n' ' ')"
 
 # --- --per-call-timeout reaches autopilot (#83) ---------------------------------
 # A BUILD that outlives the bound is cut off (exit 124) and the issue parks.
-new_fixture pct
-run_deliver pct STUB_BUILD_SLEEP=4 -- --per-call-timeout 2 --issue-max-iterations 1
-RC=$?
+RC="$(cat "$WORK/pct/rc")"
 PCT_BUILD="$(cat "$WORK"/pct/repo/tmp/deliver/*/issues/1/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="build") | .exit_code' | sort -u | tr '\n' ' ')"
 [[ "$RC" -eq 2 && "$PCT_BUILD" == "124 " ]] \
   && ok "--per-call-timeout bounds autopilot's calls (BUILD cut off with 124, issue parked)" \
   || note "--per-call-timeout: exit $RC, build exit codes '$PCT_BUILD'"
-for bad in 1.5 0; do
-  rm -rf "$WORK/pctbad"; new_fixture pctbad
-  run_deliver pctbad -- --per-call-timeout "$bad"
-  RC=$?
-  [[ "$RC" -eq 1 ]] && grep -q 'takes whole seconds' "$WORK/pctbad/err" && [[ ! -s "$WORK/pctbad/gh/calls" ]] \
+for i in "${!PCTBAD_VALUES[@]}"; do
+  bad="${PCTBAD_VALUES[$i]}"; name="pctbad$i"
+  RC="$(cat "$WORK/$name/rc")"
+  [[ "$RC" -eq 1 ]] && grep -q 'takes whole seconds' "$WORK/$name/err" && [[ ! -s "$WORK/$name/gh/calls" ]] \
     && ok "--per-call-timeout $bad is refused before any forge call" \
     || note "--per-call-timeout $bad: exit $RC"
 done
@@ -666,129 +907,62 @@ done
 # --- pacing (#88): full verify once per autopilot run by default ---------------
 # Per issue: autopilot's completion verify + deliver's own final verify = 2.
 # With --verify-every-iteration autopilot verifies each of its 2 iterations.
-new_fixture pace
-run_deliver pace -- --verify-cmd "echo v >> '$WORK/pace/count'"
-RC=$?
+RC="$(cat "$WORK/pace/rc")"
 PACE_DEFAULT="$(wc -l < "$WORK/pace/count" 2>/dev/null | tr -d ' ')"
-new_fixture paceall
-run_deliver paceall -- --verify-cmd "echo v >> '$WORK/paceall/count'" --verify-every-iteration
-RC2=$?
+RC2="$(cat "$WORK/paceall/rc")"
 PACE_ALL="$(wc -l < "$WORK/paceall/count" 2>/dev/null | tr -d ' ')"
 [[ "$RC" -eq 0 && "$PACE_DEFAULT" -eq 4 && "$RC2" -eq 0 && "$PACE_ALL" -eq 6 ]] \
   && ok "deliver runs autopilot's full verify once per issue by default (4 runs for 2 issues; 6 with --verify-every-iteration)" \
   || note "pacing: default exit $RC / $PACE_DEFAULT verify runs, every-iteration exit $RC2 / $PACE_ALL"
-new_fixture pacebad
-run_deliver pacebad -- --verify-every-iteration --iteration-verify-cmd true
-RC=$?
+RC="$(cat "$WORK/pacebad/rc")"
 [[ "$RC" -eq 1 && ! -s "$WORK/pacebad/gh/calls" ]] \
   && ok "--iteration-verify-cmd with --verify-every-iteration is refused before any forge call" \
   || note "pacing flag conflict: exit $RC"
 
 # --- refusals ------------------------------------------------------------------
-new_fixture onmain
-git -C "$WORK/onmain/repo" switch -q main
-run_deliver onmain
-RC=$?
+RC="$(cat "$WORK/onmain/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "refusing to merge into 'main'" "$WORK/onmain/err" && [[ ! -s "$WORK/onmain/gh/calls" ]] \
   && ok "refuses main (exit 1) before any forge call" \
   || note "on main: exit $RC, gh calls: $(tr '\n' '|' < "$WORK/onmain/gh/calls" 2>/dev/null)"
 
-new_fixture dirty
-echo junk > "$WORK/dirty/repo/untracked.txt"
-run_deliver dirty
-RC=$?
+RC="$(cat "$WORK/dirty/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "working tree is dirty" "$WORK/dirty/err" && [[ ! -s "$WORK/dirty/gh/calls" ]] \
   && ok "refuses a dirty tree (exit 1) before any forge call" \
   || note "dirty tree: exit $RC"
 
-new_fixture nomap
-jq '.body = "no delivery section here"' "$WORK/nomap/gh/issues/3.json" > "$WORK/nomap/x" && mv "$WORK/nomap/x" "$WORK/nomap/gh/issues/3.json"
-run_deliver nomap
-RC=$?
+RC="$(cat "$WORK/nomap/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "has no '## Delivery' lines" "$WORK/nomap/err" \
   && ok "refuses a Map without a Delivery section" || note "no-delivery map: exit $RC"
 
-new_fixture behind
-git -C "$WORK/behind/repo" commit -q --allow-empty -m "local only"
-run_deliver behind
-RC=$?
+RC="$(cat "$WORK/behind/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "not in sync with origin" "$WORK/behind/err" \
   && ok "refuses an integration branch that is not in sync with origin" || note "out-of-sync branch: exit $RC"
 
 # --- missing tools: refused before anything is copied or called --------------
-# path_without <dir> <tool>... — a PATH directory holding every executable of
-# the current PATH except the named tools (the test bin's shims included).
-path_without() {
-  local out="$1" p f b skip; shift
-  mkdir -p "$out"
-  local IFS=:
-  for p in $BIN:$PATH; do
-    [[ -d "$p" ]] || continue
-    for f in "$p"/*; do
-      b="${f##*/}"; skip=0
-      for t in "$@"; do [[ "$b" == "$t" ]] && skip=1; done
-      [[ "$skip" -eq 1 || -e "$out/$b" || ! -x "$f" ]] && continue
-      ln -s "$f" "$out/$b"
-    done
-  done
-}
 for tool in jq gh; do
-  new_fixture "no$tool"
-  path_without "$WORK/no$tool/bin" "$tool"
-  ( cd "$WORK/no$tool/repo" && env PATH="$WORK/no$tool/bin" FAKE_GH_DIR="$WORK/no$tool/gh" \
-      XDG_STATE_HOME="$WORK/no$tool/state" \
-      "$(command -v bash)" "$DELIVER_ABS" --map 3 --verify-cmd true >"$WORK/no$tool/out" 2>"$WORK/no$tool/err" )
-  RC=$?
+  RC="$(cat "$WORK/no$tool/rc")"
   [[ "$RC" -eq 1 ]] && grep -q "'$tool'" "$WORK/no$tool/err" \
     && [[ -z "$(ls -A "$WORK/no$tool/state" 2>/dev/null)" && ! -s "$WORK/no$tool/gh/calls" ]] \
     && ok "refuses a machine without $tool (exit 1), with no runner copy and no forge call" \
     || note "without $tool: exit $RC, err: $(tail -1 "$WORK/no$tool/err")"
 done
-new_fixture unauth
-run_deliver unauth FAKE_GH_UNAUTH=1
-RC=$?
+RC="$(cat "$WORK/unauth/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "not authenticated" "$WORK/unauth/err" \
   && [[ -z "$(ls -A "$WORK/unauth/state" 2>/dev/null)" ]] \
   && ok "refuses an unauthenticated gh before copying the runner" \
   || note "unauthenticated gh: exit $RC, state: $(ls -A "$WORK/unauth/state" 2>/dev/null)"
 
 # --- a Map edited mid-run into an invalid one stops with its own name ----------
-new_fixture midedit
-run_deliver midedit FAKE_GH_AFTER_FIRST_MERGE_BODY='- [ ] #2 Second thing (after: #1)' -- 
-RC=$?
+RC="$(cat "$WORK/midedit/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "became invalid mid-run" "$WORK/midedit/err" \
   && ok "a Map edited mid-run into a duplicate line stops with a validation error" \
   || note "mid-run invalid Map: exit $RC, err: $(tail -1 "$WORK/midedit/err")"
 
-# parked_one <name> — issue #1 is parked: labelled needs-human (and no longer
-# ready-for-agent), one comment saying it was parked, the Map unticked.
-parked_one() {
-  local d="$WORK/$1"
-  [[ "$(jq -r '[.labels[].name] | sort | join(",")' "$d/gh/issues/1.json")" == "needs-human" ]] \
-    && jq -r '.comments[-1].body' "$d/gh/issues/1.json" | grep -q '^\*\*Parked by `/deliver`\*\*' \
-    && [[ "$(jq -r .body "$d/gh/issues/3.json")" == *"- [ ] #1 "* ]]
-}
-# held <name> — #1 got as far as PR #4, which is now a draft, unmerged; #1 is
-# parked, #2 (after #1) was skipped, integration/x is untouched, and the
-# checkout is back on integration/x, clean.
-held() {
-  local d="$WORK/$1"
-  [[ "$(jq -r .state "$d/gh/prs/4.json" 2>/dev/null)" == "OPEN" ]] \
-    && [[ "$(jq -r .isDraft "$d/gh/prs/4.json" 2>/dev/null)" == "true" ]] \
-    && ! grep -q '^pr merge' "$d/gh/calls" \
-    && parked_one "$1" \
-    && [[ ! -f "$d/gh/prs/5.json" ]] \
-    && [[ "$(git -C "$d/remote.git" rev-parse integration/x)" == "$(git -C "$d/remote.git" rev-parse main)" ]] \
-    && [[ "$(git -C "$d/repo" branch --show-current)" == "integration/x" && -z "$(git -C "$d/repo" status --porcelain)" ]]
-}
-
 # --- parking (#58): an issue that does not finish is set aside ----------------
 # #1 stalls in autopilot; #2 waits on #1; #4 is independent. #1 is parked,
 # #2 skipped, #4 still delivered — and the run says so with exit 2.
-new_fixture park with4
-run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
-RC=$?
 P="$WORK/park"
+RC="$(cat "$WORK/park/rc")"
 [[ "$RC" -eq 2 ]] && ok "park: a stalled issue parks, the run carries on and ends partial (exit 2)" \
   || note "park: exit $RC — $(tail -2 "$P/err" | tr '\n' '|')"
 parked_one park && ! grep -q '^pr create.*--head feat/1-' "$P/gh/calls" \
@@ -812,15 +986,14 @@ grep -q 'parked: #1' "$P/err" && grep -q 'skipped (blocked by a parked issue): #
   || note "park: checkout on '$(git -C "$P/repo" branch --show-current)' or branch feat/1-first-feature gone"
 
 # An existing needs-human label is used as is, not an error.
-new_fixture park2
-echo needs-human >> "$WORK/park2/gh/labels"
-run_deliver park2 STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
-RC=$?
+RC="$(cat "$WORK/park2/rc")"
 [[ "$RC" -eq 2 ]] && parked_one park2 \
   && ok "park: a repo that already has needs-human parks the same way" || note "park with existing label: exit $RC"
 
 # Running again while #1 still carries needs-human: #1 is left alone (no new
-# branch, no new comment) and #2 is skipped again — partial, not a crash.
+# branch, no new comment) and #2 is skipped again — partial, not a crash. This
+# rerun genuinely must follow the first park run (it reads and extends the
+# state that run left behind), so it stays a foreground call, not a job.
 N_COMMENTS="$(jq '.comments | length' "$P/gh/issues/1.json")"
 run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
 RC=$?
@@ -831,7 +1004,8 @@ RC=$?
   || note "park rerun with label: exit $RC — $(tail -1 "$P/err")"
 
 # A human removes the label but not the old branch: the run must not die on
-# it — the issue is parked again with that reason, the rest carries on.
+# it — the issue is parked again with that reason, the rest carries on. Also
+# a foreground rerun for the same reason as above.
 jq '.labels = [{name:"ready-for-agent"}]' "$P/gh/issues/1.json" > "$P/x" && mv "$P/x" "$P/gh/issues/1.json"
 run_deliver park STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
 RC=$?
@@ -843,10 +1017,7 @@ RC=$?
 # A later issue hitting a leftover branch, after earlier issues merged in the
 # same run, must be parked in its own name — not with the previous issue's
 # PR and branch (review round 2 of #58 found exactly that).
-new_fixture parklate with4
-git -C "$WORK/parklate/repo" branch feat/4-independent-thing
-run_deliver parklate
-RC=$?
+RC="$(cat "$WORK/parklate/rc")"
 PL="$WORK/parklate"
 C4="$(jq -r '.comments[-1].body' "$PL/gh/issues/4.json")"
 [[ "$RC" -eq 2 ]] && [[ "$(jq -r '[.labels[].name] | join(",")' "$PL/gh/issues/4.json")" == "needs-human" ]] \
@@ -859,96 +1030,72 @@ C4="$(jq -r '.comments[-1].body' "$PL/gh/issues/4.json")"
 
 # verify passes during autopilot but fails on the finished head (it fails
 # only once HEAD is autopilot's final "green" checkpoint).
-new_fixture parkverify
-run_deliver parkverify -- --verify-cmd '! git log -1 --format=%s | grep -q "(green)"'
-RC=$?
+RC="$(cat "$WORK/parkverify/rc")"
 [[ "$RC" -eq 2 ]] && parked_one parkverify \
   && jq -r '.comments[-1].body' "$WORK/parkverify/gh/issues/1.json" | grep -q 'verify failed on the head' \
   && ! grep -q '^pr create' "$WORK/parkverify/gh/calls" \
   && ok "park: verify failing on the finished head parks the issue before anything is pushed" \
   || note "park on verify: exit $RC — $(tail -1 "$WORK/parkverify/err")"
 
-new_fixture parknowork
-run_deliver parknowork STUB_NOWORK_ISSUES=1
-RC=$?
+RC="$(cat "$WORK/parknowork/rc")"
 [[ "$RC" -eq 2 ]] && parked_one parknowork \
   && jq -r '.comments[-1].body' "$WORK/parknowork/gh/issues/1.json" | grep -q 'done without a single commit' \
   && ok "park: autopilot reporting done without a commit parks the issue" \
   || note "park on no commit: exit $RC — $(tail -1 "$WORK/parknowork/err")"
 
 # --- review verdicts that hold a PR (#59) — the issue is parked (#58) ----------
-new_fixture rvblock
-run_deliver rvblock STUB_REVIEW=blocker
-RC=$?
+RC="$(cat "$WORK/rvblock/rc")"
 [[ "$RC" -eq 2 ]] && held rvblock && jq -r '.comments[0].body' "$WORK/rvblock/gh/prs/4.json" | grep -q 'Runner verdict: changes_requested' \
   && ok "review: an in-scope blocker parks the issue — PR back to draft, review posted, nothing merged, #2 skipped (exit 2)" \
   || note "review blocker: exit $RC"
 
-new_fixture rvliar
-run_deliver rvliar STUB_REVIEW=liar
-RC=$?
+RC="$(cat "$WORK/rvliar/rc")"
 [[ "$RC" -eq 2 ]] && held rvliar \
   && jq -r '.comments[0].body' "$WORK/rvliar/gh/prs/4.json" | grep -qF '**Runner verdict: changes_requested** (reviewer said: approve)' \
   && ok "review: 'approve' with an in-scope issue is overruled by the runner" \
   || note "review liar: exit $RC"
 
-new_fixture rvoos
-run_deliver rvoos STUB_REVIEW=outofscope
-RC=$?
+RC="$(cat "$WORK/rvoos/rc")"
 [[ "$RC" -eq 0 && "$(jq -r .state "$WORK/rvoos/gh/prs/4.json")" == "MERGED" ]] \
   && ok "review: an out-of-scope finding does not block the merge" \
   || note "review out-of-scope: exit $RC"
 
-new_fixture rvgarbage
-run_deliver rvgarbage STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log"
-RC=$?
+RC="$(cat "$WORK/rvgarbage/rc")"
 [[ "$RC" -eq 2 ]] && held rvgarbage && [[ "$(grep -c . "$WORK/rvgarbage/review.log")" -eq 2 ]] \
   && jq -r '.comments[0].body' "$WORK/rvgarbage/gh/prs/4.json" | grep -q 'Runner verdict: no verdict' \
   && ok "review: no usable verdict is retried once, then parks the issue (fail closed)" \
   || note "review garbage: exit $RC, calls $(grep -c . "$WORK/rvgarbage/review.log" 2>/dev/null)"
 
-new_fixture rvretry
-run_deliver rvretry STUB_REVIEW=garbage-once STUB_REVIEW_STATE="$WORK/rvretry/review.state"
-RC=$?
+RC="$(cat "$WORK/rvretry/rc")"
 [[ "$RC" -eq 0 ]] && [[ "$(cat "$WORK"/rvretry/repo/tmp/deliver/*/run-*.jsonl | jq -s '[.[] | select(.phase=="review") | .verdict] | join(",")')" == '"no_verdict,approve,approve"' ]] \
   && ok "review: one inconclusive reply then a real verdict proceeds (logged as no_verdict, approve)" \
   || note "review retry: exit $RC"
 
-new_fixture rvmutate
-run_deliver rvmutate STUB_REVIEW=mutate
-RC=$?
+RC="$(cat "$WORK/rvmutate/rc")"
 [[ "$RC" -eq 1 ]] && grep -q 'SAFETY BREACH' "$WORK/rvmutate/err" && ! grep -q '^pr merge' "$WORK/rvmutate/gh/calls" \
   && [[ "$(jq -r .body "$WORK/rvmutate/gh/issues/3.json")" != *"[x]"* ]] \
   && ok "review: a reviewer that moves the runner's checkout fails the whole run, nothing merges" \
   || note "review mutate: exit $RC, err: $(tail -1 "$WORK/rvmutate/err")"
 
 for m in mutate-ref mutate-tmp mutate-hook; do
-  new_fixture "rv$m"
-  run_deliver "rv$m" STUB_REVIEW="$m"
-  RC=$?
+  RC="$(cat "$WORK/rv$m/rc")"
   [[ "$RC" -eq 1 ]] && grep -q 'SAFETY BREACH' "$WORK/rv$m/err" && ! grep -q '^pr merge' "$WORK/rv$m/gh/calls" \
     && ok "review: $m (a write the checkout's status cannot see) is still a safety breach" \
     || note "review $m: exit $RC, err: $(tail -1 "$WORK/rv$m/err")"
 done
 
-new_fixture rvexample
-run_deliver rvexample STUB_REVIEW=example-after
-RC=$?
+RC="$(cat "$WORK/rvexample/rc")"
 [[ "$RC" -eq 0 && "$(jq -r .state "$WORK/rvexample/gh/prs/4.json")" == "MERGED" ]] \
   && ok "review: a clean verdict followed by the restated format example still merges" \
   || note "review example-after: exit $RC"
 
-new_fixture rvwronghead
-run_deliver rvwronghead STUB_REVIEW=wrong-head
-RC=$?
+RC="$(cat "$WORK/rvwronghead/rc")"
 [[ "$RC" -eq 2 ]] && held rvwronghead \
   && ok "review: a verdict for a different head is no verdict (parked)" \
   || note "review wrong-head: exit $RC"
 
 # --- a merge refused by the forge parks the issue -----------------------------
-new_fixture refused
-run_deliver refused FAKE_GH_MERGE_FAIL=1
-RC=$?
+RC="$(cat "$WORK/refused/rc")"
 R="$WORK/refused"
 [[ "$RC" -eq 2 ]] && parked_one refused && [[ "$(jq -r .isDraft "$R/gh/prs/4.json")" == "true" ]] \
   && [[ "$(git -C "$R/remote.git" rev-parse integration/x)" == "$(git -C "$R/remote.git" rev-parse main)" ]] \
