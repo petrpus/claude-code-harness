@@ -413,6 +413,13 @@ to go missing from the budget.
 - `--per-call-timeout` (1200s) wraps every `claude -p` and the verify command in
   `timeout`, so one hung call can't defeat `--max-minutes` (which is only checked
   between phases).
+- `--verify-at-completion` (with optional `--iteration-verify-cmd`) moves gate
+  (b)'s full verify to the iteration that completes the plan — `STATUS: done`
+  or every box ticked; other iterations log `verify_cmd` as `deferred` (or run
+  the cheap iteration command). The completing iteration is still gated: a red
+  verify there resets `STATUS` and feeds back like any failure. Meant for a
+  charter that another gate stands behind (`/deliver`'s final verify, review,
+  CI); a bare autopilot run keeps verifying every iteration.
 - `--stop-file <path>` is a graceful stop, not a cap: checked before PLAN and at
   the top of every iteration (ahead of the caps), so a stop requested mid-BUILD
   lets that iteration's gates and checkpoint finish, then exits **6** with state
@@ -490,13 +497,14 @@ map), so it answers "did BUILD see one," not "was the flag on."
 
 ### Per-run aggregates (S3B)
 
-`write_status()` recomputes seven aggregates from the run's own JSONL log on
+`write_status()` recomputes eight aggregates from the run's own JSONL log on
 *every* call (not accumulated in a bash variable across the run), and merges
 them into `status.json`:
 
 ```json
 {"iterations":3,"gate_fail_rate":0.667,"cost_per_ticked_slice":3,
- "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1}
+ "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1,
+ "verify_deferred":0}
 ```
 
 - `iterations` — count of `phase:"iteration"` rows so far.
@@ -514,6 +522,10 @@ them into `status.json`:
   slice parked, unparked by a replan, and parked again as two separate
   incidents; the peak answers "how bad did it get."
 - `escalations` — count of iterations with `escalated:true`.
+- `verify_deferred` — count of iterations whose gate (b) was deferred under
+  `--verify-at-completion` (ADR-0009). Those iterations can never fail gate
+  (b), so a run with deferrals has a structurally lower `gate_fail_rate`;
+  compare it only with runs that deferred the same way.
 
 A missing or empty run log (before the first `log_iteration()` call, or a
 0.4.0-era `tmp/autopilot/` with no log at all) yields all-zero aggregates and

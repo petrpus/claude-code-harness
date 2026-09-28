@@ -663,6 +663,27 @@ for bad in 1.5 0; do
     || note "--per-call-timeout $bad: exit $RC"
 done
 
+# --- pacing (#88): full verify once per autopilot run by default ---------------
+# Per issue: autopilot's completion verify + deliver's own final verify = 2.
+# With --verify-every-iteration autopilot verifies each of its 2 iterations.
+new_fixture pace
+run_deliver pace -- --verify-cmd "echo v >> '$WORK/pace/count'"
+RC=$?
+PACE_DEFAULT="$(wc -l < "$WORK/pace/count" 2>/dev/null | tr -d ' ')"
+new_fixture paceall
+run_deliver paceall -- --verify-cmd "echo v >> '$WORK/paceall/count'" --verify-every-iteration
+RC2=$?
+PACE_ALL="$(wc -l < "$WORK/paceall/count" 2>/dev/null | tr -d ' ')"
+[[ "$RC" -eq 0 && "$PACE_DEFAULT" -eq 4 && "$RC2" -eq 0 && "$PACE_ALL" -eq 6 ]] \
+  && ok "deliver runs autopilot's full verify once per issue by default (4 runs for 2 issues; 6 with --verify-every-iteration)" \
+  || note "pacing: default exit $RC / $PACE_DEFAULT verify runs, every-iteration exit $RC2 / $PACE_ALL"
+new_fixture pacebad
+run_deliver pacebad -- --verify-every-iteration --iteration-verify-cmd true
+RC=$?
+[[ "$RC" -eq 1 && ! -s "$WORK/pacebad/gh/calls" ]] \
+  && ok "--iteration-verify-cmd with --verify-every-iteration is refused before any forge call" \
+  || note "pacing flag conflict: exit $RC"
+
 # --- refusals ------------------------------------------------------------------
 new_fixture onmain
 git -C "$WORK/onmain/repo" switch -q main
