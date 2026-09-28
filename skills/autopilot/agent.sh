@@ -159,6 +159,8 @@ agent_run() {
   if [[ -n "${AGENT_TRANSCRIPT_DIR:-}" ]] && mkdir -p "$AGENT_TRANSCRIPT_DIR" 2>/dev/null; then
     # Continue after the files already there: a resumed or reloaded run is a
     # new process, and must not overwrite the replies of the one before.
+    # Assumes one writer per directory (loop.sh's lock guarantees it for its
+    # state dir); give a second writer its own directory.
     if [[ -z "${AGENT_CALL_SEQ:-}" ]]; then
       AGENT_CALL_SEQ="$(find "$AGENT_TRANSCRIPT_DIR" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
     fi
