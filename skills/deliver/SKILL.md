@@ -20,8 +20,8 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
 > independent review (#59), parking (#58), final-verify's base-moved
-> handling and merge retry, and the CI wait (#60, partial). Not yet: CI fix
-> rounds, resume, the tmux launcher.
+> handling and merge retry, and the CI wait with its one fix round (#60).
+> Not yet: resume, the tmux launcher.
 
 ## When an issue does not make it
 
@@ -62,7 +62,8 @@ issue's fault: it ends the run with exit 1, where it is.
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
      [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
-     [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
+     [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120] \
+     [--max-fix-rounds 2]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -120,10 +121,19 @@ every `--ci-poll-seconds` (default 30) before the PR may merge:
   merges anyway, noting `CI: no CI reported.` on the issue's merge comment;
 - **all reported checks pass** (nothing left `pending`): merges, logged with
   verdict `pass`;
-- **any reported check fails**: parks with the failed checks' names in the
-  reason (a fix round arrives with #63); logged with verdict `fail`;
+- **any reported check fails**: spends one round from the issue's shared
+  `--max-fix-rounds` budget (default 2, shared with #63's review fix
+  rounds). The fix round fetches the failed run's log tail
+  (`forge_ci_failed_log`, `gh run view <id> --log-failed`), appends a
+  `- [ ] C<round> Fix red CI: <check>` plan item with the log fenced as data,
+  reopens `STATUS: in-progress` and resumes autopilot (`loop.sh
+  --resume-run`); a clean finish goes back through final-verify and
+  `ci_wait`. No round left, autopilot not finishing the fix, or CI still red
+  after the round parks — with the failed checks' names, or the log tail
+  when a round was spent — logged with verdict `fail`;
 - **still `pending` past `--ci-timeout`** (default 1800 s): parks ("CI still
-  pending after …"); logged with verdict `timeout`.
+  pending after …"), no fix round (the check never actually failed); logged
+  with verdict `timeout`.
 
 **Pacing.** An issue is already one PR-sized slice, so by default autopilot
 gets `--plan-max-items 3` (a small plan; `--plan-max-items 0` lifts it) and

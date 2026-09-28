@@ -56,7 +56,7 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 . skills/deliver/forge.sh
 
 WORK="$(mktemp -d)"
-echo "DEBUG WORK=$WORK" >&2
+trap 'rm -rf "$WORK"' EXIT
 
 # ===========================================================================
 # Unit: map.sh

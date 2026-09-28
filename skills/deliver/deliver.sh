@@ -297,9 +297,10 @@ review_issue() {
 # the caller). Fetches; if origin/$BASE is not an ancestor of HEAD, merges it
 # in — a conflict aborts the merge and parks with the conflicting paths in
 # PARK_REASON. Verify always runs, in a clean tree, on the (possibly merged)
-# head; a merge that happened is pushed with forge_push_update, whether this
-# is the first call (before the branch is ever pushed — a push here quietly
-# becomes the branch's first) or a retry after a merge refusal.
+# head; whenever HEAD ends up ahead of (or without) origin/$CUR_BRANCH — a
+# base merge, or a re-entry after a CI fix round committed new work — it is
+# pushed with forge_push_update. That covers the first call too (before the
+# branch is ever pushed — a push here quietly becomes the branch's first).
 # Returns 0 verified · 10 park (PARK_REASON set) · 1 stop the run.
 # ---------------------------------------------------------------------------
 final_verify() {
@@ -329,7 +330,7 @@ final_verify() {
     return 10
   fi
   [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify changed the checkout — stopping."; return 1; }
-  if [[ "$merged" -eq 1 ]]; then
+  if [[ "$merged" -eq 1 || "$(git rev-parse "origin/$CUR_BRANCH" 2>/dev/null)" != "$head_now" ]]; then
     forge_push_update "$CUR_BRANCH" || { log "#$n: push failed — stopping."; return 1; }
   fi
   return 0
