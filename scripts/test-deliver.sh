@@ -50,6 +50,8 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 . skills/deliver/charter.sh
 # shellcheck source=../skills/deliver/review.sh
 . skills/deliver/review.sh
+# shellcheck source=../skills/deliver/state.sh
+. skills/deliver/state.sh
 # forge.sh is sourced for its one pure function (forge_grant_violations);
 # nothing here calls gh through it.
 # shellcheck source=../skills/deliver/forge.sh
@@ -57,6 +59,7 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+REPORT_ABS="$(pwd)/skills/usage-report/report.sh"
 
 # ===========================================================================
 # Unit: map.sh
@@ -231,6 +234,52 @@ review_parse '{"verdict":"approve","findings":"none"}' >/dev/null && note "parse
   || ok "parse: findings that are not an array are no verdict"
 
 # ===========================================================================
+# Unit: state.sh (#61 S1 — state.json, events.jsonl, status.json, cost sums)
+# ===========================================================================
+echo "-- state.sh"
+ST="$WORK/state1"; mkdir -p "$ST"
+state_init "$ST" 3 "integration/x" "run-1" "0.6.0"
+jq -e '.map==3 and .base=="integration/x" and .run_id=="run-1" and .runner_version=="0.6.0" and .active_seconds==0 and (.issues=={})' "$ST/state.json" >/dev/null \
+  && ok "state_init: run identity, active_seconds 0, an empty issues map" \
+  || note "state_init: $(cat "$ST/state.json" 2>/dev/null)"
+state_issue_update "$ST" 1 '{"state":"building","branch":"feat/1-x"}'
+state_issue_update "$ST" 1 '{"round":1}'
+jq -e '.issues["1"].state=="building" and .issues["1"].branch=="feat/1-x" and .issues["1"].round==1' "$ST/state.json" >/dev/null \
+  && ok "state_issue_update: shallow-merges into one issue, keeping fields set by an earlier call" \
+  || note "state_issue_update: $(jq -c .issues "$ST/state.json" 2>/dev/null)"
+state_set_active_seconds "$ST" 42
+[[ "$(jq -r .active_seconds "$ST/state.json")" == "42" ]] \
+  && ok "state_set_active_seconds: updates the run-level field" || note "active_seconds not set"
+state_event "$ST" 1 building ""
+state_event "$ST" "" stopped "STOP file present"
+EV2="$(sed -n 2p "$ST/events.jsonl")"
+[[ "$(wc -l < "$ST/events.jsonl" | tr -d ' ')" -eq 2 ]] \
+  && [[ "$(jq -r .issue <<<"$EV2")" == "null" ]] && [[ "$(jq -r .event <<<"$EV2")" == "stopped" ]] \
+  && ok "state_event: appended, one row per transition; a run-level event carries no issue" \
+  || note "events.jsonl: $(tr '\n' '|' < "$ST/events.jsonl")"
+mkdir -p "$ST/issues/1"
+printf '%s\n' '{"phase":"plan","cost_usd":1}' '{"phase":"build","cost_usd":2}' '{"phase":"iteration","cost_usd":99}' \
+  > "$ST/issues/1/run-a.jsonl"
+printf '%s\n' '{"phase":"review","cost_usd":4}' > "$ST/run-run-1.jsonl"
+[[ "$(state_total_cost "$ST")" == "7" ]] \
+  && ok "state_total_cost: sums the runner's own log and every issue's log, excluding phase:iteration" \
+  || note "state_total_cost: $(state_total_cost "$ST")"
+EMPTY="$WORK/state-empty"; mkdir -p "$EMPTY"
+[[ "$(state_total_cost "$EMPTY")" == "0" ]] \
+  && ok "state_total_cost: no logs on disk yet is 0, not an error" \
+  || note "state_total_cost (empty): $(state_total_cost "$EMPTY")"
+state_write_status "$ST" running 1 2 0 7 120
+jq -e '.state=="running" and .current_issue==1 and .merged_count==2 and .parked_count==0 and .cost_usd==7 and .elapsed_s==120' "$ST/status.json" >/dev/null \
+  && ok "state_write_status: the run's headline fields" || note "status.json: $(cat "$ST/status.json" 2>/dev/null)"
+state_write_status "$ST" done "" 2 0 7 130
+[[ "$(jq -r .current_issue "$ST/status.json")" == "null" ]] \
+  && ok "state_write_status: no current issue writes null, not the empty string" \
+  || note "status.json current_issue: $(jq .current_issue "$ST/status.json" 2>/dev/null)"
+[[ "$(state_clip_num 5 10)" == "5" && "$(state_clip_num 10 5)" == "5" && "$(state_clip_num -1 5)" == "0" ]] \
+  && ok "state_clip_num: min(remaining, requested); a negative remaining floors at 0" \
+  || note "state_clip_num: $(state_clip_num 5 10)/$(state_clip_num 10 5)/$(state_clip_num -1 5)"
+
+# ===========================================================================
 # Unit: forge_grant_violations (ADR-0007 for --extra-allowed-tools)
 # ===========================================================================
 echo "-- forge_grant_violations"
@@ -303,6 +352,14 @@ set -uo pipefail
 S="${FAKE_GH_DIR:?}"
 printf '%s\n' "$*" >> "$S/calls"
 mkdir -p "$S/issues" "$S/prs"
+# #61 S1: drop a STOP file into the run dir the moment it exists (the first
+# real gh call happens after deliver.sh has already created it) — lets a
+# test place STOP before the run's very first issue without knowing its
+# dynamic run-id ahead of time.
+if [[ -n "${FAKE_GH_TOUCH_STOP:-}" ]]; then
+  rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+  [[ -n "$rd" ]] && : > "${rd}STOP"
+fi
 arg() { # --flag value from "$@"
   local want="$1"; shift
   while [[ $# -gt 0 ]]; do [[ "$1" == "$want" ]] && { printf '%s' "$2"; return 0; }; shift; done
@@ -729,6 +786,16 @@ job_refused() {
   run_deliver refused FAKE_GH_MERGE_FAIL=1
   echo $? > "$WORK/refused/rc"
 }
+job_stopfile() {
+  new_fixture stopfile
+  run_deliver stopfile FAKE_GH_TOUCH_STOP=1
+  echo $? > "$WORK/stopfile/rc"
+}
+job_budget() {
+  new_fixture budget
+  run_deliver budget -- --budget-usd 0.06
+  echo $? > "$WORK/budget/rc"
+}
 
 bg job_happy
 bg job_extra
@@ -764,6 +831,8 @@ bg job_rvmutatevariant mutate-hook
 bg job_rvexample
 bg job_rvwronghead
 bg job_refused
+bg job_stopfile
+bg job_budget
 wait
 
 # ===========================================================================
@@ -848,6 +917,26 @@ REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
 [[ "$(cat "$RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .verdict=="approve")] | length')" -eq 2 ]] \
   && ok "review: both calls are in the run's own log (phase review, issue, verdict, cost)" \
   || note "review: run log rows missing under $RUNDIR"
+
+# --- run state (#61 S1): state.json / events.jsonl / status.json / lock -------
+jq -e '.map==3 and .base=="integration/x" and (.runner_version|type=="string") and (.active_seconds|type=="number")
+       and .issues["1"].state=="merged" and .issues["2"].state=="merged"
+       and (.issues["1"].pr|type=="number") and (.issues["1"].head|type=="string")' "$RUNDIR/state.json" >/dev/null \
+  && ok "state.json: run identity and both issues recorded merged, with their pr and head" \
+  || note "state.json: $(cat "$RUNDIR/state.json" 2>/dev/null)"
+[[ -s "$RUNDIR/events.jsonl" ]] && jq -e . "$RUNDIR/events.jsonl" >/dev/null 2>&1 \
+  && [[ "$(jq -c 'select(.event=="merged")' "$RUNDIR/events.jsonl" 2>/dev/null | wc -l | tr -d ' ')" -eq 2 ]] \
+  && ok "events.jsonl: one valid JSON row per transition, both merges recorded" \
+  || note "events.jsonl: $(tr '\n' '|' < "$RUNDIR/events.jsonl" 2>/dev/null)"
+jq -e '.state=="done" and .merged_count==2 and .parked_count==0 and (.cost_usd|type=="number") and (.elapsed_s|type=="number")' \
+  "$RUNDIR/status.json" >/dev/null \
+  && ok "status.json: final run headline (state, merged/parked counts, cost, elapsed)" \
+  || note "status.json: $(cat "$RUNDIR/status.json" 2>/dev/null)"
+[[ ! -f "$RUNDIR/lock" ]] && ok "lock file is removed on exit" || note "lock file left behind: $(cat "$RUNDIR/lock")"
+USAGE_OUT="$(bash "$REPORT_ABS" "$RUNDIR" 2>&1)"; USAGE_RC=$?
+[[ "$USAGE_RC" -eq 0 && "$USAGE_OUT" == *"## Per run"* ]] \
+  && ok "run-<id>.jsonl stays in loop.sh's schema: /usage-report's aggregation reads it without error" \
+  || note "usage-report: rc=$USAGE_RC, out: $(head -3 <<<"$USAGE_OUT" | tr '\n' '|')"
 
 # --- guardrails (ADR-0007), over every command the runner ran ----------------
 if grep -E '(^| )push( |$)' "$H/git.calls" | grep -qE -- '(--force|--force-with-lease|(^| )-f( |$)|(^| )-[a-zA-Z]*f[a-zA-Z]*( |$))'; then
@@ -1102,5 +1191,33 @@ R="$WORK/refused"
   && jq -r '.comments[-1].body' "$WORK/refused/gh/issues/1.json" | grep -q 'the forge refused to merge PR #4' \
   && ok "a merge refused by the forge parks the issue (PR back to draft, reason in the comment)" \
   || note "refused merge: exit $RC"
+
+# --- STOP file present before the run's first issue (#61 S1) ------------------
+RC="$(cat "$WORK/stopfile/rc")"
+SF="$WORK/stopfile"
+SFRUNDIR="$(ls -d "$SF"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 6 ]] && [[ -n "$SFRUNDIR" && -f "${SFRUNDIR}STOP" ]] \
+  && [[ "$(jq -r .state "${SFRUNDIR}status.json" 2>/dev/null)" == "stopped" ]] \
+  && [[ ! -f "$SF/gh/prs/4.json" ]] && ! grep -q '^pr create' "$SF/gh/calls" 2>/dev/null \
+  && ok "a STOP file present before the run's first issue: exit 6, state 'stopped', no PR opened" \
+  || note "STOP file: exit $RC, status=$(cat "${SFRUNDIR}status.json" 2>/dev/null), prs=$(ls "$SF/gh/prs" 2>/dev/null | tr '\n' ' ')"
+
+# --- a global budget small enough to trip after the first issue (#61 S1) ------
+# #1's own inner run (plan+build+verify calls, ~$0.03) plus its review (~$0.02)
+# comes to ~$0.05, under the $0.06 cap, so #1 merges; #2's own inner run pushes
+# the total past it, so the run stops before #2 finishes — the merge #1
+# already made is not undone.
+RC="$(cat "$WORK/budget/rc")"
+BD="$WORK/budget"
+BDRUNDIR="$(ls -d "$BD"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 4 ]] && [[ "$(jq -r .state "${BDRUNDIR}status.json" 2>/dev/null)" == "budget_exhausted" ]] \
+  && [[ "$(jq -r .state "$BD/gh/prs/4.json" 2>/dev/null)" == "MERGED" ]] \
+  && [[ ! -f "$BD/gh/prs/5.json" ]] \
+  && [[ "$(jq -r '.issues["2"].state // "none"' "${BDRUNDIR}state.json" 2>/dev/null)" != "merged" ]] \
+  && ok "a global budget cap small enough to trip after the first issue: exit 4, #1 merged, #2 left unfinished (resumable)" \
+  || note "budget cap: exit $RC, status=$(cat "${BDRUNDIR}status.json" 2>/dev/null), issues=$(jq -c .issues "${BDRUNDIR}state.json" 2>/dev/null)"
+jq -e '(.issues["1"].issue_budget_usd // 10) < 10 and (.issues["2"].issue_budget_usd // 10) < 10' "${BDRUNDIR}state.json" >/dev/null 2>&1 \
+  && ok "clipped per-issue caps are recorded on state.json: less than the default --issue-budget-usd (10)" \
+  || note "clipped caps: issues=$(jq -c .issues "${BDRUNDIR}state.json" 2>/dev/null)"
 
 finish

@@ -19,11 +19,23 @@
 #              [--issue-budget-usd 10] [--review-model sonnet]
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
+#              [--budget-usd <n>] [--max-minutes <n>]
 #
 # Run it from a clean checkout of the integration branch (never main/master),
-# in sync with origin. Exit codes: 0 every Delivery line merged ·
-# 1 precondition or runner failure · 2 partial (an issue was parked; its
-# dependents were skipped).
+# in sync with origin. State lives under tmp/deliver/<run-id>/: state.json
+# (resume truth), events.jsonl, status.json, run-<run-id>.jsonl (this
+# runner's own model calls, loop.sh's schema, so /usage-report reads it) and
+# a lock file holding this process's pid, removed on exit. A STOP file at
+# tmp/deliver/<run-id>/STOP is checked between phases (before a branch, after
+# a build, before a PR, before a review, before a merge) and passed to every
+# loop.sh call as --stop-file, so a build stopped mid-run stops the same way.
+# --budget-usd / --max-minutes cap the whole run (every inner run's cost and
+# this run's active time, summed — see state.sh); each issue's own
+# --issue-budget-usd / --issue-max-minutes is clipped to whatever the global
+# caps have left before that issue's loop.sh call. Exit codes: 0 every
+# Delivery line merged · 1 precondition or runner failure · 2 partial (an
+# issue was parked; its dependents were skipped) · 3 global time cap ·
+# 4 global budget cap · 6 stopped (STOP file present).
 
 set -uo pipefail
 
@@ -46,6 +58,8 @@ PLAN_MAX_ITEMS=3       # 0: no size hint
 VERIFY_EVERY_ITERATION=0
 ITERATION_VERIFY_CMD=""
 REVIEW_MODEL=sonnet
+BUDGET_USD=""          # empty: no global cap
+MAX_MINUTES=""         # empty: no global cap
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -63,7 +77,9 @@ while [[ $# -gt 0 ]]; do
     --verify-every-iteration) VERIFY_EVERY_ITERATION=1; shift ;;
     --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
-    -h|--help)              sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
+    --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
+    -h|--help)              sed -n '2,38p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -72,6 +88,8 @@ done
 [[ "$PLAN_MAX_ITEMS" =~ ^[0-9]+$ ]] || die "--plan-max-items takes a whole number (0: no limit)"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
+[[ -z "$BUDGET_USD" || "$BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--budget-usd takes a non-negative number"
+[[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
 
 # shellcheck source=../autopilot/plan.sh
 . "$PLUGIN_ROOT/skills/autopilot/plan.sh"
@@ -85,6 +103,8 @@ done
 . "$PLUGIN_ROOT/skills/autopilot/agent.sh"
 # shellcheck source=review.sh
 . "$SCRIPT_DIR/review.sh"
+# shellcheck source=state.sh
+. "$SCRIPT_DIR/state.sh"
 REVIEW_AGENT="$PLUGIN_ROOT/agents/code-reviewer.md"
 
 # ADR-0007: no model phase may hold a forge operation. A BUILD grant that
@@ -154,9 +174,91 @@ RUN_LOG="$RUN_DIR/run-$RUN_ID.jsonl"
 AGENT_STDERR_LOG="$RUN_DIR/claude-stderr.log"
 # The review call gets the same per-call bound as autopilot's calls.
 [[ -n "$PER_CALL_TIMEOUT" ]] && AGENT_TIMEOUT="$PER_CALL_TIMEOUT"
-# A run killed mid-review must not leave the reviewer's worktree behind.
-trap 'review_cleanup; agent_cleanup' EXIT
-trap 'review_cleanup; agent_cleanup; exit 130' INT TERM
+# A run killed mid-review must not leave the reviewer's worktree behind, or
+# a stale lock/pid file that a later --resume (#61 S3) would have to guess
+# was ours.
+trap 'rm -f "$RUN_DIR/lock" 2>/dev/null; review_cleanup; agent_cleanup' EXIT
+trap 'rm -f "$RUN_DIR/lock" 2>/dev/null; review_cleanup; agent_cleanup; exit 130' INT TERM
+
+# ---------------------------------------------------------------------------
+# Run state (#61 S1): state.json (resume truth), events.jsonl, status.json,
+# lock. --resume (S3) is not implemented yet, so ACTIVE_SECONDS_BASE always
+# starts at 0 — a future --resume restores it from a prior run's state.json
+# before this point.
+# ---------------------------------------------------------------------------
+START_EPOCH="$(date +%s)"
+ACTIVE_SECONDS_BASE=0
+CUR_ISSUE=""
+RUNNER_VERSION="$(jq -r '.version // "unknown"' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null)"
+[[ -n "$RUNNER_VERSION" ]] || RUNNER_VERSION="unknown"
+echo $$ > "$RUN_DIR/lock"
+state_init "$RUN_DIR" "$MAP" "$BASE" "$RUN_ID" "$RUNNER_VERSION"
+
+# active_seconds_now — this run's persisted active time plus this process's
+# own elapsed time; the figure both the time cap and status.json report.
+active_seconds_now() { echo $(( ACTIVE_SECONDS_BASE + ( $(date +%s) - START_EPOCH ) )); }
+
+# run_status <state> — refresh status.json with the run's current headline.
+run_status() {
+  state_write_status "$RUN_DIR" "$1" "$CUR_ISSUE" "${#MERGED[@]}" "${#PARKED[@]}" \
+    "$(state_total_cost "$RUN_DIR")" "$(active_seconds_now)"
+}
+
+# stop_run <exit_code> <state_label> — a global cap or STOP tripped: persist
+# where the run ended (issue left non-terminal, resumable) and exit. Never
+# returns.
+stop_run() {
+  state_set_active_seconds "$RUN_DIR" "$(active_seconds_now)"
+  run_status "$2"
+  state_event "$RUN_DIR" "$CUR_ISSUE" "$2" ""
+  log "run $2 (exit $1): ${#MERGED[@]} merged, ${#PARKED[@]} parked this run."
+  exit "$1"
+}
+
+# check_caps <phase-label> — the STOP file, then the global budget, then the
+# global time cap, in that order; the first one that trips ends the run via
+# stop_run (never returns). Called between phases (before a branch, after a
+# build, before a PR, before a review, before a merge) so an issue never
+# starts a phase the run cannot afford to let finish.
+check_caps() {
+  local phase="$1"
+  if [[ -e "$RUN_DIR/STOP" ]]; then
+    log "STOP file present — stopping ($phase)."
+    stop_run 6 stopped
+  fi
+  if [[ -n "$BUDGET_USD" ]]; then
+    local cost; cost="$(state_total_cost "$RUN_DIR")"
+    if jq -en --argjson c "$cost" --argjson b "$BUDGET_USD" '$c >= $b' >/dev/null 2>&1; then
+      log "global budget cap (\$$BUDGET_USD) reached (spent \$$cost) — stopping ($phase)."
+      stop_run 4 budget_exhausted
+    fi
+  fi
+  if [[ -n "$MAX_MINUTES" ]]; then
+    local elapsed_min=$(( $(active_seconds_now) / 60 ))
+    if (( elapsed_min >= MAX_MINUTES )); then
+      log "global time cap ($MAX_MINUTES min) reached (elapsed ${elapsed_min}m) — stopping ($phase)."
+      stop_run 3 time_exhausted
+    fi
+  fi
+}
+
+# clipped_issue_budget / clipped_issue_minutes — this issue's own cap,
+# reduced to whatever the global cap has left (never raised: a global cap
+# always wins). No global cap set: the issue's own flag is unchanged.
+clipped_issue_budget() {
+  [[ -z "$BUDGET_USD" ]] && { echo "$ISSUE_BUDGET_USD"; return; }
+  local rem
+  rem="$(jq -n --argjson b "$BUDGET_USD" --argjson c "$(state_total_cost "$RUN_DIR")" \
+           '(($b - $c) as $r | if $r < 0 then 0 else $r end)')"
+  state_clip_num "$rem" "$ISSUE_BUDGET_USD"
+}
+clipped_issue_minutes() {
+  [[ -z "$MAX_MINUTES" ]] && { echo "$ISSUE_MAX_MINUTES"; return; }
+  local elapsed_min=$(( $(active_seconds_now) / 60 )) rem
+  rem=$(( MAX_MINUTES - elapsed_min ))
+  (( rem < 0 )) && rem=0
+  if (( ISSUE_MAX_MINUTES < rem )); then echo "$ISSUE_MAX_MINUTES"; else echo "$rem"; fi
+}
 
 # deliver_logline <phase> <issue> <round> <verdict> — one row per model call
 # the runner itself makes, in loop.sh's run-log schema (plus issue/round), so
@@ -203,6 +305,7 @@ select_next_slice "$MAP_PLAN" >/dev/null; rc=$?
 [[ "$rc" -eq 2 ]] && die "map #$MAP has a dependency cycle in its after: edges"
 
 log "run $RUN_ID: map #$MAP into '$BASE' — verify='$VERIFY_CMD', $(grep -c '\[ \]' "$MAP_PLAN") issue(s) left"
+run_status running
 
 # tick_map <number> — tick the issue's Delivery line on the forge. Re-read,
 # change one line, write, read back; retried because a human editing the Map
@@ -278,6 +381,8 @@ deliver_issue() {
   # Per-issue state starts empty: every early return below may park, and a
   # park must never name an earlier issue's PR or branch.
   CUR_PR=""; CUR_BRANCH=""
+  CUR_ISSUE="$n"
+  state_issue_update "$RUN_DIR" "$n" '{"state":"preparing"}'
 
   forge_issue_json "$n" > "$dir/issue.json" || { log "#$n: cannot read the issue"; return 1; }
   state="$(jq -r '.state' "$dir/issue.json")"
@@ -298,6 +403,8 @@ deliver_issue() {
   title="$(map_pr_title "$map_title" "$issue_title" "$labels")"
   branch="$(map_branch_name "$n" "$title")"
 
+  check_caps "before a branch (#$n)"
+
   # A branch left by an earlier attempt (a parked one, typically). Until
   # resume exists (#61) the runner cannot tell whether that work should be
   # continued or discarded, so it parks the issue — and only the issue.
@@ -309,6 +416,7 @@ deliver_issue() {
   log "#$n: $title → $branch"
   git switch -q -c "$branch" "origin/$BASE" || return 1
   CUR_BRANCH="$branch"
+  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg b "$branch" '{state:"building", branch:$b}')"
 
   charter_from_issue "$dir/issue.json" "$MAP_PLAN" "$MAP" > "$dir/PROMPT.md"
 
@@ -327,12 +435,26 @@ deliver_issue() {
   fi
   local -a loop_extra=()
   [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
+  # Per-issue caps never exceed what the global --budget-usd / --max-minutes
+  # have left (#61); recorded on the issue's state before the call so a
+  # future --resume (S3) can see what this attempt was actually bounded by.
+  local issue_budget_eff issue_minutes_eff
+  issue_budget_eff="$(clipped_issue_budget)"
+  issue_minutes_eff="$(clipped_issue_minutes)"
+  state_issue_update "$RUN_DIR" "$n" \
+    "$(jq -cn --argjson b "$issue_budget_eff" --argjson m "$issue_minutes_eff" \
+         '{issue_budget_usd:$b, issue_max_minutes:$m}')"
   bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
-    --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$ISSUE_MAX_MINUTES" \
-    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
+    --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$issue_minutes_eff" \
+    --budget-usd "$issue_budget_eff" --stop-file "$RUN_DIR/STOP" \
+    ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
     2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
   local loop_rc=$?
   status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
+  # loop.sh's own STOP-file exit is this run's stop, never a park (#61) — the
+  # STOP file it found is the same one check_caps below would find.
+  [[ "$loop_rc" -eq 6 ]] && stop_run 6 stopped
+  check_caps "after a build (#$n)"
   # Exit 1 is autopilot refusing to start (its preconditions) — the machinery,
   # not this issue. Anything else short of done is this issue not finishing.
   if [[ "$loop_rc" -eq 1 ]]; then
@@ -384,18 +506,25 @@ deliver_issue() {
     echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
   } > "$dir/pr-body.md"
 
+  check_caps "before a PR (#$n)"
   forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
   pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
     || { log "#$n: opening the PR failed — stopping."; return 1; }
   CUR_PR="$pr"
   log "#$n: PR #$pr opened"
+  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --argjson p "$pr" '{state:"pr-open", pr:$p}')"
+  state_event "$RUN_DIR" "$n" pr-open ""
 
   # --- independent review of the pushed head, before anything merges ---
+  check_caps "before a review (#$n)"
+  state_issue_update "$RUN_DIR" "$n" '{"state":"reviewing","round":1}'
   review_issue "$n" "$pr" "$(git rev-parse "origin/$BASE")" "$head_sha" "$dir"
   local review_rc=$?
   [[ "$review_rc" -eq 0 ]] || return "$review_rc"
 
   # --- merge (from the base, so the forge never has the head checked out) ---
+  check_caps "before a merge (#$n)"
+  state_issue_update "$RUN_DIR" "$n" '{"state":"merging"}'
   git switch -q "$BASE" || return 1
   if ! forge_pr_merge "$pr" "$head_sha" "$title (#$pr)" "$dir/pr-body.md" > "$dir/merge.log" 2>&1; then
     PARK_REASON="the forge refused to merge PR #$pr: $(tail -1 "$dir/merge.log")"
@@ -414,6 +543,9 @@ deliver_issue() {
   printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
     "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP" > "$dir/issue-comment.md"
   forge_issue_comment "$n" "$dir/issue-comment.md" || true
+  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$merged_sha" '{state:"merged", head:$h}')"
+  state_event "$RUN_DIR" "$n" merged ""
+  run_status running
   log "#$n: merged as $merged_sha"
   return 0
 }
@@ -467,6 +599,9 @@ park_issue() {
   } > "$comment"
   forge_issue_comment "$n" "$comment" || log "#$n: could not post the parking comment"
   PARKED+=("#$n")
+  state_issue_update "$RUN_DIR" "$n" '{"state":"parked"}'
+  state_event "$RUN_DIR" "$n" parked "$PARK_REASON"
+  run_status running
 }
 
 # finish — report what this run did and exit 0 (everything merged) or 2.
@@ -479,7 +614,13 @@ finish() {
     skipped+=("${PLAN_IDS[$i]}")
   done
   log "map #$MAP: ${#MERGED[@]} merged this run${PARKED[*]:+, parked: ${PARKED[*]}}${skipped[*]:+, skipped (blocked by a parked issue): ${skipped[*]}}."
-  [[ ${#PARKED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]] && exit 0
+  CUR_ISSUE=""
+  state_set_active_seconds "$RUN_DIR" "$(active_seconds_now)"
+  if [[ ${#PARKED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]]; then
+    run_status done
+    exit 0
+  fi
+  run_status partial
   exit 2
 }
 
