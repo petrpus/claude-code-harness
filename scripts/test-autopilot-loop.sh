@@ -31,6 +31,14 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 # site that shells out to loop.sh.
 unset AUTOPILOT_RUN_ID AUTOPILOT_ITER AUTOPILOT_TOTAL_COST AUTOPILOT_LOCK_OWNED
 
+# Forge-credential withholding (ADR-0007) sets GH_CONFIG_DIR and appends to
+# GIT_CONFIG_COUNT for everything it runs — the verify command included, so
+# these tests inherit both when autopilot or /deliver verifies this repo. The
+# fixtures bring their own forge (a fake gh, bare remotes) and must not see
+# the caller's: an inherited empty GH_CONFIG_DIR makes the fake gh report
+# "not logged in" (first live run, #83).
+unset GH_CONFIG_DIR GIT_CONFIG_COUNT
+
 FAIL=0
 note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }

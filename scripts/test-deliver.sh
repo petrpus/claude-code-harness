@@ -19,6 +19,14 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 # See test-autopilot-loop.sh: a live autopilot run's reload handoff must not
 # leak into the fresh runs below.
 unset AUTOPILOT_RUN_ID AUTOPILOT_ITER AUTOPILOT_TOTAL_COST AUTOPILOT_LOCK_OWNED
+
+# Forge-credential withholding (ADR-0007) sets GH_CONFIG_DIR and appends to
+# GIT_CONFIG_COUNT for everything it runs — the verify command included, so
+# these tests inherit both when autopilot or /deliver verifies this repo. The
+# fixtures bring their own forge (a fake gh, bare remotes) and must not see
+# the caller's: an inherited empty GH_CONFIG_DIR makes the fake gh report
+# "not logged in" (first live run, #83).
+unset GH_CONFIG_DIR GIT_CONFIG_COUNT
 unset DELIVER_SNAPSHOT DELIVER_RUN_ID
 
 FAIL=0
@@ -439,6 +447,7 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    [[ -n "${STUB_BUILD_SLEEP:-}" ]] && sleep "$STUB_BUILD_SLEEP"
     # A BUILD that tries the forge itself (ADR-0007): record what happened.
     if [[ -n "${STUB_FORGE_PROBE:-}" ]]; then
       gh auth status >/dev/null 2>&1; echo "gh=$?" >> "$STUB_FORGE_PROBE"
@@ -635,6 +644,22 @@ PROBE="$(sort -u "$WORK/nocreds/probe" 2>/dev/null | tr '\n' ' ')"
   && [[ "$(jq -r .state "$WORK/nocreds/gh/prs/5.json")" == "MERGED" ]] \
   && ok "BUILD's gh and the verify command's gh are unauthenticated, git has no helper, while the runner (GH_TOKEN) still merges" \
   || note "no-creds: exit $RC, probe '$PROBE'"
+
+# --- --per-call-timeout reaches autopilot (#83) ---------------------------------
+# A BUILD that outlives the bound is cut off (exit 124) and the issue parks.
+new_fixture pct
+run_deliver pct STUB_BUILD_SLEEP=4 -- --per-call-timeout 2 --issue-max-iterations 1
+RC=$?
+PCT_BUILD="$(cat "$WORK"/pct/repo/tmp/deliver/*/issues/1/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="build") | .exit_code' | sort -u | tr '\n' ' ')"
+[[ "$RC" -eq 2 && "$PCT_BUILD" == "124 " ]] \
+  && ok "--per-call-timeout bounds autopilot's calls (BUILD cut off with 124, issue parked)" \
+  || note "--per-call-timeout: exit $RC, build exit codes '$PCT_BUILD'"
+new_fixture pctbad
+run_deliver pctbad -- --per-call-timeout 1.5
+RC=$?
+[[ "$RC" -eq 1 ]] && grep -q 'takes whole seconds' "$WORK/pctbad/err" && [[ ! -s "$WORK/pctbad/gh/calls" ]] \
+  && ok "--per-call-timeout that is not whole seconds is refused before any forge call" \
+  || note "--per-call-timeout 1.5: exit $RC"
 
 # --- refusals ------------------------------------------------------------------
 new_fixture onmain

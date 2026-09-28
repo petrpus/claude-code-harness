@@ -29,6 +29,11 @@
 #   Missing fields (a stub, a crashed call, a dry run) read as 0 / "" — the
 #   output shape is never a hard requirement. Needs jq and coreutils timeout.
 #
+#   Every call runs WITHOUT MCP servers: `--strict-mcp-config` with an empty
+#   `--mcp-config`, so none of the user's or the project's configured servers
+#   (a mailbox, a recordings service, a browser) is started for an autonomous
+#   call that never asked for them (first live run, #83).
+#
 #   Every call runs WITHOUT forge credentials (ADR-0007): see
 #   agent_withhold_forge_credentials below. A model phase that reaches `gh`
 #   or `git push` anyway — through a script it edited and may run, say —
@@ -119,7 +124,9 @@ agent_run() {
       timeout "${AGENT_TIMEOUT:-1200}" claude -p "$prompt" \
         --model "$model" --output-format json \
         --permission-mode "$perm" --allowedTools "$allowed" \
-        --max-turns "${AGENT_MAX_TURNS:-80}" ${extra[@]+"${extra[@]}"} 2>>"$errlog"
+        --max-turns "${AGENT_MAX_TURNS:-80}" \
+        --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+        ${extra[@]+"${extra[@]}"} 2>>"$errlog"
     )"
     rc=$?
   fi
