@@ -38,6 +38,14 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 
 FAIL=0
+# Same reason as in the test scripts: never let a caller's withheld-credential
+# environment leak into verify's own checks (#83).
+unset GH_CONFIG_DIR GIT_CONFIG_COUNT
+# The loop and deliver suites run the way autopilot and /deliver run verify:
+# with forge credentials withheld. A test that silently depends on the
+# caller's environment then fails here, in CI, not only in a live run.
+# shellcheck source=../skills/autopilot/agent.sh
+. skills/autopilot/agent.sh
 note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }
 section() { echo; echo "== $1 =="; }
@@ -53,6 +61,7 @@ cleanup() {
   [[ -n "$TMP_FEAT_REPO" && -d "$TMP_FEAT_REPO" ]] && rm -rf "$TMP_FEAT_REPO"
   local d
   for d in "${TMP_GATE_DIRS[@]:-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf "$d"; done
+  agent_cleanup
   return 0
 }
 trap cleanup EXIT
@@ -351,7 +360,7 @@ fi
 # a stub `claude`, so the runner's decisions are exercised without spending.
 section "autopilot loop control flow"
 if [[ -f scripts/test-autopilot-loop.sh ]]; then
-  if bash scripts/test-autopilot-loop.sh; then
+  if agent_run_without_forge_credentials bash scripts/test-autopilot-loop.sh; then
     ok "autopilot loop control flow passed"
   else
     note "autopilot loop control flow failed (see above)"
@@ -366,7 +375,7 @@ fi
 # runner actually ran (no force push, no --admin, merges pinned to a head).
 section "deliver runner (map → PR → merge)"
 if [[ -f scripts/test-deliver.sh ]]; then
-  if bash scripts/test-deliver.sh; then
+  if agent_run_without_forge_credentials bash scripts/test-deliver.sh; then
     ok "deliver runner passed"
   else
     note "deliver runner failed (see above)"
@@ -740,6 +749,9 @@ AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
 [[ "$AGENT_ARGS_FIRST" == *"--max-turns 7"* && "$AGENT_ARGS_FIRST" == *"--model sonnet"* && "$AGENT_ARGS_FIRST" == *"--allowedTools Read,Grep"* \
    && "$AGENT_ARGS_FIRST" == *"--disallowedTools Bash,Write"* ]] \
   && ok "agent_run passes model, allowlist, AGENT_MAX_TURNS and AGENT_DISALLOWED_TOOLS through" \
+  || note "agent_run args were: '$AGENT_ARGS_FIRST'"
+[[ "$AGENT_ARGS_FIRST" == *'--strict-mcp-config --mcp-config {"mcpServers":{}}'* ]] \
+  && ok "agent_run starts no MCP servers (--strict-mcp-config with an empty --mcp-config)" \
   || note "agent_run args were: '$AGENT_ARGS_FIRST'"
 [[ "$AGENT_L2" == "3||0" ]] \
   && ok "a failing call returns its exit code with empty result and zero cost" \

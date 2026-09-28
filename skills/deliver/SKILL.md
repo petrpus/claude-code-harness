@@ -53,7 +53,7 @@ issue's fault: it ends the run with exit 1, where it is.
    ```bash
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
-     [--review-model sonnet] [--extra-allowed-tools '<csv>']
+     [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -100,6 +100,17 @@ says "approve" still holds the PR. A reply with no usable verdict is retried
 once, then holds the PR (fail closed). The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
+
+`--per-call-timeout <s>` bounds every model call — autopilot's and the
+review — in whole seconds (default 1200). Raise it when the verify command is
+slow: BUILD runs verify itself, and in this repo (`scripts/verify.sh` ≈ 6 min)
+the default cut the first BUILD off after a couple of runs.
+
+**Stopping a run today.** Ctrl-C in the terminal does not stop it: `timeout`
+runs each `claude -p` in its own process group, so the signal never reaches
+the call, and the runner waits for it. Terminate the runner's process tree
+instead (from the `deliver.sh` PID down, leaves first). A graceful `--stop`
+arrives with #61.
 
 The runner first copies the plugin to
 `${XDG_STATE_HOME:-~/.local/state}/claude-code-harness/deliver/<run-id>/runner/`
