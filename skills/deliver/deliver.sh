@@ -56,14 +56,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ "$MAP" =~ ^[0-9]+$ ]] || die "--map <issue number> is required"
-# ADR-0007: no model phase may hold a forge operation. A BUILD grant that
-# reaches gh or git push (or a blanket Bash) would hand one to the model.
-# Matched with whitespace squeezed out, so "Bash(git  push:*)" or ", Bash ,"
-# cannot slip past; the patterns are written the same way.
-case ",$(printf '%s' "$EXTRA_ALLOWED_TOOLS" | tr -d '[:space:]')," in
-  *",Bash,"*|*"Bash(*"*|*"Bash(gh"*|*"Bash(gitpush"*|*"Bash(git:"*|*"Bash(git*:"*|*"Bash(git)"*)
-    die "--extra-allowed-tools must not grant Bash, gh or git push to autopilot (ADR-0007): '$EXTRA_ALLOWED_TOOLS'" ;;
-esac
 
 # shellcheck source=../autopilot/plan.sh
 . "$PLUGIN_ROOT/skills/autopilot/plan.sh"
@@ -78,6 +70,14 @@ esac
 # shellcheck source=review.sh
 . "$SCRIPT_DIR/review.sh"
 REVIEW_AGENT="$PLUGIN_ROOT/agents/code-reviewer.md"
+
+# ADR-0007: no model phase may hold a forge operation. A BUILD grant that
+# reaches gh or git (directly, via a wrapper or an absolute path) or that runs
+# arbitrary commands is refused here, before anything else happens.
+if [[ -n "$EXTRA_ALLOWED_TOOLS" ]]; then
+  GRANT_PROBLEMS="$(forge_grant_violations "$EXTRA_ALLOWED_TOOLS")" \
+    || die "--extra-allowed-tools refused (ADR-0007): $(printf '%s' "$GRANT_PROBLEMS" | tr '\n' ';')"
+fi
 
 # ---------------------------------------------------------------------------
 # Preconditions — local and read-only first, so a refused run makes no forge

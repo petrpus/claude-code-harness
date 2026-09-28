@@ -42,6 +42,10 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 . skills/deliver/charter.sh
 # shellcheck source=../skills/deliver/review.sh
 . skills/deliver/review.sh
+# forge.sh is sourced for its one pure function (forge_grant_violations);
+# nothing here calls gh through it.
+# shellcheck source=../skills/deliver/forge.sh
+. skills/deliver/forge.sh
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -217,6 +221,29 @@ review_parse '{"verdict":"lgtm","findings":[]}' >/dev/null && note "parse: an of
   || ok "parse: a verdict other than approve/changes_requested is no verdict"
 review_parse '{"verdict":"approve","findings":"none"}' >/dev/null && note "parse: non-array findings accepted" \
   || ok "parse: findings that are not an array are no verdict"
+
+# ===========================================================================
+# Unit: forge_grant_violations (ADR-0007 for --extra-allowed-tools)
+# ===========================================================================
+echo "-- forge_grant_violations"
+GV_MISSED=0
+for g in 'Bash' 'Bash(*)' 'Bash(:*)' 'Bash(gh:*)' 'Bash(git push:*)' 'Bash(git:*)' 'Bash(git  push origin x)' \
+         'Bash(env gh:*)' 'Bash(/usr/bin/gh:*)' 'Bash(command gh:*)' 'Bash(env git push:*)' \
+         'Bash(/usr/bin/git push:*)' 'Bash(/usr/bin/git:*)' 'Bash(command git push:*)' \
+         'Bash(GH_HOST=x gh pr merge:*)' 'Bash(timeout 60 gh:*)' 'Bash(nohup env git push)' \
+         'Bash(sh -c:*)' 'Bash(bash -c:*)' 'Bash(bash:*)' 'Bash(xargs:*)' 'Bash(eval:*)' \
+         'Bash(find:*)' 'Bash(python3 -c:*)' 'Bash(gh *)' 'Bash(foo * bar)' 'Read, Bash , Grep'; do
+  forge_grant_violations "$g" >/dev/null && { note "grant '$g' was NOT refused"; GV_MISSED=1; }
+done
+[[ "$GV_MISSED" -eq 0 ]] && ok "refuses blanket, wildcard, gh/git (direct, wrapped, absolute path, env-prefixed) and exec-wrapper grants (27 forms)"
+for g in 'Bash(jq:*)' 'Bash(bash scripts/test-deliver.sh)' 'Bash(bash scripts/x.sh:*)' 'Read,Grep' \
+         'Bash(shellcheck:*)' 'Bash(git-lfs:*)' 'Bash(python3 tools/gen.py)' 'Bash(printf a,b)' 'Bash(make test *)'; do
+  forge_grant_violations "$g" >/dev/null || { note "grant '$g' was refused: $(forge_grant_violations "$g")"; GV_MISSED=1; }
+done
+[[ "$GV_MISSED" -eq 0 ]] && ok "allows ordinary tool grants and interpreters running a named script"
+WHY="$(forge_grant_violations 'Bash(jq:*),Bash(env gh:*)')"
+[[ "$WHY" == "Bash(env gh:*): runs gh"* && "$(grep -c . <<<"$WHY")" -eq 1 ]] \
+  && ok "names exactly the offending rule and why" || note "reason was: $WHY"
 
 # ===========================================================================
 # Static: the forge surface (ADR-0007)
@@ -563,11 +590,11 @@ RC=$?
 [[ "$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u)" == "Read,Grep,Glob" ]] \
   && ok "--extra-allowed-tools never reaches the reviewer (its allowlist stays Read,Grep,Glob)" \
   || note "--extra-allowed-tools: reviewer allowlist was '$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u | tr '\n' '|')'"
-for bad in 'Bash' 'Bash(gh:*)' 'Bash(git push:*)' 'Read, Bash(git  push origin x)' 'Read,Bash(git:*)' 'Bash(*)' 'Glob , Bash '; do
+for bad in 'Bash' 'Bash(env gh:*)' 'Read, Bash(/usr/bin/git  push origin x)'; do
   new_fixture extrabad
   run_deliver extrabad -- --extra-allowed-tools "$bad"
   RC=$?
-  if [[ "$RC" -eq 1 ]] && grep -q 'must not grant Bash, gh or git push' "$WORK/extrabad/err" && [[ ! -s "$WORK/extrabad/gh/calls" ]]; then
+  if [[ "$RC" -eq 1 ]] && grep -q 'extra-allowed-tools refused (ADR-0007)' "$WORK/extrabad/err" && [[ ! -s "$WORK/extrabad/gh/calls" ]]; then
     ok "--extra-allowed-tools '$bad' is refused before any forge call"
   else
     note "--extra-allowed-tools '$bad': exit $RC"

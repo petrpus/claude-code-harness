@@ -87,3 +87,69 @@ forge_pr_draft() { gh pr ready "$1" --undo >/dev/null; }
 forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'
 }
+
+# forge_grant_violations <allowed_tools_csv>
+#   Pure: which Claude Code permission rules in the list would hand a model
+#   phase a forge operation (ADR-0007) or a way to run arbitrary commands
+#   that reach one. Echoes one "<rule>: <why>" per offending rule and returns
+#   1 if there is any. Rules are split on commas outside parentheses; for each
+#   `Bash(...)` rule the command text is read the way a shell would run it:
+#   leading VAR=value assignments and pass-through wrappers (env, command,
+#   exec, nohup, nice, time, stdbuf, timeout <n>) are skipped, and the
+#   program is judged by its basename — so `Bash(env gh:*)` and
+#   `Bash(/usr/bin/git push:*)` are the same grant as `Bash(gh:*)` and
+#   `Bash(git push:*)`.
+#
+#   This is defence in depth, not the boundary: BUILD edits files and may run
+#   the verify command and scripts it can edit, so an allowlist alone can
+#   never stop a model phase from reaching gh. Withholding forge credentials
+#   from model phases is that boundary (#77, map #68).
+forge_grant_violations() {
+  local csv="$1" rule inner cmd tok base next bad=0 depth=0 cur="" ch i
+  local -a rules=() toks=()
+  for (( i=0; i<${#csv}; i++ )); do
+    ch="${csv:$i:1}"
+    case "$ch" in
+      "(") depth=$((depth+1)); cur+="$ch" ;;
+      ")") (( depth > 0 )) && depth=$((depth-1)); cur+="$ch" ;;
+      ",") if (( depth == 0 )); then rules+=("$cur"); cur=""; else cur+="$ch"; fi ;;
+      *)   cur+="$ch" ;;
+    esac
+  done
+  rules+=("$cur")
+  for rule in "${rules[@]}"; do
+    rule="$(printf '%s' "$rule" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [[ -n "$rule" ]] || continue
+    if [[ "$rule" == "Bash" ]]; then echo "$rule: a blanket shell grant"; bad=1; continue; fi
+    [[ "$rule" == Bash\(*\) ]] || continue
+    inner="${rule#Bash(}"; inner="${inner%)}"
+    # Prefix (`cmd:*`) and trailing-wildcard (`cmd *`) forms name the same program.
+    cmd="$(printf '%s' "$inner" | sed -E 's/:\*$//; s/[[:space:]]\*$//')"
+    if [[ "$cmd" == *"*"* ]]; then echo "$rule: a wildcard inside the command"; bad=1; continue; fi
+    read -ra toks <<<"$cmd"
+    i=0
+    while (( i < ${#toks[@]} )); do
+      tok="${toks[$i]}"
+      if [[ "$tok" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then i=$((i+1)); continue; fi
+      case "${tok##*/}" in
+        env|command|builtin|exec|nohup|nice|time|stdbuf) i=$((i+1)); continue ;;
+        timeout) i=$((i+2)); continue ;;
+      esac
+      break
+    done
+    if (( i >= ${#toks[@]} )); then echo "$rule: no program named — as broad as Bash"; bad=1; continue; fi
+    base="${toks[$i]##*/}"; next="${toks[$((i+1))]:-}"
+    case "$base" in
+      gh|git|hub)
+        echo "$rule: runs $base — forge operations are the runner's alone (ADR-0007)"; bad=1 ;;
+      xargs|eval|sudo|su|doas|ssh|parallel|watch|find|script)
+        echo "$rule: $base runs other commands"; bad=1 ;;
+      sh|bash|zsh|dash|ksh|fish|python|python3|perl|ruby|node|deno)
+        if [[ -z "$next" || "$next" == -* ]]; then
+          echo "$rule: $base without a script path runs arbitrary code"; bad=1
+        fi ;;
+    esac
+  done
+  return "$bad"
+}
+

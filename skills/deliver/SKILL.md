@@ -60,8 +60,16 @@ issue's fault: it ends the run with exit 1, where it is.
    script) unless `--verify-cmd` is given. The `--issue-*` caps and
    `--extra-allowed-tools` (appended to autopilot BUILD's allowlist — e.g.
    `'Bash(bash scripts/test-deliver.sh),Bash(jq:*)'` for a shell project) are
-   passed to each issue's `loop.sh` run. A grant of Bash, `gh` or `git push`
-   is refused (ADR-0007: no model phase holds a forge operation).
+   passed to each issue's `loop.sh` run. Refused before anything happens
+   (ADR-0007: no model phase holds a forge operation): a blanket `Bash`, a
+   wildcard inside the command, any rule whose program — after `VAR=`
+   assignments and wrappers such as `env`, `command`, `timeout` — is `gh`,
+   `git` or `hub` (any subcommand, any path), a command runner (`xargs`,
+   `eval`, `sudo`, `ssh`, `find`, …), or an interpreter without a script path
+   (`bash -c`, `bash:*`, `python3 -c`). This is defence in depth, not the
+   boundary: BUILD edits files and runs the verify command, so it could
+   always put a `gh` call into a script it may run. Keeping forge credentials
+   away from model phases is the boundary, and is tracked in #77 (map #68).
 
 ## The review step
 
