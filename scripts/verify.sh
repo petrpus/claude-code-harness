@@ -797,11 +797,12 @@ AGENT_REFUSE="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$
   TMPDIR="$AGENT_DIR/does-not-exist" bash -c '
   . "$1/skills/autopilot/agent.sh"
   agent_run build sonnet "Read" acceptEdits "p"; a=$?
-  agent_run_without_forge_credentials touch "$2/ran"; b=$?
-  echo "$a|$b|$AGENT_LAST_RC|${AGENT_LAST_RESULT}"
+  agent_run_without_forge_credentials touch "$2/ran"; b=$?; r1="$AGENT_REFUSED"
+  unset TMPDIR; agent_run_without_forge_credentials bash -c "exit 125"; c=$?; r2="$AGENT_REFUSED"
+  echo "$a|$b|$AGENT_LAST_RC|${AGENT_LAST_RESULT}|$r1|$c|$r2"
 ' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
-[[ "$AGENT_REFUSE" == "125|125|125|" && ! -e "$AGENT_DIR/env" && ! -e "$AGENT_DIR/ran" ]] \
-  && ok "no private dir → agent_run and agent_run_without_forge_credentials refuse (125) and run nothing" \
+[[ "$AGENT_REFUSE" == "125|125|125||1|125|0" && ! -e "$AGENT_DIR/env" && ! -e "$AGENT_DIR/ran" ]] \
+  && ok "no private dir → both entry points refuse (125, AGENT_REFUSED=1) and run nothing; a command's own 125 is not a refusal" \
   || note "refusal path: '$AGENT_REFUSE', model ran: $([[ -e "$AGENT_DIR/env" ]] && echo yes || echo no), command ran: $([[ -e "$AGENT_DIR/ran" ]] && echo yes || echo no)"
 AGENT_CLEAN="$(cd "$AGENT_DIR" && bash -c '
   . "$1/skills/autopilot/agent.sh"; agent_noforge_dir; d="$AGENT_NOFORGE_DIR"; agent_cleanup

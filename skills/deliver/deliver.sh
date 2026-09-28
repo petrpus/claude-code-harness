@@ -326,7 +326,7 @@ deliver_issue() {
   # Autopilot's BUILD may have edited what verify runs: no forge credentials.
   agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
   local verify_rc=$?
-  if [[ "$verify_rc" -eq 125 && ! -s "$dir/final-verify.log" ]]; then
+  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
     log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
     return 1
   fi

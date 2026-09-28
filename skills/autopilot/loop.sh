@@ -886,7 +886,7 @@ while :; do
   VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
   if [[ "$VERIFY_RC" -eq 0 ]]; then
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
-  elif [[ "$VERIFY_RC" -eq 125 && ! -s "$STATE_DIR/verify.log" ]]; then
+  elif [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
     # The wrapper refused before running anything: not a verify failure.
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 125 "fail"
     FAIL_REASON="the verify command was not run: forge credentials could not be withheld (no private temp dir)"

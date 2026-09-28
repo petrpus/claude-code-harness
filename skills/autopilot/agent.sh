@@ -65,6 +65,8 @@ agent_noforge_dir() {
 }
 
 # agent_cleanup — remove the private dir; for the caller's EXIT trap.
+# rmdir, never rm -rf: the dir is meant to stay empty, and if anything ever
+# wrote into it, leaving it for a human beats deleting what we did not create.
 agent_cleanup() {
   [[ -n "${AGENT_NOFORGE_DIR:-}" && -d "$AGENT_NOFORGE_DIR" ]] && rmdir "$AGENT_NOFORGE_DIR" 2>/dev/null
   AGENT_NOFORGE_DIR=""
@@ -74,9 +76,12 @@ agent_cleanup() {
 # agent_run_without_forge_credentials <cmd> [args…] — run a command the
 # runner executes but a model may have written (the verify command, which
 # BUILD can edit) under the same withheld credentials as a model call.
-# Returns the command's exit code, 125 if credentials cannot be withheld.
+# Returns the command's exit code, or 125 with AGENT_REFUSED=1 when
+# credentials cannot be withheld and nothing ran — the flag, not the code,
+# tells a refusal apart from a command that itself exits 125.
 agent_run_without_forge_credentials() {
-  agent_noforge_dir || return 125
+  AGENT_REFUSED=0
+  agent_noforge_dir || { AGENT_REFUSED=1; return 125; }
   ( agent_withhold_forge_credentials; "$@" )
 }
 
