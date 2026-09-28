@@ -42,3 +42,34 @@ verify_grants() {
 verify_grants_are_narrow() {
   [[ "$(verify_grants "$1")" != *':*)' ]]
 }
+
+# detect_verify_cmd
+#   Echoes the verify command for the current directory, trying project types
+#   in order (package.json -> scripts/verify.sh -> Makefile) and falling
+#   through on a miss at each step. Empty output and a non-zero exit when none
+#   of them apply — the caller decides what "no verify command" means.
+detect_verify_cmd() {
+  if [[ -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
+    if [[ -f pnpm-lock.yaml ]]; then
+      printf 'pnpm verify'
+    else
+      printf 'npm run verify'
+    fi
+    return 0
+  fi
+
+  if [[ -f scripts/verify.sh ]]; then
+    printf 'bash scripts/verify.sh'
+    return 0
+  fi
+
+  local mf
+  for mf in Makefile makefile GNUmakefile; do
+    if [[ -f "$mf" ]] && grep -qE '^verify:' "$mf"; then
+      printf 'make verify'
+      return 0
+    fi
+  done
+
+  return 1
+}
