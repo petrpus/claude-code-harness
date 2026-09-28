@@ -11,12 +11,12 @@
 # back to draft, a comment saying why; issues that depend on it are skipped
 # and independent ones continue. A failure of the machinery itself (the forge
 # unreachable, a dirty checkout, a review that touched the checkout) ends the
-# run instead. Not built yet: fix rounds, CI wait, resume, the launcher.
+# run instead. Not built yet: CI wait, resume, the launcher.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
 #              [--issue-max-iterations 10] [--issue-max-minutes 120]
-#              [--issue-budget-usd 10] [--review-model sonnet]
+#              [--issue-budget-usd 10] [--review-model sonnet] [--review-rounds 2]
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
 #
@@ -24,6 +24,13 @@
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
 # 1 precondition or runner failure · 2 partial (an issue was parked; its
 # dependents were skipped).
+#
+# --review-rounds bounds in-scope fix rounds on the same PR (docs/adr/0010-*.md):
+# every in-scope blocker/issue finding of a changes_requested round becomes a
+# plan item (R<k>.<j>), autopilot runs again on the same issue state dir, the
+# new head is verified, pushed fast-forward only, and reviewed again with the
+# previous round's findings inlined. Still requesting changes after
+# --review-rounds rounds parks the issue, naming the round count and the PR.
 
 set -uo pipefail
 
@@ -46,6 +53,7 @@ PLAN_MAX_ITEMS=3       # 0: no size hint
 VERIFY_EVERY_ITERATION=0
 ITERATION_VERIFY_CMD=""
 REVIEW_MODEL=sonnet
+REVIEW_ROUNDS=2
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -63,13 +71,15 @@ while [[ $# -gt 0 ]]; do
     --verify-every-iteration) VERIFY_EVERY_ITERATION=1; shift ;;
     --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
-    -h|--help)              sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --review-rounds)        REVIEW_ROUNDS="$2"; shift 2 ;;
+    -h|--help)              sed -n '2,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 [[ "$MAP" =~ ^[0-9]+$ ]] || die "--map <issue number> is required"
 [[ -z "$PER_CALL_TIMEOUT" || "$PER_CALL_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--per-call-timeout takes whole seconds"
 [[ "$PLAN_MAX_ITEMS" =~ ^[0-9]+$ ]] || die "--plan-max-items takes a whole number (0: no limit)"
+[[ "$REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "--review-rounds takes a positive whole number"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
@@ -225,12 +235,17 @@ tick_map() {
 # review could not run; a checkout changed by the review is not an issue
 # failure but a broken safety property, and ends the whole run.
 # ---------------------------------------------------------------------------
+# review_issue <n> <pr> <base_sha> <head_sha> <dir> <round> [prev_findings_json]
+#   One review round. A repeated no-usable-verdict reply parks the issue
+#   itself (PARK_REASON set here) — it is not a fix round; the caller (#63)
+#   only turns a real changes_requested verdict into one, by checking whether
+#   <dir>/review-<round>.json exists (only written when a verdict parsed).
 review_issue() {
-  local n="$1" pr="$2" base_sha="$3" head_sha="$4" dir="$5"
-  local round=1 attempt rc out verdict comment="$dir/review-1.comment.md"
+  local n="$1" pr="$2" base_sha="$3" head_sha="$4" dir="$5" round="$6" prev="${7:-[]}"
+  local attempt rc out verdict comment="$dir/review-$round.comment.md"
   for attempt in 1 2; do
     out="$dir/review-$round"
-    review_run "$n" "$round" "$BASE" "$base_sha" "$head_sha" "$dir/PROMPT.md" "$out" "$REVIEW_MODEL"; rc=$?
+    review_run "$n" "$round" "$BASE" "$base_sha" "$head_sha" "$dir/PROMPT.md" "$out" "$REVIEW_MODEL" "$prev"; rc=$?
     case "$rc" in
       0) deliver_logline review "$n" "$round" "$(jq -r '.verdict' "$out.json")"; break ;;
       2) # A failed call (timeout, crash) and an off-contract reply both leave
@@ -241,27 +256,136 @@ review_issue() {
            deliver_logline review "$n" "$round" no_verdict
          fi
          if [[ "$attempt" -eq 1 ]]; then
-           log "#$n: the reviewer returned no usable verdict — retrying once."
+           log "#$n: round $round — the reviewer returned no usable verdict — retrying once."
            continue
          fi
          review_comment "$n" "$round" "$head_sha" "$out.md" "" > "$comment"
          forge_pr_comment "$pr" "$comment" || true
-         PARK_REASON="the reviewer returned no usable verdict twice (PR #$pr)"
+         PARK_REASON="round $round's reviewer returned no usable verdict twice (PR #$pr)"
          return 10 ;;
       3) deliver_logline review "$n" "$round" breach
-         die "#$n: SAFETY BREACH — the checkout changed during the review of PR #$pr: $(tr '\n' ' ' < "$out.breach"). Stopping the run; nothing further is pushed or merged." ;;
-      *) log "#$n: could not create the review worktree — stopping."; return 1 ;;
+         die "#$n: SAFETY BREACH — the checkout changed during round $round's review of PR #$pr: $(tr '\n' ' ' < "$out.breach"). Stopping the run; nothing further is pushed or merged." ;;
+      *) log "#$n: could not create round $round's review worktree — stopping."; return 1 ;;
     esac
   done
   review_comment "$n" "$round" "$head_sha" "$out.md" "$out.json" > "$comment"
-  forge_pr_comment "$pr" "$comment" || log "#$n: could not post the review on PR #$pr (continuing)"
+  forge_pr_comment "$pr" "$comment" || log "#$n: could not post round $round's review on PR #$pr (continuing)"
   verdict="$(jq -r '.verdict' "$out.json")"
   if [[ "$verdict" != "approve" ]]; then
-    PARK_REASON="the review requests changes on PR #$pr (fix rounds arrive with #63)"
     return 10
   fi
-  log "#$n: review approved PR #$pr"
+  log "#$n: round $round's review approved PR #$pr"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Shared by an issue's first autopilot run and every fix round (#63):
+# run_autopilot fires one loop.sh invocation with this run's flags;
+# autopilot_gates checks its outcome; final_verify re-verifies the exact head
+# with no forge credentials in reach; write_pr_body (re)builds the PR body
+# from the issue's current plan and latest autopilot status.
+# ---------------------------------------------------------------------------
+
+# run_autopilot <dir>
+run_autopilot() {
+  local dir="$1"
+  local -a loop_timeout=() loop_pace=() loop_extra=()
+  [[ -n "$PER_CALL_TIMEOUT" ]] && loop_timeout=(--per-call-timeout "$PER_CALL_TIMEOUT")
+  [[ "$PLAN_MAX_ITEMS" -gt 0 ]] && loop_pace+=(--plan-max-items "$PLAN_MAX_ITEMS")
+  if [[ "$VERIFY_EVERY_ITERATION" -eq 0 ]]; then
+    loop_pace+=(--verify-at-completion)
+    [[ -n "$ITERATION_VERIFY_CMD" ]] && loop_pace+=(--iteration-verify-cmd "$ITERATION_VERIFY_CMD")
+  fi
+  [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
+  # Indented line by line with a read loop, not sed: sed block-buffers into a
+  # pipe, and a run log behind `| tee` then stayed empty for half an hour.
+  bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
+    --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$ISSUE_MAX_MINUTES" \
+    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
+    2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
+}
+
+# autopilot_gates <n> <dir> <prev_head> <loop_rc>
+#   Exit 1 (autopilot refusing to start) and a dirty tree left behind stop the
+#   whole run (0 is not this issue's fault); anything short of a done status,
+#   or a run that produced no commit beyond <prev_head>, parks this issue.
+autopilot_gates() {
+  local n="$1" dir="$2" prev_head="$3" loop_rc="$4" status_state
+  status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
+  if [[ "$loop_rc" -eq 1 ]]; then
+    log "#$n: autopilot refused to start (exit 1) — stopping the run. State: $dir"
+    return 1
+  fi
+  [[ -z "$(git status --porcelain)" ]] || { log "#$n: autopilot left a dirty tree — stopping."; return 1; }
+  if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
+    PARK_REASON="autopilot ended '$status_state' (exit $loop_rc) without finishing"
+    return 10
+  fi
+  if [[ "$(git rev-parse HEAD)" == "$prev_head" ]]; then
+    PARK_REASON="autopilot reported done without a single commit"
+    return 10
+  fi
+  return 0
+}
+
+# final_verify <n> <dir>  — verifies the exact head about to be pushed/merged;
+# autopilot's BUILD may have edited what verify runs, so it never sees forge
+# credentials.
+final_verify() {
+  local n="$1" dir="$2" head_sha verify_rc
+  head_sha="$(git rev-parse HEAD)"
+  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
+  verify_rc=$?
+  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
+    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
+    return 1
+  fi
+  if [[ "$verify_rc" -ne 0 ]]; then
+    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
+    PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
+    return 10
+  fi
+  [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
+    || { log "#$n: verify changed the checkout — stopping."; return 1; }
+  return 0
+}
+
+# write_pr_body <n> <dir> <head_sha>  — (re)builds the PR body from the
+# issue's current plan and the latest autopilot status; used for the PR's
+# opening body and, after every fix round, to keep it in sync (#63).
+write_pr_body() {
+  local n="$1" dir="$2" head_sha="$3" iters cost
+  iters="$(jq -r '.iterations_done // 0' "$dir/status.json")"
+  cost="$(jq -r '.total_cost_usd // 0' "$dir/status.json")"
+  {
+    echo "Refs #$n · Part of map #$MAP"
+    echo
+    echo "## What"
+    echo
+    grep -E '^[[:space:]]*[-*][[:space:]]+\[[xX]\]' "$dir/IMPLEMENTATION_PLAN.md" 2>/dev/null || echo "- (no plan items recorded)"
+    echo
+    echo "## Verification"
+    echo
+    echo "- \`$VERIFY_CMD\` passed on \`${head_sha:0:12}\`"
+    echo "- autopilot: $iters iteration(s), \$$cost"
+    echo
+    echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
+  } > "$dir/pr-body.md"
+}
+
+# append_fix_round_items <plan_file> <round> <findings_json>
+#   Appends round <round>'s in-scope blocker/issue findings as fresh plan
+#   items (review_fix_items, review.sh) and reopens the plan (STATUS:
+#   in-progress) for another autopilot run. Returns 1, plan untouched, when
+#   the round named nothing to fix — a changes_requested verdict with no
+#   in-scope blocker/issue finding is a reviewer contract violation, not an
+#   ordinary fix round.
+append_fix_round_items() {
+  local plan="$1" round="$2" findings="$3" items
+  items="$(review_fix_items "$round" "$findings")"
+  [[ -n "$items" ]] || return 1
+  { grep -v '^STATUS:' "$plan" 2>/dev/null; printf '%s\n' "$items"; echo; echo 'STATUS: in-progress'; } \
+    > "$plan.tmp" && mv "$plan.tmp" "$plan"
 }
 
 # ---------------------------------------------------------------------------
@@ -271,7 +395,8 @@ review_issue() {
 # alone, skipped with its dependents), 1 end the run.
 deliver_issue() {
   local id="$1" n dir line map_title issue_title labels state title branch
-  local pr head_sha status_state iters cost merged_sha
+  local pr head_sha merged_sha
+  local loop_rc gate_rc prev_head base_sha round prev_findings review_rc findings
   n="$(map_issue_number "$id")"
   dir="$RUN_DIR/issues/$n"
   mkdir -p "$dir"
@@ -316,84 +441,59 @@ deliver_issue() {
   # --extra-allowed-tools reaches autopilot's BUILD only — never the verifier
   # or the reviewer, and it is the caller's to keep free of gh / git push
   # (ADR-0007); the runner refuses such entries below.
-  # Indented line by line with a read loop, not sed: sed block-buffers into a
-  # pipe, and a run log behind `| tee` then stayed empty for half an hour.
-  local -a loop_timeout=() loop_pace=()
-  [[ -n "$PER_CALL_TIMEOUT" ]] && loop_timeout=(--per-call-timeout "$PER_CALL_TIMEOUT")
-  [[ "$PLAN_MAX_ITEMS" -gt 0 ]] && loop_pace+=(--plan-max-items "$PLAN_MAX_ITEMS")
-  if [[ "$VERIFY_EVERY_ITERATION" -eq 0 ]]; then
-    loop_pace+=(--verify-at-completion)
-    [[ -n "$ITERATION_VERIFY_CMD" ]] && loop_pace+=(--iteration-verify-cmd "$ITERATION_VERIFY_CMD")
-  fi
-  local -a loop_extra=()
-  [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
-  bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
-    --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$ISSUE_MAX_MINUTES" \
-    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
-    2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
-  local loop_rc=$?
-  status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
-  # Exit 1 is autopilot refusing to start (its preconditions) — the machinery,
-  # not this issue. Anything else short of done is this issue not finishing.
-  if [[ "$loop_rc" -eq 1 ]]; then
-    log "#$n: autopilot refused to start (exit 1) — stopping the run. State: $dir"
-    return 1
-  fi
-  [[ -z "$(git status --porcelain)" ]] || { log "#$n: autopilot left a dirty tree — stopping."; return 1; }
-  if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
-    PARK_REASON="autopilot ended '$status_state' (exit $loop_rc) without finishing"
-    return 10
-  fi
-  if [[ "$(git rev-list --count "origin/$BASE..HEAD")" -eq 0 ]]; then
-    PARK_REASON="autopilot reported done without a single commit"
-    return 10
-  fi
+  prev_head="$(git rev-parse HEAD)"
+  run_autopilot "$dir"; loop_rc=$?
+  autopilot_gates "$n" "$dir" "$prev_head" "$loop_rc"; gate_rc=$?
+  [[ "$gate_rc" -eq 0 ]] || return "$gate_rc"
 
   # --- verify the exact head that will be merged ---
+  final_verify "$n" "$dir" || return $?
   head_sha="$(git rev-parse HEAD)"
-  # Autopilot's BUILD may have edited what verify runs: no forge credentials.
-  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
-  local verify_rc=$?
-  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
-    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
-    return 1
-  fi
-  if [[ "$verify_rc" -ne 0 ]]; then
-    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
-    PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
-    return 10
-  fi
-  [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
-    || { log "#$n: verify changed the checkout — stopping."; return 1; }
 
   # --- PR ---
-  iters="$(jq -r '.iterations_done // 0' "$dir/status.json")"
-  cost="$(jq -r '.total_cost_usd // 0' "$dir/status.json")"
-  {
-    echo "Refs #$n · Part of map #$MAP"
-    echo
-    echo "## What"
-    echo
-    grep -E '^[[:space:]]*[-*][[:space:]]+\[[xX]\]' "$dir/IMPLEMENTATION_PLAN.md" 2>/dev/null || echo "- (no plan items recorded)"
-    echo
-    echo "## Verification"
-    echo
-    echo "- \`$VERIFY_CMD\` passed on \`${head_sha:0:12}\`"
-    echo "- autopilot: $iters iteration(s), \$$cost"
-    echo
-    echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
-  } > "$dir/pr-body.md"
-
+  write_pr_body "$n" "$dir" "$head_sha"
   forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
   pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
     || { log "#$n: opening the PR failed — stopping."; return 1; }
   CUR_PR="$pr"
   log "#$n: PR #$pr opened"
 
-  # --- independent review of the pushed head, before anything merges ---
-  review_issue "$n" "$pr" "$(git rev-parse "origin/$BASE")" "$head_sha" "$dir"
-  local review_rc=$?
-  [[ "$review_rc" -eq 0 ]] || return "$review_rc"
+  # --- independent review, with bounded in-scope fix rounds (#63) ---
+  base_sha="$(git rev-parse "origin/$BASE")"
+  round=1; prev_findings="[]"
+  while :; do
+    review_issue "$n" "$pr" "$base_sha" "$head_sha" "$dir" "$round" "$prev_findings"
+    review_rc=$?
+    [[ "$review_rc" -eq 0 ]] && break
+    [[ "$review_rc" -eq 10 ]] || return "$review_rc"
+    # A repeated no-usable-verdict reply parks the issue itself (PARK_REASON
+    # already set inside review_issue) and never gets a fix round; only a
+    # parsed changes_requested verdict (review-<round>.json on disk) does.
+    [[ -f "$dir/review-$round.json" ]] || return 10
+    if [[ "$round" -ge "$REVIEW_ROUNDS" ]]; then
+      PARK_REASON="the review still requests changes after $REVIEW_ROUNDS round(s) (PR #$pr)"
+      return 10
+    fi
+    findings="$(jq -c '.findings' "$dir/review-$round.json")"
+    append_fix_round_items "$dir/IMPLEMENTATION_PLAN.md" "$round" "$findings" || {
+      PARK_REASON="round $round's review requested changes but named no in-scope blocker or issue to fix (PR #$pr)"
+      return 10
+    }
+    log "#$n: round $round requested changes — fix round $((round + 1)) on the same PR #$pr"
+    prev_head="$(git rev-parse HEAD)"
+    run_autopilot "$dir"; loop_rc=$?
+    autopilot_gates "$n" "$dir" "$prev_head" "$loop_rc"; gate_rc=$?
+    [[ "$gate_rc" -eq 0 ]] || return "$gate_rc"
+    final_verify "$n" "$dir" || return $?
+    head_sha="$(git rev-parse HEAD)"
+    write_pr_body "$n" "$dir" "$head_sha"
+    # Fast-forward only — never forced: a rejected push means the branch
+    # moved from under this run, and that is a reason to stop, not overwrite.
+    forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
+    forge_pr_set_body "$pr" "$dir/pr-body.md" || log "#$n: could not update PR #$pr's body (continuing)"
+    prev_findings="$findings"
+    round=$(( round + 1 ))
+  done
 
   # --- merge (from the base, so the forge never has the head checked out) ---
   git switch -q "$BASE" || return 1

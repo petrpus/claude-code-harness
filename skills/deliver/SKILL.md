@@ -19,8 +19,8 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
-> independent review (#59) and parking (#58). Not yet: review fix rounds, CI
-> wait, resume, the tmux launcher.
+> independent review (#59), parking (#58) and bounded fix rounds (#63). Not
+> yet: out-of-scope follow-up issues, CI wait, resume, the tmux launcher.
 
 ## When an issue does not make it
 
@@ -53,7 +53,8 @@ issue's fault: it ends the run with exit 1, where it is.
    ```bash
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
-     [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
+     [--review-model sonnet] [--review-rounds 2] [--extra-allowed-tools '<csv>'] \
+     [--per-call-timeout <s>] \
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
    ```
 
@@ -101,6 +102,31 @@ says "approve" still holds the PR. A reply with no usable verdict is retried
 once, then holds the PR (fail closed). The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
+
+## Fix rounds (`--review-rounds`, default 2)
+
+A `changes_requested` verdict does not park the issue outright. Every
+in-scope `blocker` / `issue` finding of that round becomes a fresh plan item
+(`- [ ] R<k>.<j> — <severity> <file>:<line>: <note>`) appended to the issue's
+`IMPLEMENTATION_PLAN.md`, its `STATUS:` line is reopened to `in-progress`, and
+`loop.sh` runs again on the **same** `--state-dir` — so BUILD sees the same
+charter, memory and feedback, and only fixes what the review named.
+Out-of-scope findings and suggestions never become plan items — a suggestion
+never appears anywhere but the review's own PR comment.
+
+Once that round's autopilot run reports done, the same gates as the first run
+apply: an autopilot exit 1 or a dirty tree stops the whole run, anything
+short of `done` (or a run with no new commit) parks the issue, the full
+verify runs again on the new head, and the branch is pushed **fast-forward
+only** — never forced; a rejected (non-fast-forward) push stops the run. The
+PR body is rewritten from the current plan (`forge_pr_set_body`, `gh pr edit
+--body-file`), and the new head is reviewed again as round `k+1`, with round
+`k`'s findings inlined into the prompt so the reviewer can judge what was
+fixed — the round's PR comment lists the ids it marks `resolved`.
+
+After `--review-rounds` rounds still requesting changes, the issue parks with
+a reason naming the round count and the PR. Decision record:
+`docs/adr/0010-*.md`.
 
 **Pacing.** An issue is already one PR-sized slice, so by default autopilot
 gets `--plan-max-items 3` (a small plan; `--plan-max-items 0` lifts it) and

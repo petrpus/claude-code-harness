@@ -32,6 +32,10 @@ forge_issue_body() {
 forge_issue_set_body() { gh issue edit "$1" --body-file "$2" >/dev/null; }   # <number> <file>
 forge_issue_comment()  { gh issue comment "$1" --body-file "$2" >/dev/null; } # <number> <file>
 
+# forge_pr_set_body <pr> <file>  — rewrite a PR's body (a fix round's updated
+# plan, #63). Never touches the title.
+forge_pr_set_body() { gh pr edit "$1" --body-file "$2" >/dev/null; }
+
 # forge_push_branch <branch>  — first push of a branch the runner created.
 # Never forced: a rejected push means someone else wrote the branch, and
 # that is a reason to stop, not to overwrite.

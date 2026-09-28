@@ -361,6 +361,10 @@ case "$cmd" in
     echo "https://github.com/o/r/pull/$n" ;;
   "pr view")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; cat "$f" ;;
+  "pr edit")
+    f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1
+    b="$(arg --body-file "$@")" || exit 64
+    jq --rawfile body "$b" '.body = $body' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   "pr comment")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -416,9 +420,16 @@ case "$prompt" in
       inl=no; [[ "$prompt" == *"### Diff"* && "$prompt" == *"+++ b/work/issue-"* ]] && inl=yes
       printf '%s\t%s\t%s\t%s\t%s\n' "$(pwd)" "$tools" "$dis" "$perm" "$inl" >> "$STUB_REVIEW_LOG"
     fi
+    if [[ -n "${STUB_REVIEW_PROMPT_DIR:-}" ]]; then
+      mkdir -p "$STUB_REVIEW_PROMPT_DIR"
+      printf '%s' "$prompt" > "$STUB_REVIEW_PROMPT_DIR/$(date +%s%N)-$$-$RANDOM.txt"
+    fi
     mode="${STUB_REVIEW:-approve}"
     if [[ "$mode" == "garbage-once" ]]; then
       if [[ -f "${STUB_REVIEW_STATE:?}" ]]; then mode=approve; else touch "$STUB_REVIEW_STATE"; mode=garbage; fi
+    fi
+    if [[ "$mode" == "blocker-once" ]]; then
+      if [[ -f "${STUB_REVIEW_STATE:?}" ]]; then mode=approve; else touch "$STUB_REVIEW_STATE"; mode=blocker; fi
     fi
     case "$mode" in
       approve)    r="$(review_json approve '[{"id":"S1","severity":"suggestion","file":"a","line":1,"note":"nit","in_scope":true}]')" ;;
@@ -712,6 +723,28 @@ job_parknowork() {
 }
 job_rvblock()   { new_fixture rvblock;    run_deliver rvblock    STUB_REVIEW=blocker;                                                  echo $? > "$WORK/rvblock/rc"; }
 job_rvliar()    { new_fixture rvliar;     run_deliver rvliar     STUB_REVIEW=liar;                                                     echo $? > "$WORK/rvliar/rc"; }
+# --- fix rounds (#63) ---------------------------------------------------------
+job_rvblockonce() {
+  new_fixture rvblockonce
+  run_deliver rvblockonce STUB_REVIEW=blocker-once STUB_REVIEW_STATE="$WORK/rvblockonce/review.state" \
+    STUB_REVIEW_PROMPT_DIR="$WORK/rvblockonce/prompts"
+  echo $? > "$WORK/rvblockonce/rc"
+}
+job_rvblockrounds2() {
+  new_fixture rvblockrounds2
+  run_deliver rvblockrounds2 STUB_REVIEW=blocker -- --review-rounds 2
+  echo $? > "$WORK/rvblockrounds2/rc"
+}
+job_rvblockrounds1() {
+  new_fixture rvblockrounds1
+  run_deliver rvblockrounds1 STUB_REVIEW=blocker -- --review-rounds 1
+  echo $? > "$WORK/rvblockrounds1/rc"
+}
+job_reviewroundsbad() {
+  new_fixture reviewroundsbad
+  run_deliver reviewroundsbad -- --review-rounds 0
+  echo $? > "$WORK/reviewroundsbad/rc"
+}
 job_rvoos()     { new_fixture rvoos;      run_deliver rvoos      STUB_REVIEW=outofscope;                                               echo $? > "$WORK/rvoos/rc"; }
 job_rvgarbage() { new_fixture rvgarbage;  run_deliver rvgarbage  STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log";      echo $? > "$WORK/rvgarbage/rc"; }
 job_rvretry()   { new_fixture rvretry;    run_deliver rvretry    STUB_REVIEW=garbage-once STUB_REVIEW_STATE="$WORK/rvretry/review.state"; echo $? > "$WORK/rvretry/rc"; }
@@ -754,6 +787,10 @@ bg job_parkverify
 bg job_parknowork
 bg job_rvblock
 bg job_rvliar
+bg job_rvblockonce
+bg job_rvblockrounds2
+bg job_rvblockrounds1
+bg job_reviewroundsbad
 bg job_rvoos
 bg job_rvgarbage
 bg job_rvretry
@@ -848,6 +885,10 @@ REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
 [[ "$(cat "$RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .verdict=="approve")] | length')" -eq 2 ]] \
   && ok "review: both calls are in the run's own log (phase review, issue, verdict, cost)" \
   || note "review: run log rows missing under $RUNDIR"
+[[ "$(jq -r .body "$H/gh/prs/4.json")" != *"nit"* && "$(cat "$RUNDIR"issues/1/IMPLEMENTATION_PLAN.md 2>/dev/null)" != *"nit"* ]] \
+  && jq -r '.comments[0].body' "$H/gh/prs/4.json" | grep -q 'nit' \
+  && ok "review: a suggestion's note never lands in the plan or PR body, only the review comment" \
+  || note "review: suggestion 'nit' leaked into the plan or PR body, or missing from the comment"
 
 # --- guardrails (ADR-0007), over every command the runner ran ----------------
 if grep -E '(^| )push( |$)' "$H/git.calls" | grep -qE -- '(--force|--force-with-lease|(^| )-f( |$)|(^| )-[a-zA-Z]*f[a-zA-Z]*( |$))'; then
@@ -1054,6 +1095,48 @@ RC="$(cat "$WORK/rvliar/rc")"
   && jq -r '.comments[0].body' "$WORK/rvliar/gh/prs/4.json" | grep -qF '**Runner verdict: changes_requested** (reviewer said: approve)' \
   && ok "review: 'approve' with an in-scope issue is overruled by the runner" \
   || note "review liar: exit $RC"
+
+# --- bounded in-scope fix rounds on the same PR (#63) --------------------------
+RC="$(cat "$WORK/rvblockonce/rc")"
+RVBO="$WORK/rvblockonce"
+RUNDIR_RVBO="$(ls -d "$RVBO"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+ROWS_RVBO="$(cat "$RUNDIR_RVBO"run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .issue==1)] | length')"
+ROUND2_HAS_B1=0
+for f in "$RVBO"/prompts/*.txt; do
+  [[ -f "$f" ]] || continue
+  grep -q 'Issue #1, review round 2' "$f" 2>/dev/null && grep -q '"id":"B1"' "$f" 2>/dev/null && ROUND2_HAS_B1=1
+done
+[[ "$RC" -eq 0 ]] && [[ "$ROWS_RVBO" -eq 2 ]] \
+  && grep -qE '^- \[x\] R1\.1' "$RUNDIR_RVBO"issues/1/IMPLEMENTATION_PLAN.md 2>/dev/null \
+  && [[ "$ROUND2_HAS_B1" -eq 1 ]] \
+  && [[ "$(jq -r .state "$RVBO/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(jq -r .body "$RVBO/gh/issues/3.json")" == *"- [x] #1 "* && "$(jq -r .body "$RVBO/gh/issues/3.json")" == *"- [x] #2 "* ]] \
+  && ok "fix round: blocker-once → round 2 approves — R1.1 fixed and ticked, round 2's prompt inlines round 1's finding id, PR merged, Map ticked" \
+  || note "fix round blocker-once: exit $RC, review rows(issue1)=$ROWS_RVBO, round2-has-B1=$ROUND2_HAS_B1"
+
+RC="$(cat "$WORK/rvblockrounds2/rc")"
+RVBR2="$WORK/rvblockrounds2"
+RUNDIR_RVBR2="$(ls -d "$RVBR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+ROWS_RVBR2="$(cat "$RUNDIR_RVBR2"run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .issue==1)] | length')"
+[[ "$RC" -eq 2 ]] && held rvblockrounds2 && [[ "$ROWS_RVBR2" -eq 2 ]] \
+  && jq -r '.comments[-1].body' "$RVBR2/gh/issues/1.json" | grep -q 'after 2 round(s) (PR #4)' \
+  && ok "fix rounds: an always-blocker verdict with --review-rounds 2 parks after exactly 2 reviews" \
+  || note "fix rounds --review-rounds 2: exit $RC, review rows=$ROWS_RVBR2"
+
+RC="$(cat "$WORK/rvblockrounds1/rc")"
+RVBR1="$WORK/rvblockrounds1"
+RUNDIR_RVBR1="$(ls -d "$RVBR1"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+ROWS_RVBR1="$(cat "$RUNDIR_RVBR1"run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .issue==1)] | length')"
+[[ "$RC" -eq 2 ]] && held rvblockrounds1 && [[ "$ROWS_RVBR1" -eq 1 ]] \
+  && jq -r '.comments[-1].body' "$RVBR1/gh/issues/1.json" | grep -q 'after 1 round(s) (PR #4)' \
+  && ok "fix rounds: --review-rounds 1 parks after exactly one review" \
+  || note "fix rounds --review-rounds 1: exit $RC, review rows=$ROWS_RVBR1"
+
+RC="$(cat "$WORK/reviewroundsbad/rc")"
+[[ "$RC" -eq 1 ]] && grep -q 'review-rounds takes a positive whole number' "$WORK/reviewroundsbad/err" \
+  && [[ ! -s "$WORK/reviewroundsbad/gh/calls" ]] \
+  && ok "--review-rounds 0 is refused before any forge call" \
+  || note "--review-rounds 0: exit $RC"
 
 RC="$(cat "$WORK/rvoos/rc")"
 [[ "$RC" -eq 0 && "$(jq -r .state "$WORK/rvoos/gh/prs/4.json")" == "MERGED" ]] \

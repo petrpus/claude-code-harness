@@ -173,6 +173,19 @@ review_parse() {
                   then "changes_requested" else "approve" end)'
 }
 
+# review_fix_items <round> <findings_json>
+#   A review round's in-scope blocker/issue findings as fresh plan checklist
+#   lines: "- [ ] R<round>.<j> — <severity> <file>:<line>: <note>", 1-based
+#   per round (#63). Out-of-scope findings and suggestions never appear here
+#   — they are only ever surfaced in the PR comment (review_comment below).
+review_fix_items() {
+  local round="$1" findings="$2"
+  printf '%s' "$findings" | jq -r --arg round "$round" '
+    [ .[] | select(.in_scope and (.severity == "blocker" or .severity == "issue")) ] |
+    to_entries[] |
+    "- [ ] R\($round).\(.key + 1) — \(.value.severity) \(.value.file // "?"):\(.value.line // "?"): \(.value.note // "")"'
+}
+
 # review_cleanup — remove the live throwaway worktree, if any. Safe to call
 # repeatedly; deliver.sh also calls it from its EXIT/INT/TERM traps, so a
 # killed run does not leave a worktree behind to confuse the next snapshot.
@@ -227,7 +240,7 @@ review_run() {
 #   The PR comment: a marker a resumed run can find (never post the same
 #   review twice), the runner's verdict, then the reviewer's own report.
 review_comment() {
-  local n="$1" round="$2" head="$3" report="$4" vjson="$5" verdict model_verdict counts
+  local n="$1" round="$2" head="$3" report="$4" vjson="$5" verdict model_verdict counts resolved=""
   if [[ -n "$vjson" && -f "$vjson" ]]; then
     verdict="$(jq -r '.verdict' "$vjson")"
     model_verdict="$(jq -r '.model_verdict' "$vjson")"
@@ -236,6 +249,7 @@ review_comment() {
                        (.findings | map(select(.in_scope | not)) | length),
                        (.findings | map(select(.severity=="suggestion")) | length)]
                      | "in-scope blockers: \(.[0]) · in-scope issues: \(.[1]) · out of scope: \(.[2]) · suggestions: \(.[3])"' "$vjson")"
+    resolved="$(jq -r '(.resolved // []) | map(tostring) | join(", ")' "$vjson")"
   else
     verdict="no verdict"; model_verdict="—"; counts="the reviewer's reply carried no usable JSON verdict for this head"
   fi
@@ -243,6 +257,10 @@ review_comment() {
   echo "## Independent review — round $round (\`code-reviewer\` via \`/deliver\`)"
   echo
   echo "**Runner verdict: $verdict** (reviewer said: $model_verdict) — $counts"
+  if [[ "$round" -gt 1 && -n "$resolved" ]]; then
+    echo
+    echo "Resolved since round $((round - 1)): $resolved"
+  fi
   echo
   echo "<details><summary>Reviewer's report</summary>"
   echo
