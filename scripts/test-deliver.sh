@@ -654,12 +654,14 @@ PCT_BUILD="$(cat "$WORK"/pct/repo/tmp/deliver/*/issues/1/run-*.jsonl 2>/dev/null
 [[ "$RC" -eq 2 && "$PCT_BUILD" == "124 " ]] \
   && ok "--per-call-timeout bounds autopilot's calls (BUILD cut off with 124, issue parked)" \
   || note "--per-call-timeout: exit $RC, build exit codes '$PCT_BUILD'"
-new_fixture pctbad
-run_deliver pctbad -- --per-call-timeout 1.5
-RC=$?
-[[ "$RC" -eq 1 ]] && grep -q 'takes whole seconds' "$WORK/pctbad/err" && [[ ! -s "$WORK/pctbad/gh/calls" ]] \
-  && ok "--per-call-timeout that is not whole seconds is refused before any forge call" \
-  || note "--per-call-timeout 1.5: exit $RC"
+for bad in 1.5 0; do
+  rm -rf "$WORK/pctbad"; new_fixture pctbad
+  run_deliver pctbad -- --per-call-timeout "$bad"
+  RC=$?
+  [[ "$RC" -eq 1 ]] && grep -q 'takes whole seconds' "$WORK/pctbad/err" && [[ ! -s "$WORK/pctbad/gh/calls" ]] \
+    && ok "--per-call-timeout $bad is refused before any forge call" \
+    || note "--per-call-timeout $bad: exit $RC"
+done
 
 # --- refusals ------------------------------------------------------------------
 new_fixture onmain
