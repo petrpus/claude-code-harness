@@ -189,6 +189,28 @@ review_fix_items() {
 # review_cleanup — remove the live throwaway worktree, if any. Safe to call
 # repeatedly; deliver.sh also calls it from its EXIT/INT/TERM traps, so a
 # killed run does not leave a worktree behind to confuse the next snapshot.
+# review_out_of_scope_items <findings_json>
+#   Every out-of-scope blocker/issue finding (suggestions are skipped, same
+#   rule as review_fix_items, #63) as TSV rows: file, line, severity, note,
+#   issue_title (the reviewer's suggested follow-up title, may be empty).
+review_out_of_scope_items() {
+  printf '%s' "$1" | jq -r '
+    .[] | select((.in_scope | not) and (.severity == "blocker" or .severity == "issue")) |
+    [ (.file // "?"), ((.line // "?") | tostring), .severity, (.note // ""), (.issue_title // "") ] | @tsv'
+}
+
+# finding_hash <file> <severity> <note>
+#   sha256 of the finding's normalized file/severity/note — an out-of-scope
+#   finding's identity across review rounds, autopilot re-runs and repeated
+#   /deliver invocations against the same forge state (#63): unless an issue
+#   already carries `<!-- deliver:finding <hash> -->`, a fresh one is opened.
+finding_hash() {
+  local norm
+  norm="$(printf '%s\x1f%s\x1f%s' "$1" "$2" "$3" \
+    | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed -E 's/^ +| +$//')"
+  printf '%s' "$norm" | sha256sum | cut -d' ' -f1
+}
+
 review_cleanup() {
   [[ -n "$REVIEW_WT" ]] || return 0
   git worktree remove --force "$REVIEW_WT" 2>/dev/null || rm -rf "$REVIEW_WT"

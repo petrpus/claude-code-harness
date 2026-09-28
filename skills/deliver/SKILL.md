@@ -19,8 +19,8 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
-> independent review (#59), parking (#58) and bounded fix rounds (#63). Not
-> yet: out-of-scope follow-up issues, CI wait, resume, the tmux launcher.
+> independent review (#59), parking (#58), bounded fix rounds and follow-up
+> issues (#63). Not yet: CI wait, resume, the tmux launcher.
 
 ## When an issue does not make it
 
@@ -127,6 +127,31 @@ fixed — the round's PR comment lists the ids it marks `resolved`.
 After `--review-rounds` rounds still requesting changes, the issue parks with
 a reason naming the round count and the PR. Decision record:
 `docs/adr/0010-*.md`.
+
+## Out-of-scope findings become follow-up issues
+
+Every out-of-scope `blocker` / `issue` finding (suggestions are never
+followed up — they only ever appear in the review's PR comment) becomes a
+`needs-triage` issue instead of a plan item, in every round, whether that
+round approves or requests changes:
+
+- a **finding hash** (sha256 of its normalized `file`, `severity` and `note`)
+  is its identity across rounds, autopilot re-runs and separate `/deliver`
+  invocations. `forge_issue_search` looks for an open or closed issue already
+  carrying `<!-- deliver:finding <hash> -->`; only when there is none does
+  `gh issue create --label needs-triage` open a new one (label created if the
+  repo lacks it), titled from the finding's `issue_title` (else a conventional
+  fallback) and linking the Map, the PR and the `file:line`;
+- the follow-up (found or freshly created) is appended under the Map's
+  `## Follow-ups` section (`map_add_follow_up`, `docs/adr/0008-*.md` decision
+  7) — created if the Map has none yet, and only once per issue number, with
+  the same re-read/write/read-back retry as ticking a Delivery line;
+- it is also listed in the PR body's `## Follow-ups` section
+  (`forge_pr_set_body`), kept in sync after every round that finds one.
+
+A follow-up is **recorded, never executed** by the run that found it: it
+never touches `## Delivery`, gets no branch and no autopilot run — adding it
+to a Map's Delivery section is a human decision made after triage.
 
 **Pacing.** An issue is already one PR-sized slice, so by default autopilot
 gets `--plan-max-items 3` (a small plan; `--plan-max-items 0` lifts it) and

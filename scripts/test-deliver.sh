@@ -142,6 +142,38 @@ printf -- '- [ ] #1 feat: a (after: #2)\n- [ ] #2 feat: b (after: #1)\n' > "$WOR
 select_next_slice "$WORK/cycle.plan" >/dev/null; [[ $? -eq 2 ]] \
   && ok "a cycle between issues is plan.sh's rc 2" || note "cycle not detected"
 
+# --- follow-ups (#63) ---------------------------------------------------------
+map_add_follow_up "$WORK/map1.md" 75 '- [ ] #75 found reviewing #62 (PR #72): old bug' > "$WORK/map1.followup.md"
+grep -A2 '^## Follow-ups$' "$WORK/map1.followup.md" | grep -q '#75 found reviewing #62 (PR #72): old bug' \
+  && grep -q '^## Notes$' "$WORK/map1.followup.md" \
+  && ok "add_follow_up: creates '## Follow-ups' (before the next section) when the Map has none" \
+  || note "add_follow_up (new section): $(tr '\n' '|' < "$WORK/map1.followup.md")"
+
+cat > "$WORK/followup.md" <<'EOF'
+## Delivery
+- [ ] #1 feat(a): first feature
+
+## Follow-ups
+- [ ] #75 found reviewing #62 (PR #72): old bug
+
+## Notes
+nothing
+EOF
+map_add_follow_up "$WORK/followup.md" 80 '- [ ] #80 found reviewing #62 (PR #72): another bug' > "$WORK/followup2.md"
+[[ "$(grep -c '^- \[ \] #' "$WORK/followup2.md")" -eq 3 ]] \
+  && grep -q '#80 found reviewing #62 (PR #72): another bug' "$WORK/followup2.md" \
+  && grep -q '#75 found reviewing #62 (PR #72): old bug' "$WORK/followup2.md" \
+  && ok "add_follow_up: appends to an existing '## Follow-ups' section" \
+  || note "add_follow_up (existing section): $(tr '\n' '|' < "$WORK/followup2.md")"
+
+map_add_follow_up "$WORK/followup.md" 75 '- [ ] #75 duplicate' > "$WORK/followup3.md"
+cmp -s "$WORK/followup.md" "$WORK/followup3.md" \
+  && ok "add_follow_up: an already-listed issue leaves the body unchanged (idempotent)" \
+  || note "add_follow_up (already listed): body changed"
+map_follow_up_has "$WORK/followup.md" 75 && ! map_follow_up_has "$WORK/followup.md" 76 \
+  && ok "follow_up_has: reads the Follow-ups section only" \
+  || note "follow_up_has: wrong answer"
+
 # ===========================================================================
 # Unit: charter.sh
 # ===========================================================================
@@ -359,6 +391,29 @@ case "$cmd" in
        '{number:$n,state:"OPEN",baseRefName:$base,headRefName:$head,title:$title,body:$body,headRefOid:$oid}' \
        > "$S/prs/$n.json"
     echo "https://github.com/o/r/pull/$n" ;;
+  "issue create")
+    title="$(arg --title "$@")"; b="$(arg --body-file "$@")" || exit 64
+    label="$(arg --label "$@")" || label=""
+    if [[ -n "$label" ]]; then
+      grep -qx "$label" "$S/labels" 2>/dev/null || { echo "could not add label: '$label' not found" >&2; exit 1; }
+    fi
+    n="$(next_num)"
+    jq -n --argjson n "$n" --arg title "$title" --rawfile body "$b" --arg label "$label" \
+       '{number:$n,title:$title,body:$body,state:"OPEN",url:("https://github.com/o/r/issues/" + ($n|tostring)),
+         labels:(if $label=="" then [] else [{name:$label}] end),comments:[]}' \
+       > "$S/issues/$n.json"
+    echo "https://github.com/o/r/issues/$n" ;;
+  "issue list")
+    search="$(arg --search "$@")" || search=""
+    jqexpr="$(arg --jq "$@")" || jqexpr=""
+    matches="[]"
+    for f in "$S"/issues/*.json; do
+      [[ -f "$f" ]] || continue
+      if [[ -z "$search" ]] || grep -qF "$search" "$f"; then
+        matches="$(jq --argjson m "$matches" '. as $it | $m + [{number: $it.number}]' "$f")"
+      fi
+    done
+    if [[ -n "$jqexpr" ]]; then printf '%s' "$matches" | jq -r "$jqexpr"; else printf '%s' "$matches"; fi ;;
   "pr view")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; cat "$f" ;;
   "pr edit")
@@ -1139,8 +1194,26 @@ RC="$(cat "$WORK/reviewroundsbad/rc")"
   || note "--review-rounds 0: exit $RC"
 
 RC="$(cat "$WORK/rvoos/rc")"
-[[ "$RC" -eq 0 && "$(jq -r .state "$WORK/rvoos/gh/prs/4.json")" == "MERGED" ]] \
-  && ok "review: an out-of-scope finding does not block the merge" \
+RVOOS="$WORK/rvoos"
+HASH_RVOOS="$(finding_hash b issue 'old bug')"
+MAP_BODY_RVOOS="$(jq -r .body "$RVOOS/gh/issues/3.json" 2>/dev/null)"
+TRIAGE_COUNT="$(jq -s '[.[] | select([.labels[]?.name] | index("needs-triage"))] | length' "$RVOOS"/gh/issues/*.json 2>/dev/null)"
+# STUB_REVIEW=outofscope reports the same b:9 finding for both #1's and #2's
+# review — the fixture's own way of reprocessing the same finding twice —
+# so the dedupe (forge_issue_search) is exercised without a second run.
+[[ "$RC" -eq 0 && "$(jq -r .state "$RVOOS/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$RVOOS/gh/prs/6.json")" == "MERGED" ]] \
+  && [[ "$TRIAGE_COUNT" -eq 1 ]] \
+  && [[ -f "$RVOOS/gh/issues/5.json" ]] \
+  && [[ "$(jq -r '[.labels[].name] | join(",")' "$RVOOS/gh/issues/5.json")" == "needs-triage" ]] \
+  && jq -r .body "$RVOOS/gh/issues/5.json" | grep -qF 'map #3' \
+  && jq -r .body "$RVOOS/gh/issues/5.json" | grep -qF 'PR #4' \
+  && jq -r .body "$RVOOS/gh/issues/5.json" | grep -qF 'b:9' \
+  && jq -r .body "$RVOOS/gh/issues/5.json" | grep -qF "<!-- deliver:finding $HASH_RVOOS -->" \
+  && [[ "$(grep -c '^- \[ \] #5 ' <<<"$MAP_BODY_RVOOS")" -eq 1 ]] \
+  && grep -A3 '^## Follow-ups$' <<<"$MAP_BODY_RVOOS" | grep -q '#5 found reviewing #1 (PR #4)' \
+  && [[ "$MAP_BODY_RVOOS" == *"- [x] #1 "* && "$MAP_BODY_RVOOS" == *"- [x] #2 "* ]] \
+  && jq -r .body "$RVOOS/gh/prs/4.json" | grep -qF '#5 — fix: old bug' \
+  && ok "review: an out-of-scope finding does not block the merge; becomes one needs-triage follow-up (Map Follow-ups + PR body), never duplicated when the same finding recurs on #2's review" \
   || note "review out-of-scope: exit $RC"
 
 RC="$(cat "$WORK/rvgarbage/rc")"

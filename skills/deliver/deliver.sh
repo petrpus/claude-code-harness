@@ -229,6 +229,68 @@ tick_map() {
   return 1
 }
 
+# add_map_follow_up <fn> <line>
+#   Appends <line> under the Map's '## Follow-ups' section (map_add_follow_up,
+#   map.sh) unless #<fn> is already listed there. Same re-read/write/read-back
+#   retry as tick_map (ADR-0008 decision 6): a human editing the Map at the
+#   same moment must not silently lose the runner's write. Never touches
+#   '## Delivery' — a follow-up is recorded, not scheduled.
+add_map_follow_up() {
+  local fn="$1" line="$2" attempt fresh="$RUN_DIR/map.fresh.md" new="$RUN_DIR/map.new.md"
+  for attempt in 1 2 3; do
+    forge_issue_body "$MAP" "$fresh" || continue
+    map_follow_up_has "$fresh" "$fn" && return 0
+    map_add_follow_up "$fresh" "$fn" "$line" > "$new" || return 1
+    forge_issue_set_body "$MAP" "$new" || continue
+    forge_issue_body "$MAP" "$fresh" && map_follow_up_has "$fresh" "$fn" && return 0
+  done
+  return 1
+}
+
+# process_out_of_scope_findings <n> <pr> <dir> <round>
+#   Every out-of-scope blocker/issue finding of round <round> (suggestions
+#   skipped, review_out_of_scope_items) becomes a needs-triage follow-up
+#   issue — or is matched to one that already carries its finding-hash marker
+#   (forge_issue_search, dedupe) — appended under the Map's '## Follow-ups'
+#   and recorded for this issue's PR body (#63). Never holds the verdict
+#   (review_parse already keeps out-of-scope findings out of that) and never
+#   executed: adding it to '## Delivery' is a human decision after triage
+#   (ADR-0008 decision 7).
+process_out_of_scope_findings() {
+  local n="$1" pr="$2" dir="$3" round="$4" findings file line sev note issue_title
+  local hash marker fn title body_file
+  findings="$(jq -c '.findings' "$dir/review-$round.json" 2>/dev/null)" || return 0
+  while IFS=$'\t' read -r file line sev note issue_title; do
+    [[ -n "$file" ]] || continue
+    hash="$(finding_hash "$file" "$sev" "$note")"
+    marker="<!-- deliver:finding $hash -->"
+    title="${issue_title:-fix: $sev at $file:$line}"
+    fn="$(forge_issue_search "$hash")"
+    if [[ -z "$fn" ]]; then
+      body_file="$dir/follow-up-$hash.md"
+      {
+        echo "Found reviewing #$n (PR #$pr), part of map #$MAP."
+        echo
+        echo "- Severity: $sev"
+        echo "- Location: \`$file:$line\`"
+        if [[ -n "$note" ]]; then echo; echo "$note"; fi
+        echo
+        echo "$marker"
+      } > "$body_file"
+      forge_label_ensure needs-triage e4e669 "Out-of-scope review finding awaiting human triage before it joins a Map"
+      fn="$(forge_issue_create "$title" "$body_file" needs-triage)" \
+        || { log "#$n: could not create a follow-up issue for $file:$line — continuing"; continue; }
+      log "#$n: follow-up issue #$fn created for out-of-scope $sev at $file:$line"
+    else
+      log "#$n: follow-up issue #$fn already carries this finding — reusing it"
+    fi
+    add_map_follow_up "$fn" "- [ ] #$fn found reviewing #$n (PR #$pr): $title" \
+      || log "#$n: could not record follow-up #$fn on map #$MAP (continuing)"
+    grep -q "^$fn"$'\t' "$dir/follow-ups.pr.list" 2>/dev/null \
+      || printf '%s\t%s\n' "$fn" "$title" >> "$dir/follow-ups.pr.list"
+  done < <(review_out_of_scope_items "$findings")
+}
+
 # ---------------------------------------------------------------------------
 # Independent review of one PR head (review.sh). Returns 0 when the runner's
 # verdict is approve, 10 (park) when the review holds the PR, 1 when the
@@ -368,6 +430,14 @@ write_pr_body() {
     echo
     echo "- \`$VERIFY_CMD\` passed on \`${head_sha:0:12}\`"
     echo "- autopilot: $iters iteration(s), \$$cost"
+    if [[ -s "$dir/follow-ups.pr.list" ]]; then
+      echo
+      echo "## Follow-ups"
+      echo
+      while IFS=$'\t' read -r fn ftitle; do
+        echo "- #$fn — $ftitle"
+      done < "$dir/follow-ups.pr.list"
+    fi
     echo
     echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
   } > "$dir/pr-body.md"
@@ -464,8 +534,15 @@ deliver_issue() {
   while :; do
     review_issue "$n" "$pr" "$base_sha" "$head_sha" "$dir" "$round" "$prev_findings"
     review_rc=$?
+    [[ "$review_rc" -eq 0 || "$review_rc" -eq 10 ]] || return "$review_rc"
+    if [[ -f "$dir/review-$round.json" ]]; then
+      process_out_of_scope_findings "$n" "$pr" "$dir" "$round"
+      if [[ -s "$dir/follow-ups.pr.list" ]]; then
+        write_pr_body "$n" "$dir" "$head_sha"
+        forge_pr_set_body "$pr" "$dir/pr-body.md" || log "#$n: could not update PR #$pr's body (continuing)"
+      fi
+    fi
     [[ "$review_rc" -eq 0 ]] && break
-    [[ "$review_rc" -eq 10 ]] || return "$review_rc"
     # A repeated no-usable-verdict reply parks the issue itself (PARK_REASON
     # already set inside review_issue) and never gets a fix round; only a
     # parsed changes_requested verdict (review-<round>.json on disk) does.
