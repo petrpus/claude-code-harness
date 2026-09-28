@@ -87,3 +87,72 @@ forge_pr_draft() { gh pr ready "$1" --undo >/dev/null; }
 forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'
 }
+
+# forge_grant_violations <allowed_tools_csv>
+#   Pure: which Claude Code permission rules in the list would hand a model
+#   phase a forge operation (ADR-0007), or cannot be shown not to. Echoes one
+#   "<rule>: <why>" per offending rule and returns 1 if there is any.
+#
+#   Fail closed: a `Bash(...)` rule is accepted only when its command is a
+#   plain command — words made of [A-Za-z0-9._/+=:@%,-], separated by spaces,
+#   optionally ending in `:*` or ` *` — and even then its program (by
+#   basename) must not be gh / git / hub, a program that runs other programs
+#   (env, command, exec, nice, timeout, xargs, eval, sudo, ssh, find, …), or
+#   an interpreter without a script path (bash -c, bash:*, python3 -c).
+#   Quotes, backslashes, $, ;, |, &, <, >, backticks, a leading VAR=value or
+#   a wildcard inside the command are refused, not interpreted: each is a way
+#   to spell `gh` that a denylist would have to anticipate. A blanket `Bash`
+#   and a malformed rule are refused too. Rules for other tools pass.
+#
+#   This is defence in depth, not the boundary, and it cannot be complete:
+#   BUILD edits files and may run the verify command and scripts it can
+#   edit, and loop.sh's own base allowlist already grants npx / pnpm / node.
+#   Withholding forge credentials from model calls is the boundary (#77).
+forge_grant_violations() {
+  local csv="$1" rule inner cmd base next bad=0 depth=0 cur="" ch i
+  local -a rules=() toks=()
+  local word='[A-Za-z0-9._/+=:@%,-]+'
+  for (( i=0; i<${#csv}; i++ )); do
+    ch="${csv:$i:1}"
+    case "$ch" in
+      "(") depth=$((depth+1)); cur+="$ch" ;;
+      ")") (( depth > 0 )) && depth=$((depth-1)); cur+="$ch" ;;
+      ",") if (( depth == 0 )); then rules+=("$cur"); cur=""; else cur+="$ch"; fi ;;
+      *)   cur+="$ch" ;;
+    esac
+  done
+  rules+=("$cur")
+  for rule in "${rules[@]}"; do
+    rule="$(printf '%s' "$rule" | tr '\t\n\r' '   ' | sed -E 's/^ +//; s/ +$//')"
+    [[ -n "$rule" ]] || continue
+    [[ "$rule" == Bash* ]] || continue
+    if [[ "$rule" == "Bash" ]]; then echo "$rule: a blanket shell grant"; bad=1; continue; fi
+    if [[ ! "$rule" =~ ^Bash\((.*)\)$ ]]; then echo "$rule: not a well-formed Bash(...) rule"; bad=1; continue; fi
+    inner="${BASH_REMATCH[1]}"
+    cmd="$(printf '%s' "$inner" | sed -E 's/:\*$//; s/ \*$//; s/^ +//; s/ +$//')"
+    if [[ ! "$cmd" =~ ^${word}(\ +${word})*$ ]]; then
+      echo "$rule: not a plain command (quotes, escapes, wildcards or shell syntax are refused)"; bad=1; continue
+    fi
+    read -ra toks <<<"$cmd"
+    if [[ "${toks[0]}" == *=* ]]; then echo "$rule: starts with an environment assignment"; bad=1; continue; fi
+    # Lowercased: on a case-insensitive filesystem (macOS, Windows) `GH`
+    # resolves to the same binary as `gh`.
+    base="$(printf '%s' "${toks[0]##*/}" | tr '[:upper:]' '[:lower:]')"; next="${toks[1]:-}"
+    case "$base" in
+      gh|gh-*|git|hub|glab|lab)
+        echo "$rule: runs $base — forge operations are the runner's alone (ADR-0007)"; bad=1 ;;
+      npx|npm|pnpm|yarn|bunx|bun|corepack|deno|pipx|uvx|uv)
+        # Package runners execute whatever they are told to fetch or find,
+        # and deno also runs code from a data: URL written into the grant.
+        echo "$rule: $base runs programs and code it is handed"; bad=1 ;;
+      env|command|builtin|exec|nohup|nice|ionice|time|stdbuf|timeout|setsid|flock|chroot|unshare|strace|ltrace|\
+      xargs|eval|sudo|su|doas|pkexec|ssh|parallel|watch|find|script|expect)
+        echo "$rule: $base runs other commands"; bad=1 ;;
+      sh|bash|zsh|dash|ksh|fish|python|python3|perl|ruby|node)
+        if [[ -z "$next" || "$next" == -* ]]; then
+          echo "$rule: $base without a script path runs arbitrary code"; bad=1
+        fi ;;
+    esac
+  done
+  return "$bad"
+}

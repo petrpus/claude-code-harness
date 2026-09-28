@@ -53,12 +53,28 @@ issue's fault: it ends the run with exit 1, where it is.
    ```bash
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
-     [--review-model sonnet]
+     [--review-model sonnet] [--extra-allowed-tools '<csv>']
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
-   script) unless `--verify-cmd` is given. The `--issue-*` caps are passed to
-   each issue's `loop.sh` run.
+   script) unless `--verify-cmd` is given. The `--issue-*` caps and
+   `--extra-allowed-tools` (appended to autopilot BUILD's allowlist — e.g.
+   `'Bash(bash scripts/test-deliver.sh),Bash(jq:*)'` for a shell project) are
+   passed to each issue's `loop.sh` run. The check fails closed (ADR-0007:
+   no model phase holds a forge operation): a `Bash(...)` rule is accepted
+   only as a **plain command** — words of `[A-Za-z0-9._/+=:@%,-]`, optionally
+   ending in `:*` or ` *` — whose program (by basename, any letter case) is
+   not a forge CLI (`gh`, `gh-*`, `git`, `hub`, `glab`, `lab`), not a program
+   that runs other programs (`env`, `command`, `timeout`, `nice`, `xargs`,
+   `eval`, `sudo`, `ssh`, `find`, …), not a package runner (`npx`, `npm`,
+   `pnpm`, `yarn`, `bunx`, `deno`, `uvx`, …) and not an interpreter without a
+   script path (`bash -c`, `bash:*`, `python3 -c`).
+   Quotes, backslashes, `$`, `;`, `|`, `&`, redirections, a leading `VAR=`,
+   wildcards inside the command, a blanket `Bash` and malformed rules are
+   refused outright. This is defence in depth, not the boundary, and cannot
+   be complete: BUILD edits files and runs the verify command, and
+   autopilot's own base allowlist already grants `npx`, `pnpm` and `node`. Keeping forge credentials away from model
+   phases is the boundary, and is tracked in #77 (map #68).
 
 ## The review step
 

@@ -42,6 +42,10 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 . skills/deliver/charter.sh
 # shellcheck source=../skills/deliver/review.sh
 . skills/deliver/review.sh
+# forge.sh is sourced for its one pure function (forge_grant_violations);
+# nothing here calls gh through it.
+# shellcheck source=../skills/deliver/forge.sh
+. skills/deliver/forge.sh
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -217,6 +221,38 @@ review_parse '{"verdict":"lgtm","findings":[]}' >/dev/null && note "parse: an of
   || ok "parse: a verdict other than approve/changes_requested is no verdict"
 review_parse '{"verdict":"approve","findings":"none"}' >/dev/null && note "parse: non-array findings accepted" \
   || ok "parse: findings that are not an array are no verdict"
+
+# ===========================================================================
+# Unit: forge_grant_violations (ADR-0007 for --extra-allowed-tools)
+# ===========================================================================
+echo "-- forge_grant_violations"
+GV_MISSED=0
+for g in 'Bash' 'Bash(*)' 'Bash(:*)' 'Bash(gh:*)' 'Bash(git push:*)' 'Bash(git:*)' 'Bash(git  push origin x)' \
+         'Bash(env gh:*)' 'Bash(/usr/bin/gh:*)' 'Bash(command gh:*)' 'Bash(env git push:*)' \
+         'Bash(/usr/bin/git push:*)' 'Bash(/usr/bin/git:*)' 'Bash(command git push:*)' \
+         'Bash(GH_HOST=x gh pr merge:*)' 'Bash(timeout 60 gh:*)' 'Bash(nohup env git push)' \
+         'Bash(sh -c:*)' 'Bash(bash -c:*)' 'Bash(bash:*)' 'Bash(xargs:*)' 'Bash(eval:*)' \
+         'Bash(find:*)' 'Bash(python3 -c:*)' 'Bash(gh *)' 'Bash(foo * bar)' 'Read, Bash , Grep' \
+         'Bash("gh":*)' "Bash('git' push)" 'Bash(\gh:*)' 'Bash(g\h pr merge)' 'Bash($HOME/gh:*)' \
+         'Bash(env -i gh:*)' 'Bash(env -u X gh)' 'Bash(nice -n 5 git push)' 'Bash(timeout -s KILL 5 gh:*)' \
+         'Bash(exec -a x gh)' 'Bash(jq; gh pr merge)' 'Bash(jq && gh)' 'Bash(jq | gh)' 'Bash(`gh`)' \
+         'Bash($(gh))' 'Bash(gh:*' 'Bash(GH=1 jq)' 'Bash(jq > /tmp/x)' \
+         'Bash(GH:*)' 'Bash(Git push:*)' 'Bash(gh-dash:*)' 'Bash(glab push:*)' 'Bash(lab:*)' \
+         'Bash(deno run:*)' 'Bash(deno eval:*)' 'Bash(deno run data:application/typescript,x%281%29:*)' \
+         'Bash(npx gh:*)' 'Bash(npm exec gh:*)' 'Bash(pnpm dlx gh:*)' 'Bash(yarn dlx git push:*)' \
+         'Bash(bunx gh:*)' 'Bash(corepack pnpm dlx gh:*)'; do
+  forge_grant_violations "$g" >/dev/null && { note "grant '$g' was NOT refused"; GV_MISSED=1; }
+done
+[[ "$GV_MISSED" -eq 0 ]] && ok "refuses blanket, wildcard, quoted/escaped, wrapped, chained, redirected, malformed, gh/git (any case), package-runner grants (59 forms)"
+GV_MISSED=0
+for g in 'Bash(jq:*)' 'Bash(bash scripts/test-deliver.sh)' 'Bash(bash scripts/x.sh:*)' 'Read,Grep' \
+         'Bash(shellcheck:*)' 'Bash(git-lfs:*)' 'Bash(python3 tools/gen.py)' 'Bash(printf a,b)' 'Bash(make test *)'; do
+  forge_grant_violations "$g" >/dev/null || { note "grant '$g' was refused: $(forge_grant_violations "$g")"; GV_MISSED=1; }
+done
+[[ "$GV_MISSED" -eq 0 ]] && ok "allows ordinary tool grants and interpreters running a named script"
+WHY="$(forge_grant_violations 'Bash(jq:*),Bash(/usr/bin/gh:*)')"
+[[ "$WHY" == "Bash(/usr/bin/gh:*): runs gh"* && "$(grep -c . <<<"$WHY")" -eq 1 ]] \
+  && ok "names exactly the offending rule and why" || note "reason was: $WHY"
 
 # ===========================================================================
 # Static: the forge surface (ADR-0007)
@@ -396,6 +432,9 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    if [[ -n "${STUB_BUILD_LOG:-}" ]]; then
+      prev=""; for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && printf '%s\n' "$a" >> "$STUB_BUILD_LOG"; prev="$a"; done
+    fi
     n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
     if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
@@ -548,6 +587,29 @@ grep -q -- '--admin' "$H/gh/calls" && note "guardrail: gh was called with --admi
 grep -E '^pr merge' "$H/gh/calls" | grep -q -- '--match-head-commit [0-9a-f]\{40\}' \
   && ok "guardrail: every merge is pinned to a verified head (--match-head-commit)" \
   || note "guardrail: a merge was not pinned to its head sha"
+
+# --- --extra-allowed-tools reaches BUILD, and never a forge grant ----------------
+new_fixture extra
+run_deliver extra STUB_BUILD_LOG="$WORK/extra/build.log" STUB_REVIEW_LOG="$WORK/extra/review.log" -- --extra-allowed-tools 'Bash(jq:*),Bash(bash scripts/x.sh)'
+RC=$?
+[[ "$RC" -eq 0 ]] && [[ "$(grep -c . "$WORK/extra/build.log")" -ge 2 ]] \
+  && ! grep -v 'Bash(jq:\*),Bash(bash scripts/x.sh)' "$WORK/extra/build.log" | grep -q . \
+  && ok "--extra-allowed-tools is appended to every BUILD call's allowlist" \
+  || note "--extra-allowed-tools: exit $RC, build allowlists: $(sort -u "$WORK/extra/build.log" 2>/dev/null | head -2 | tr '\n' '|')"
+[[ "$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u)" == "Read,Grep,Glob" ]] \
+  && ok "--extra-allowed-tools never reaches the reviewer (its allowlist stays Read,Grep,Glob)" \
+  || note "--extra-allowed-tools: reviewer allowlist was '$(cut -f2 "$WORK/extra/review.log" 2>/dev/null | sort -u | tr '\n' '|')'"
+for bad in 'Bash' 'Bash(env gh:*)' 'Read, Bash(/usr/bin/git  push origin x)'; do
+  new_fixture extrabad
+  run_deliver extrabad -- --extra-allowed-tools "$bad"
+  RC=$?
+  if [[ "$RC" -eq 1 ]] && grep -q 'extra-allowed-tools refused (ADR-0007)' "$WORK/extrabad/err" && [[ ! -s "$WORK/extrabad/gh/calls" ]]; then
+    ok "--extra-allowed-tools '$bad' is refused before any forge call"
+  else
+    note "--extra-allowed-tools '$bad': exit $RC"
+  fi
+  rm -rf "$WORK/extrabad"
+done
 
 # --- refusals ------------------------------------------------------------------
 new_fixture onmain
