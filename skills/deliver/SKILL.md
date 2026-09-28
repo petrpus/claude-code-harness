@@ -19,16 +19,23 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
-> independent review (#59) and parking (#58). Not yet: review fix rounds, CI
-> wait, resume, the tmux launcher.
+> independent review (#59), parking (#58) and final-verify's base-moved
+> handling and merge retry (#60, partial). Not yet: CI wait, review fix
+> rounds, resume, the tmux launcher.
 
 ## When an issue does not make it
 
 An issue that cannot reach its merge is **parked** and the run carries on:
 autopilot did not finish (stuck, or an iteration / time / budget cap), it
 finished without a commit, verify failed on its head, the review held its PR
-(changes requested, or no usable verdict twice), or the forge refused the
-merge. Parking:
+(changes requested, or no usable verdict twice), the integration branch moved
+into a conflict, or the forge refused the merge twice. Before merging,
+**final-verify** re-fetches and, if the integration branch moved, merges it
+into the issue branch (a conflict parks the issue; a clean merge is
+re-verified and pushed); a merge the forge refuses goes back through
+final-verify once — a repo whose branch protection forbids squash merges gets
+a plain `--merge` instead, tried automatically, before that ever counts as a
+refusal. Parking:
 
 - labels the issue `needs-human` (created if the repo lacks it) and removes
   `ready-for-agent`;

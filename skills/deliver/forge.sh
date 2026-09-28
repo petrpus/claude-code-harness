@@ -37,6 +37,12 @@ forge_issue_comment()  { gh issue comment "$1" --body-file "$2" >/dev/null; } # 
 # that is a reason to stop, not to overwrite.
 forge_push_branch() { git push -q -u origin "$1"; }
 
+# forge_push_update <branch>  — a later push of a branch already on the
+# remote: final_verify folding in a moved integration branch, before or
+# after the PR exists. Plain `git push`, never forced — a rejected push
+# (someone else advanced the branch) stops the run rather than overwrite it.
+forge_push_update() { git push -q origin "$1"; }
+
 # forge_delete_remote_branch <branch>  — after its PR merged. Tolerates the
 # forge having deleted it already (repos with auto-delete of head branches).
 forge_delete_remote_branch() {
@@ -59,8 +65,21 @@ forge_pr_create() {
 #   the branch after verify, the forge refuses instead of merging unverified
 #   code. The head branch is deleted separately (forge_delete_remote_branch)
 #   so gh never touches the local checkout.
+#   A repo whose branch protection forbids squash merges gets a plain merge
+#   instead (--merge), still pinned to the same head. Any other refusal is
+#   returned to the caller as is — deliver.sh retries once through
+#   final_verify, then parks (#60).
 forge_pr_merge() {
-  gh pr merge "$1" --squash --match-head-commit "$2" --subject "$3" --body-file "$4"
+  local pr="$1" sha="$2" subject="$3" bodyf="$4" out rc
+  out="$(gh pr merge "$pr" --squash --match-head-commit "$sha" --subject "$subject" --body-file "$bodyf" 2>&1)"
+  rc=$?
+  printf '%s\n' "$out"
+  if [[ "$rc" -ne 0 ]] && grep -qi 'squash.*not allowed' <<<"$out"; then
+    out="$(gh pr merge "$pr" --merge --match-head-commit "$sha" --subject "$subject" --body-file "$bodyf" 2>&1)"
+    rc=$?
+    printf '%s\n' "$out"
+  fi
+  return "$rc"
 }
 
 # forge_pr_comment <pr> <body_file>  — the review report. A comment, not a

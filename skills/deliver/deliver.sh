@@ -5,13 +5,19 @@
 # blocking-edge order. docs/prd/0003-deliver.md, ADR-0007, ADR-0008.
 #
 # Every issue PR gets an independent review (agents/code-reviewer.md, in a
-# throwaway worktree, #59) before it may merge. An issue that cannot get there
-# — autopilot did not finish, verify failed on its head, the review held it,
-# the forge refused the merge — is PARKED (#58): labelled needs-human, its PR
-# back to draft, a comment saying why; issues that depend on it are skipped
-# and independent ones continue. A failure of the machinery itself (the forge
-# unreachable, a dirty checkout, a review that touched the checkout) ends the
-# run instead. Not built yet: fix rounds, CI wait, resume, the launcher.
+# throwaway worktree, #59) before it may merge. Before merging, final_verify
+# (#60) re-fetches and, if the integration branch moved, merges it into the
+# issue branch — a conflict parks the issue; a clean merge is re-verified and
+# pushed. A merge the forge refuses (repo forbids squash: retried as a plain
+# --merge; anything else) goes back through final_verify once before giving
+# up. An issue that cannot get there — autopilot did not finish, verify
+# failed on its head, the review held it, the base moved into a conflict, the
+# forge refused the merge twice — is PARKED (#58): labelled needs-human, its
+# PR back to draft, a comment saying why; issues that depend on it are
+# skipped and independent ones continue. A failure of the machinery itself
+# (the forge unreachable, a dirty checkout, a review that touched the
+# checkout) ends the run instead. Not built yet: CI wait, fix rounds, resume,
+# the launcher.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
@@ -265,6 +271,50 @@ review_issue() {
 }
 
 # ---------------------------------------------------------------------------
+# final_verify <n> <dir> — the head that will be pushed and merged, verified
+# on top of the current base (#60). Runs on the issue branch (checked out by
+# the caller). Fetches; if origin/$BASE is not an ancestor of HEAD, merges it
+# in — a conflict aborts the merge and parks with the conflicting paths in
+# PARK_REASON. Verify always runs, in a clean tree, on the (possibly merged)
+# head; a merge that happened is pushed with forge_push_update, whether this
+# is the first call (before the branch is ever pushed — a push here quietly
+# becomes the branch's first) or a retry after a merge refusal.
+# Returns 0 verified · 10 park (PARK_REASON set) · 1 stop the run.
+# ---------------------------------------------------------------------------
+final_verify() {
+  local n="$1" dir="$2" verify_rc merged=0 head_now conflicts
+  git fetch -q origin || { log "#$n: git fetch failed — stopping."; return 1; }
+  if ! git merge-base --is-ancestor "origin/$BASE" HEAD; then
+    if ! git merge -q --no-edit "origin/$BASE" > "$dir/base-merge.log" 2>&1; then
+      conflicts="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+      git merge --abort
+      PARK_REASON="the base branch \`$BASE\` moved and the merge conflicts on: ${conflicts:-(unknown paths)}"
+      return 10
+    fi
+    merged=1
+    log "#$n: \`$BASE\` moved — merged origin/$BASE into the issue branch ($(git rev-parse --short HEAD))"
+  fi
+  # Autopilot's BUILD may have edited what verify runs: no forge credentials.
+  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
+  verify_rc=$?
+  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
+    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
+    return 1
+  fi
+  head_now="$(git rev-parse HEAD)"
+  if [[ "$verify_rc" -ne 0 ]]; then
+    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
+    PARK_REASON="verify failed on the head autopilot finished with (\`${head_now:0:12}\`)"
+    return 10
+  fi
+  [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify changed the checkout — stopping."; return 1; }
+  if [[ "$merged" -eq 1 ]]; then
+    forge_push_update "$CUR_BRANCH" || { log "#$n: push failed — stopping."; return 1; }
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # One issue: branch → autopilot → push → PR → review → verify → merge → tick.
 # ---------------------------------------------------------------------------
 # Returns 0 merged, 10 park (PARK_REASON says why), 11 already parked (left
@@ -349,22 +399,14 @@ deliver_issue() {
     return 10
   fi
 
-  # --- verify the exact head that will be merged ---
+  # --- final-verify: the merged head that will be pushed and merged ---
+  final_verify "$n" "$dir"; local fv_rc=$?
+  case "$fv_rc" in
+    0)  ;;
+    10) return 10 ;;
+    *)  return 1 ;;
+  esac
   head_sha="$(git rev-parse HEAD)"
-  # Autopilot's BUILD may have edited what verify runs: no forge credentials.
-  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
-  local verify_rc=$?
-  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
-    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
-    return 1
-  fi
-  if [[ "$verify_rc" -ne 0 ]]; then
-    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
-    PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
-    return 10
-  fi
-  [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
-    || { log "#$n: verify changed the checkout — stopping."; return 1; }
 
   # --- PR ---
   iters="$(jq -r '.iterations_done // 0' "$dir/status.json")"
@@ -396,11 +438,31 @@ deliver_issue() {
   [[ "$review_rc" -eq 0 ]] || return "$review_rc"
 
   # --- merge (from the base, so the forge never has the head checked out) ---
+  # A refusal (branch protection, a base that moved again, …) goes back
+  # through final_verify exactly once before parking (#60); forge_pr_merge
+  # already falls back to a plain --merge on its own when the repo forbids
+  # squash, so that case never reaches this retry at all.
   git switch -q "$BASE" || return 1
-  if ! forge_pr_merge "$pr" "$head_sha" "$title (#$pr)" "$dir/pr-body.md" > "$dir/merge.log" 2>&1; then
-    PARK_REASON="the forge refused to merge PR #$pr: $(tail -1 "$dir/merge.log")"
-    return 10
-  fi
+  local merge_retried=0
+  while :; do
+    if forge_pr_merge "$pr" "$head_sha" "$title (#$pr)" "$dir/pr-body.md" > "$dir/merge.log" 2>&1; then
+      break
+    fi
+    if [[ "$merge_retried" -eq 1 ]]; then
+      PARK_REASON="the forge refused to merge PR #$pr twice: $(tail -1 "$dir/merge.log")"
+      return 10
+    fi
+    merge_retried=1
+    log "#$n: merge of PR #$pr was refused — retrying once via final-verify: $(tail -1 "$dir/merge.log")"
+    git switch -q "$branch" || return 1
+    final_verify "$n" "$dir"; fv_rc=$?
+    case "$fv_rc" in
+      0)  head_sha="$(git rev-parse HEAD)" ;;
+      10) return 10 ;;
+      *)  return 1 ;;
+    esac
+    git switch -q "$BASE" || return 1
+  done
   [[ "$(forge_pr_state "$pr")" == "MERGED" ]] || { log "#$n: PR #$pr is not MERGED after merge — stopping."; return 1; }
 
   git fetch -q origin && git merge -q --ff-only "origin/$BASE" \
@@ -428,9 +490,12 @@ park_issue() {
   log "#$n: PARKED — $PARK_REASON"
   # Back to the base so the next issue starts clean; anything else means the
   # checkout is not in the state the runner left it, and parking stops there.
+  # final_verify's own `git fetch` may have moved origin/$BASE ahead of the
+  # local branch (the base moved, #60) — catching up is a fast-forward, not
+  # a foreign mutation, so it is folded in here rather than treated as one.
   [[ -z "$(git status --porcelain)" ]] || die "#$n: cannot park — the checkout is dirty."
   git switch -q "$BASE" || die "#$n: cannot park — cannot switch back to '$BASE'."
-  [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$BASE")" ]] \
+  git fetch -q origin && git merge -q --ff-only "origin/$BASE" \
     || die "#$n: cannot park — '$BASE' no longer matches origin/$BASE."
 
   forge_label_ensure needs-human d93f0b "Parked by /deliver: needs a human decision before an agent retries it"

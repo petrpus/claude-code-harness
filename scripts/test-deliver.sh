@@ -366,9 +366,23 @@ case "$cmd" in
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   "pr merge")
     n="$1"; shift; f="$S/prs/$n.json"; [[ -f "$f" ]] || exit 1
-    has --squash "$@" || { echo "fake gh: only --squash is modelled" >&2; exit 64; }
+    if has --squash "$@"; then strategy=squash
+    elif has --merge "$@"; then strategy=merge
+    else echo "fake gh: only --squash or --merge is modelled" >&2; exit 64
+    fi
     has --admin "$@" && { echo "fake gh: --admin used" >&2; exit 65; }
     sha="$(arg --match-head-commit "$@")"; subject="$(arg --subject "$@")"; b="$(arg --body-file "$@")"
+    # A repo mode: --squash is always refused (branch protection forbids it);
+    # forge_pr_merge is expected to notice and fall back to --merge itself.
+    if [[ "$strategy" == squash && -f "$S/no_squash" ]]; then
+      echo "GraphQL: Squash merges are not allowed on this repository" >&2; exit 1
+    fi
+    # A one-shot refusal: the first pr-merge call (whatever its strategy)
+    # fails, the next one succeeds — deliver.sh's final-verify retry.
+    if [[ -n "${FAKE_GH_MERGE_REFUSE_ONCE:-}" && ! -f "$S/.merge_refused_once" ]]; then
+      touch "$S/.merge_refused_once"
+      echo "merge refused (fake, once)" >&2; exit 1
+    fi
     base="$(jq -r .baseRefName "$f")"; head="$(jq -r .headRefName "$f")"
     remote="$(git remote get-url origin)"
     tmp="$(mktemp -d)"
@@ -379,8 +393,12 @@ case "$cmd" in
     fi
     [[ -n "${FAKE_GH_MERGE_FAIL:-}" ]] && { echo "merge refused (fake)" >&2; rm -rf "$tmp"; exit 1; }
     ( cd "$tmp/c" && git -c advice.detachedHead=false checkout -q "$base" \
-        && git merge -q --squash "origin/$head" >/dev/null \
-        && git -c user.email=gh@fake -c user.name=fake-gh commit -q -m "$subject" -m "$(cat "${b:-/dev/null}")" \
+        && if [[ "$strategy" == squash ]]; then
+             git merge -q --squash "origin/$head" >/dev/null \
+               && git -c user.email=gh@fake -c user.name=fake-gh commit -q -m "$subject" -m "$(cat "${b:-/dev/null}")"
+           else
+             git -c user.email=gh@fake -c user.name=fake-gh merge -q --no-ff -m "$subject" "origin/$head" >/dev/null
+           fi \
         && git push -q origin "$base" ) || { rm -rf "$tmp"; exit 1; }
     moid="$(git -C "$tmp/c" rev-parse HEAD)"; rm -rf "$tmp"
     if [[ -n "${FAKE_GH_AFTER_FIRST_MERGE_BODY:-}" && ! -f "$S/.edited" ]]; then
@@ -452,6 +470,25 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
     [[ -n "${STUB_BUILD_SLEEP:-}" ]] && sleep "$STUB_BUILD_SLEEP"
+    # Simulate a concurrent push to the integration branch, mid-build, so
+    # final_verify meets a base that moved (#60): a separate clone commits
+    # to $STUB_ADVANCE_BASE_PATH and pushes it straight to origin/integration/x,
+    # once (a marker file, since BUILD can run more than once per issue).
+    if [[ -n "${STUB_ADVANCE_BASE_PATH:-}" && -n "${STUB_ADVANCE_BASE_MARKER:-}" && ! -f "$STUB_ADVANCE_BASE_MARKER" ]]; then
+      touch "$STUB_ADVANCE_BASE_MARKER"
+      adv_remote="$(git remote get-url origin 2>/dev/null)"
+      if [[ -n "$adv_remote" ]]; then
+        adv_tmp="$(mktemp -d)"
+        ( cd "$adv_tmp" && git clone -q "$adv_remote" c 2>/dev/null \
+            && cd c && git switch -q integration/x \
+            && mkdir -p "$(dirname "$STUB_ADVANCE_BASE_PATH")" \
+            && printf 'advanced by someone else\n' > "$STUB_ADVANCE_BASE_PATH" \
+            && git add "$STUB_ADVANCE_BASE_PATH" \
+            && git -c user.email=other@test.est -c user.name=other commit -q -m "advance base" \
+            && git push -q origin integration/x ) >/dev/null 2>&1
+        rm -rf "$adv_tmp"
+      fi
+    fi
     # A BUILD that tries the forge itself (ADR-0007): record what happened.
     if [[ -n "${STUB_FORGE_PROBE:-}" ]]; then
       gh auth status >/dev/null 2>&1; echo "gh=$?" >> "$STUB_FORGE_PROBE"
@@ -729,6 +766,28 @@ job_refused() {
   run_deliver refused FAKE_GH_MERGE_FAIL=1
   echo $? > "$WORK/refused/rc"
 }
+job_refusedonce() {
+  new_fixture refusedonce
+  run_deliver refusedonce FAKE_GH_MERGE_REFUSE_ONCE=1
+  echo $? > "$WORK/refusedonce/rc"
+}
+job_squash() {
+  new_fixture squash
+  touch "$WORK/squash/gh/no_squash"
+  run_deliver squash
+  echo $? > "$WORK/squash/rc"
+}
+job_baseadv_clean() {
+  new_fixture baseadv
+  git -C "$WORK/baseadv/remote.git" rev-parse main > "$WORK/baseadv/main_before"
+  run_deliver baseadv STUB_ADVANCE_BASE_PATH=advanced.txt STUB_ADVANCE_BASE_MARKER="$WORK/baseadv/advance.marker"
+  echo $? > "$WORK/baseadv/rc"
+}
+job_baseadv_conflict() {
+  new_fixture baseadvconflict with4
+  run_deliver baseadvconflict STUB_ADVANCE_BASE_PATH=work/issue-1.txt STUB_ADVANCE_BASE_MARKER="$WORK/baseadvconflict/advance.marker" -- --issue-max-iterations 1
+  echo $? > "$WORK/baseadvconflict/rc"
+}
 
 bg job_happy
 bg job_extra
@@ -764,6 +823,10 @@ bg job_rvmutatevariant mutate-hook
 bg job_rvexample
 bg job_rvwronghead
 bg job_refused
+bg job_refusedonce
+bg job_squash
+bg job_baseadv_clean
+bg job_baseadv_conflict
 wait
 
 # ===========================================================================
@@ -1094,13 +1157,60 @@ RC="$(cat "$WORK/rvwronghead/rc")"
   && ok "review: a verdict for a different head is no verdict (parked)" \
   || note "review wrong-head: exit $RC"
 
-# --- a merge refused by the forge parks the issue -----------------------------
+# --- a merge refused twice by the forge parks the issue (#60) ----------------
 RC="$(cat "$WORK/refused/rc")"
 R="$WORK/refused"
 [[ "$RC" -eq 2 ]] && parked_one refused && [[ "$(jq -r .isDraft "$R/gh/prs/4.json")" == "true" ]] \
   && [[ "$(git -C "$R/remote.git" rev-parse integration/x)" == "$(git -C "$R/remote.git" rev-parse main)" ]] \
-  && jq -r '.comments[-1].body' "$WORK/refused/gh/issues/1.json" | grep -q 'the forge refused to merge PR #4' \
-  && ok "a merge refused by the forge parks the issue (PR back to draft, reason in the comment)" \
-  || note "refused merge: exit $RC"
+  && [[ "$(grep -c '^pr merge' "$R/gh/calls")" -eq 2 ]] \
+  && jq -r '.comments[-1].body' "$WORK/refused/gh/issues/1.json" | grep -q 'the forge refused to merge PR #4 twice' \
+  && ok "a merge refused twice by the forge (with a final-verify retry in between) parks the issue" \
+  || note "refused merge: exit $RC, pr merge calls: $(grep -c '^pr merge' "$R/gh/calls" 2>/dev/null)"
+
+# --- a merge refused once, then accepted after a final-verify retry (#60) ----
+RC="$(cat "$WORK/refusedonce/rc")"
+RO="$WORK/refusedonce"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$RO/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(grep -c '^pr merge 4' "$RO/gh/calls")" -eq 2 ]] \
+  && ok "a merge refused once retries through final-verify and then succeeds" \
+  || note "refused-once merge: exit $RC, pr merge calls for #4: $(grep -c '^pr merge 4' "$RO/gh/calls" 2>/dev/null)"
+
+# --- a repo that forbids squash merges gets a plain --merge instead (#60) ----
+RC="$(cat "$WORK/squash/rc")"
+SQ="$WORK/squash"
+MOID_SQ="$(jq -r '.mergeCommit.oid // ""' "$SQ/gh/prs/4.json" 2>/dev/null)"
+[[ "$RC" -eq 0 ]] && [[ -n "$MOID_SQ" ]] \
+  && grep -q '^pr merge 4 --squash' "$SQ/gh/calls" && grep -q '^pr merge 4 --merge' "$SQ/gh/calls" \
+  && [[ "$(git -C "$SQ/remote.git" rev-list --parents -n1 "$MOID_SQ" | wc -w)" -eq 3 ]] \
+  && ok "a repo that forbids squash merges gets a plain --merge instead, still pinned to the verified head" \
+  || note "squash fallback: exit $RC, calls: $(grep '^pr merge 4' "$SQ/gh/calls" 2>/dev/null | tr '\n' '|')"
+
+# --- final-verify folds in a base that moved, cleanly (#60) -------------------
+BA="$WORK/baseadv"
+RC="$(cat "$BA/rc")"
+MAIN_BEFORE_BA="$(cat "$BA/main_before" 2>/dev/null)"
+LOG_BA="$(git -C "$BA/remote.git" log --format=%s "$MAIN_BEFORE_BA..integration/x" 2>/dev/null)"
+[[ "$RC" -eq 0 ]] && [[ "$(grep -c . <<<"$LOG_BA")" -eq 3 ]] \
+  && grep -qx 'advance base' <<<"$LOG_BA" \
+  && grep -qx 'fix: second thing (#5)' <<<"$LOG_BA" && grep -qx 'feat(a): first feature (#4)' <<<"$LOG_BA" \
+  && ! grep -E '(^| )push( |$)' "$BA/git.calls" | grep -qE -- '(--force|--force-with-lease|(^| )-f( |$)|(^| )-[a-zA-Z]*f[a-zA-Z]*( |$))' \
+  && ok "a moved integration branch is merged into the issue branch, re-verified, pushed and merged (no force push)" \
+  || note "base-advance clean: exit $RC, log: $(tr '\n' '|' <<<"$LOG_BA")"
+
+# --- final-verify aborts on a conflicting base move; independent issues continue (#60) --
+BC="$WORK/baseadvconflict"
+RC="$(cat "$BC/rc")"
+C1_BC="$(jq -r '.comments[-1].body' "$BC/gh/issues/1.json" 2>/dev/null)"
+LOG_BC="$(git -C "$BC/remote.git" log --format=%s main..integration/x 2>/dev/null)"
+[[ "$RC" -eq 2 ]] \
+  && [[ "$(jq -r '[.labels[].name]|join(",")' "$BC/gh/issues/1.json")" == "needs-human" ]] \
+  && [[ "$C1_BC" == *"the base branch \`integration/x\` moved"* && "$C1_BC" == *"work/issue-1.txt"* ]] \
+  && ! grep -q '^pr create.*--head feat/1-' "$BC/gh/calls" \
+  && [[ "$(git -C "$BC/repo" branch --show-current)" == "integration/x" && -z "$(git -C "$BC/repo" status --porcelain)" ]] \
+  && [[ "$(jq -r .state "$BC/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && [[ "$(grep -c . <<<"$LOG_BC")" -eq 2 ]] && grep -qx 'advance base' <<<"$LOG_BC" \
+  && grep -qx 'feat: independent thing (#5)' <<<"$LOG_BC" \
+  && ok "a conflicting base move aborts the merge, parks the issue (no PR ever opened) and lets an independent issue still merge" \
+  || note "base-advance conflict: exit $RC, #1 comment: $(head -3 <<<"$C1_BC" | tr '\n' '|'), log: $(tr '\n' '|' <<<"$LOG_BC")"
 
 finish
