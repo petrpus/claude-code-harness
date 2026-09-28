@@ -129,8 +129,9 @@ every `--ci-poll-seconds` (default 30) before the PR may merge:
   reopens `STATUS: in-progress` and resumes autopilot (`loop.sh
   --resume-run`); a clean finish goes back through final-verify and
   `ci_wait`. No round left, autopilot not finishing the fix, or CI still red
-  after the round parks — with the failed checks' names, or the log tail
-  when a round was spent — logged with verdict `fail`;
+  after the round parks — with the failed checks' names in the reason and
+  the failed run's log tail in the park comment — logged with verdict
+  `fail`;
 - **still `pending` past `--ci-timeout`** (default 1800 s): parks ("CI still
   pending after …"), no fix round (the check never actually failed); logged
   with verdict `timeout`.

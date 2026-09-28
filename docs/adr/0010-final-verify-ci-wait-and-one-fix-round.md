@@ -59,10 +59,12 @@ record the decisions.
      another change to the head, and it gets the same verify-then-CI
      treatment as the original one.
 5. **No round left, a second red CI, or autopilot not finishing the fix
-   parks**, with the log tail in the park comment either way (from
-   `ci_fix_round` when autopilot did not finish cleanly, or built fresh from
-   `CI_FAILED_JSON`'s second failure when the round was spent and CI is red
-   again). A dirty tree after the resumed run, or `loop.sh` exiting 1
+   parks**, with the failed run's log tail in the park comment in all three
+   cases (`PARK_LOG`, rendered fenced inside a `<details>` block — data,
+   never inlined into the one-line reason): the fix round's own
+   `ci-fail-<k>.log` when autopilot did not finish, a freshly fetched one
+   for the second failure, or for the first when no round was left. A
+   dirty tree after the resumed run, or `loop.sh` exiting 1
    (refused to resume), stops the whole run rather than parking — those are
    runner/autopilot-seam failures, not something about this issue's code.
 

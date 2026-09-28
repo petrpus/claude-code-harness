@@ -836,13 +836,26 @@ job_ci_fail() {
   # A checks script that stays FAILURE forever (its one line repeats): the
   # fix round (#60) gets tried once — the stub `claude` "fixes" it, ticking
   # C1 — but the CI script still says FAILURE on the second poll, so this is
-  # "CI red twice", parked without a third attempt.
+  # "CI red twice", parked without a third attempt, the second failure's log
+  # tail in the park comment.
   new_fixture cifail
-  mkdir -p "$WORK/cifail/gh/ci"
-  printf '%s\n' '[{"name":"build","state":"FAILURE","bucket":"fail","link":"http://x/1"}]' \
+  mkdir -p "$WORK/cifail/gh/ci" "$WORK/cifail/gh/runs"
+  printf '%s\n' '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/777/job/2"}]' \
     > "$WORK/cifail/gh/ci/4"
+  printf 'assert failed: flaky_widget expected 3\n' > "$WORK/cifail/gh/runs/777.log"
   run_deliver cifail -- --ci-poll-seconds 0 --ci-grace-seconds 0 --issue-max-iterations 2
   echo $? > "$WORK/cifail/rc"
+}
+job_ci_fail_no_rounds() {
+  # --max-fix-rounds 0: the budget is gone before the first red check, so no
+  # fix round is attempted — parked straight away, with the log tail.
+  new_fixture cinoround
+  mkdir -p "$WORK/cinoround/gh/ci" "$WORK/cinoround/gh/runs"
+  printf '%s\n' '[{"name":"lint","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/888/job/3"}]' \
+    > "$WORK/cinoround/gh/ci/4"
+  printf 'lint: trailing whitespace in src/a.sh\n' > "$WORK/cinoround/gh/runs/888.log"
+  run_deliver cinoround -- --ci-poll-seconds 0 --ci-grace-seconds 0 --max-fix-rounds 0
+  echo $? > "$WORK/cinoround/rc"
 }
 job_ci_fail_then_green() {
   # Red on the first poll, green on the second (the fix round's own ci_wait):
@@ -908,6 +921,7 @@ bg job_baseadv_conflict
 bg job_ci_none
 bg job_ci_pending_green
 bg job_ci_fail
+bg job_ci_fail_no_rounds
 bg job_ci_fail_then_green
 bg job_ci_timeout
 wait
@@ -1324,10 +1338,28 @@ RC="$(cat "$CF/rc")"
 CF_RUNDIR="$(ls -d "$CF"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
 [[ "$RC" -eq 2 ]] && held cifail \
   && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qF 'CI failed again on PR #4 after fix round 1: build' \
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qxF 'assert failed: flaky_widget expected 3' \
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qx '~~~~~' \
+  && grep -qF 'flaky_widget' "$CF_RUNDIR/issues/1/ci-fail-2.log" \
   && grep -q '^- \[x\] C1 Fix red CI: build$' "$CF_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && ! grep -q 'C2 Fix red CI' "$CF_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && [[ "$(cat "$CF_RUNDIR/issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
   && [[ "$(cat "$CF_RUNDIR"/run-*.jsonl 2>/dev/null | jq -cs '[.[] | select(.phase=="ci" and .issue==1 and .verdict=="fail")] | map(.round) | sort')" == "[1,2]" ]] \
-  && ok "CI: a red check gets one fix round (the fix round itself ran, C1 ticked); still red after it parks (PR back to draft, #2 skipped)" \
+  && ok "CI: a red check gets one fix round (the fix round itself ran, C1 ticked); still red after it parks with the log tail, fenced (PR back to draft, #2 skipped)" \
   || note "ci fail twice: exit $RC, comment: $(jq -r '.comments[-1].body' "$CF/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
+
+# no fix rounds left: parked on the first red check, log tail in the comment,
+# no plan item appended and autopilot not resumed.
+CR="$WORK/cinoround"
+RC="$(cat "$CR/rc")"
+CR_RUNDIR="$(ls -d "$CR"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 2 ]] && held cinoround \
+  && jq -r '.comments[-1].body' "$CR/gh/issues/1.json" | grep -qF 'CI failed on PR #4: lint (no fix rounds left)' \
+  && jq -r '.comments[-1].body' "$CR/gh/issues/1.json" | grep -qxF 'lint: trailing whitespace in src/a.sh' \
+  && grep -q '^run view 888' "$CR/gh/calls" \
+  && ! grep -q 'Fix red CI' "$CR_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && ok "CI: a red check with no fix rounds left (--max-fix-rounds 0) parks at once, log tail in the park comment, no fix item" \
+  || note "ci fail, no rounds: exit $RC, comment: $(jq -r '.comments[-1].body' "$CR/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
 
 # red then green: the fix round's log tail lands in the plan, C1 gets ticked,
 # and the re-verified, re-pushed head merges once CI is green.

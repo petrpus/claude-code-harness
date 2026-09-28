@@ -207,6 +207,7 @@ MAP_PLAN="$RUN_DIR/map.plan.md"
 MERGED=()   # issue numbers merged by this run
 PARKED=()   # issue refs (#N) parked by this run
 PARK_REASON=""   # set by deliver_issue before it returns 10
+PARK_LOG=""      # optionally, a log file whose tail the park comment carries (a red CI run's)
 CUR_PR=""        # the PR of the issue in flight, once opened
 CUR_BRANCH=""    # its branch, once created
 
@@ -411,31 +412,43 @@ round_budget_use() {
   printf '%s\n' "$used"
 }
 
-# ci_fix_round <n> <pr> <dir> <round> — one CI fix round (#60), spent by the
-# caller against round_budget_use before this runs. Runs on the issue branch
-# (checked out by the caller). Fetches the failed run's log tail
-# (forge_ci_failed_log, from the first failed check's link in CI_FAILED_JSON
-# — ci_wait must have just set it), appends a new `- [ ] C<round> Fix red CI:
-# <check>` item to the issue's IMPLEMENTATION_PLAN.md with the log fenced as
-# data (read by the model, not parsed as a plan line), re-opens `STATUS:
-# in-progress`, and resumes autopilot on the same state dir. A finished,
-# clean run is re-verified (final_verify) and pushed; anything else parks
-# with the log tail in PARK_REASON.
-# Returns 0 fixed, re-verified and pushed · 10 park (PARK_REASON set) · 1
-# stop the run.
-# ---------------------------------------------------------------------------
-ci_fix_round() {
-  local n="$1" pr="$2" dir="$3" round="$4"
-  local check link run_id logf plan="$dir/IMPLEMENTATION_PLAN.md" fence
-  check="$(jq -r '.[0].name // "CI"' <<<"$CI_FAILED_JSON")"
+# ci_failed_log_fetch <dir> — the tail of the failed run's log for the first
+# failed check in CI_FAILED_JSON (ci_wait must have just set it), fetched with
+# forge_ci_failed_log from the run id in the check's link and written to
+# $dir/ci-fail-<k>.log, k counting this issue's red CI results (1, 2, …).
+# Echoes the file's path; the file is empty when the link names no run or the
+# log is gone — less context for whoever reads it, never a reason to stop.
+ci_failed_log_fetch() {
+  local dir="$1" k=1 link run_id logf
+  while [[ -e "$dir/ci-fail-$k.log" ]]; do k=$(( k + 1 )); done
+  logf="$dir/ci-fail-$k.log"
   link="$(jq -r '.[0].link // empty' <<<"$CI_FAILED_JSON")"
   run_id="$(grep -oE '/runs/[0-9]+' <<<"$link" | head -1 | grep -oE '[0-9]+')"
-  logf="$dir/ci-fail-$round.log"
   if [[ -n "$run_id" ]]; then
     forge_ci_failed_log "$run_id" > "$logf" 2>/dev/null
   else
     : > "$logf"
   fi
+  printf '%s\n' "$logf"
+}
+
+# ci_fix_round <n> <pr> <dir> <round> — one CI fix round (#60), spent by the
+# caller against round_budget_use before this runs. Runs on the issue branch
+# (checked out by the caller). Fetches the failed run's log tail
+# (ci_failed_log_fetch), appends a new `- [ ] C<round> Fix red CI: <check>`
+# item to the issue's IMPLEMENTATION_PLAN.md with the log fenced as data
+# (read by the model, not parsed as a plan line), re-opens `STATUS:
+# in-progress`, and resumes autopilot on the same state dir. A finished,
+# clean run is re-verified (final_verify) and pushed; anything else parks
+# with the log tail as PARK_LOG.
+# Returns 0 fixed, re-verified and pushed · 10 park (PARK_REASON set) · 1
+# stop the run.
+# ---------------------------------------------------------------------------
+ci_fix_round() {
+  local n="$1" pr="$2" dir="$3" round="$4"
+  local check logf plan="$dir/IMPLEMENTATION_PLAN.md" fence
+  check="$(jq -r '.[0].name // "CI"' <<<"$CI_FAILED_JSON")"
+  logf="$(ci_failed_log_fetch "$dir")"
   fence="$(md_tilde_fence < "$logf")"
   {
     echo
@@ -474,8 +487,8 @@ ci_fix_round() {
     return 1
   fi
   if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
-    PARK_REASON="the CI fix round for PR #$pr did not finish (autopilot ended '$status_state', exit $loop_rc). Failed check: \`$check\`.
-$(cat "$logf" 2>/dev/null)"
+    PARK_REASON="the CI fix round for PR #$pr did not finish (autopilot ended '$status_state', exit $loop_rc); failed check: \`$check\`"
+    PARK_LOG="$logf"
     return 10
   fi
 
@@ -496,7 +509,7 @@ deliver_issue() {
   mkdir -p "$dir"
   # Per-issue state starts empty: every early return below may park, and a
   # park must never name an earlier issue's PR or branch.
-  CUR_PR=""; CUR_BRANCH=""
+  CUR_PR=""; CUR_BRANCH=""; PARK_LOG=""
 
   forge_issue_json "$n" > "$dir/issue.json" || { log "#$n: cannot read the issue"; return 1; }
   state="$(jq -r '.state' "$dir/issue.json")"
@@ -617,13 +630,15 @@ deliver_issue() {
            ci_wait "$n" "$pr" "$dir" "$(( round + 1 ))"; ci_rc=$?
            if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
              PARK_REASON="CI failed again on PR #$pr after fix round $round: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON")"
+             PARK_LOG="$(ci_failed_log_fetch "$dir")"
            fi
            ;;
-        10) ;;  # PARK_REASON already set inside ci_fix_round
+        10) ;;  # PARK_REASON / PARK_LOG already set inside ci_fix_round
         *)  return 1 ;;
       esac
     else
       PARK_REASON="CI failed on PR #$pr: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON") (no fix rounds left)"
+      PARK_LOG="$(ci_failed_log_fetch "$dir")"
       ci_rc=10
     fi
   fi
@@ -712,6 +727,18 @@ park_issue() {
     fi
     echo "- Issues that wait on this one are skipped in this run; independent ones continue."
     echo "- To retry: resolve the cause, delete the issue branch${CUR_BRANCH:+ \`$CUR_BRANCH\`} (locally and on origin)${CUR_PR:+ and close PR #$CUR_PR}, remove \`needs-human\`, and run /deliver on map #$MAP again. While the label is on, /deliver leaves this issue alone."
+    if [[ -n "$PARK_LOG" && -s "$PARK_LOG" ]]; then
+      local log_fence
+      log_fence="$(md_tilde_fence < "$PARK_LOG")"
+      echo
+      echo "<details><summary>Failed CI log (tail)</summary>"
+      echo
+      echo "$log_fence"
+      cat "$PARK_LOG"
+      echo "$log_fence"
+      echo
+      echo "</details>"
+    fi
     if [[ -s "$dir/FEEDBACK.md" ]]; then
       local fence
       fence="$(tail -n 40 "$dir/FEEDBACK.md" | md_tilde_fence)"
