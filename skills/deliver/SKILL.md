@@ -53,7 +53,8 @@ issue's fault: it ends the run with exit 1, where it is.
    ```bash
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
-     [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
+     [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
+     [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -100,6 +101,14 @@ says "approve" still holds the PR. A reply with no usable verdict is retried
 once, then holds the PR (fail closed). The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
+
+**Pacing.** An issue is already one PR-sized slice, so by default autopilot
+gets `--plan-max-items 3` (a small plan; `--plan-max-items 0` lifts it) and
+`--verify-at-completion`: after each item BUILD runs only the tests covering
+it, and the full verify runs once, when the plan is complete — then again as
+this runner's final verify on the head. `--iteration-verify-cmd '<cmd>'` adds
+a cheap check after every item; `--verify-every-iteration` restores the full
+verify per item.
 
 `--per-call-timeout <s>` bounds every model call — autopilot's and the
 review — in whole seconds (default 1200). Raise it when the verify command is

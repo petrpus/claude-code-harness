@@ -18,6 +18,7 @@
 #              [--issue-max-iterations 10] [--issue-max-minutes 120]
 #              [--issue-budget-usd 10] [--review-model sonnet]
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
+#              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
@@ -38,6 +39,12 @@ ISSUE_MAX_MINUTES=120
 ISSUE_BUDGET_USD=10
 EXTRA_ALLOWED_TOOLS=""
 PER_CALL_TIMEOUT=""    # empty: loop.sh's default (1200 s)
+# An issue is already one PR-sized slice (#88): a small plan, and the full
+# verify once per autopilot run (at completion) — /deliver's own final verify,
+# review and CI stand behind every merge anyway.
+PLAN_MAX_ITEMS=3       # 0: no size hint
+VERIFY_EVERY_ITERATION=0
+ITERATION_VERIFY_CMD=""
 REVIEW_MODEL=sonnet
 
 log()     { echo "deliver: $*" >&2; }
@@ -52,13 +59,19 @@ while [[ $# -gt 0 ]]; do
     --issue-budget-usd)     ISSUE_BUDGET_USD="$2"; shift 2 ;;
     --extra-allowed-tools)  EXTRA_ALLOWED_TOOLS="$2"; shift 2 ;;
     --per-call-timeout)     PER_CALL_TIMEOUT="$2"; shift 2 ;;
+    --plan-max-items)       PLAN_MAX_ITEMS="$2"; shift 2 ;;
+    --verify-every-iteration) VERIFY_EVERY_ITERATION=1; shift ;;
+    --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
-    -h|--help)              sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)              sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 [[ "$MAP" =~ ^[0-9]+$ ]] || die "--map <issue number> is required"
 [[ -z "$PER_CALL_TIMEOUT" || "$PER_CALL_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--per-call-timeout takes whole seconds"
+[[ "$PLAN_MAX_ITEMS" =~ ^[0-9]+$ ]] || die "--plan-max-items takes a whole number (0: no limit)"
+[[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
+  || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
 # shellcheck source=../autopilot/plan.sh
 . "$PLUGIN_ROOT/skills/autopilot/plan.sh"
@@ -305,13 +318,18 @@ deliver_issue() {
   # (ADR-0007); the runner refuses such entries below.
   # Indented line by line with a read loop, not sed: sed block-buffers into a
   # pipe, and a run log behind `| tee` then stayed empty for half an hour.
-  local -a loop_timeout=()
+  local -a loop_timeout=() loop_pace=()
   [[ -n "$PER_CALL_TIMEOUT" ]] && loop_timeout=(--per-call-timeout "$PER_CALL_TIMEOUT")
+  [[ "$PLAN_MAX_ITEMS" -gt 0 ]] && loop_pace+=(--plan-max-items "$PLAN_MAX_ITEMS")
+  if [[ "$VERIFY_EVERY_ITERATION" -eq 0 ]]; then
+    loop_pace+=(--verify-at-completion)
+    [[ -n "$ITERATION_VERIFY_CMD" ]] && loop_pace+=(--iteration-verify-cmd "$ITERATION_VERIFY_CMD")
+  fi
   local -a loop_extra=()
   [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
   bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
     --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$ISSUE_MAX_MINUTES" \
-    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} \
+    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
     2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
   local loop_rc=$?
   status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"

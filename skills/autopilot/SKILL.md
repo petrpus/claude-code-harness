@@ -79,6 +79,16 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    state `stopped`. It never deletes the file — remove it, then `--resume-run`
    continues the same run.
 
+   Pacing for a charter that is already one PR-sized slice (what `/deliver`
+   hands over): `--plan-max-items <n>` tells PLAN and replan to plan at most n
+   items and to fold documentation into the item it documents, because every
+   item costs a whole iteration. `--verify-at-completion` runs the verify
+   command only on the iteration that completes the plan; the others run
+   `--iteration-verify-cmd <cmd>` if given (a cheap check), otherwise no
+   machine verify, and BUILD proves its item with the tests that cover it. A
+   completion whose verify fails goes back to work like any other failure. In
+   the live runs a full verify per item was most of each ~15-minute iteration.
+
    If this repo *is* the autopilot harness's own source, a slice can
    legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh` — the runner
    notices its own sourced files changed on disk and re-execs itself under the

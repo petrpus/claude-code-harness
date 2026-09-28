@@ -381,6 +381,13 @@ to go missing from the budget.
 - `--per-call-timeout` (1200s) wraps every `claude -p` and the verify command in
   `timeout`, so one hung call can't defeat `--max-minutes` (which is only checked
   between phases).
+- `--verify-at-completion` (with optional `--iteration-verify-cmd`) moves gate
+  (b)'s full verify to the iteration that completes the plan — `STATUS: done`
+  or every box ticked; other iterations log `verify_cmd` as `deferred` (or run
+  the cheap iteration command). The completing iteration is still gated: a red
+  verify there resets `STATUS` and feeds back like any failure. Meant for a
+  charter that another gate stands behind (`/deliver`'s final verify, review,
+  CI); a bare autopilot run keeps verifying every iteration.
 - `--stop-file <path>` is a graceful stop, not a cap: checked before PLAN and at
   the top of every iteration (ahead of the caps), so a stop requested mid-BUILD
   lets that iteration's gates and checkpoint finish, then exits **6** with state

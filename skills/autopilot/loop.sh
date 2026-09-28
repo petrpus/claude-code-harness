@@ -16,6 +16,7 @@
 #           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
 #           [--escalate-model opus|none] [--no-repo-map] [--resume-run] [--dry-run]
 #           [--state-dir tmp/autopilot] [--stop-file '<path>']
+#           [--plan-max-items <n>] [--verify-at-completion] [--iteration-verify-cmd '<cmd>']
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
 #             cap · 6 stopped (--stop-file appeared) · 1 runner error (bad
@@ -43,6 +44,9 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # runs one autopilot per issue, each in its own directory.
 STATE_DIR="tmp/autopilot"
 STOP_FILE=""
+PLAN_MAX_ITEMS=""        # empty: no size hint to PLAN
+VERIFY_AT_COMPLETION=0   # 1: full verify only when the plan completes
+ITERATION_VERIFY_CMD=""  # cheap per-iteration check under --verify-at-completion
 
 # Defaults (all overridable).
 MAX_ITERATIONS=10
@@ -87,7 +91,10 @@ while [[ $# -gt 0 ]]; do
     --dry-run)          DRY_RUN=1; shift ;;
     --state-dir)        STATE_DIR="$2"; shift 2 ;;
     --stop-file)        STOP_FILE="$2"; shift 2 ;;
-    -h|--help)          sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --plan-max-items)   PLAN_MAX_ITEMS="$2"; shift 2 ;;
+    --verify-at-completion) VERIFY_AT_COMPLETION=1; shift ;;
+    --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
+    -h|--help)          sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) log_err "unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -147,6 +154,12 @@ if [[ -z "$VERIFY_CMD" ]]; then
   if [[ -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
     if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
   fi
+fi
+if [[ -n "$PLAN_MAX_ITEMS" && ! "$PLAN_MAX_ITEMS" =~ ^[1-9][0-9]*$ ]]; then
+  log_err "--plan-max-items takes a positive whole number"; exit 1
+fi
+if [[ -n "$ITERATION_VERIFY_CMD" && "$VERIFY_AT_COMPLETION" -ne 1 ]]; then
+  log_err "--iteration-verify-cmd only applies with --verify-at-completion"; exit 1
 fi
 if [[ -z "$VERIFY_CMD" ]]; then
   log_err "no verify command found and --verify-cmd not given."
@@ -469,6 +482,20 @@ count_boxes() {
 # ---------------------------------------------------------------------------
 # Prompts.
 # ---------------------------------------------------------------------------
+# plan_size_hint — PLAN / replan guidance when the charter is already one
+# PR-sized slice (/deliver): each plan item costs a whole iteration, so a
+# small issue must not be cut into many (#88).
+plan_size_hint() {
+  [[ -n "$PLAN_MAX_ITEMS" ]] || return 0
+  cat <<HINT
+
+This charter is ONE issue, already sized to land as one reviewed PR. Plan at
+most $PLAN_MAX_ITEMS items — one is fine when the work is small. Each item costs a
+whole iteration, so do not split work that is naturally done together; fold
+documentation into the item it documents rather than giving it its own item.
+HINT
+}
+
 plan_prompt() {
   cat <<EOF
 You are the PLAN phase of an autonomous run. Read $PROMPT_FILE (the immutable
@@ -504,6 +531,7 @@ that touch different files almost never need an edge between them.
 Slices that document or release the work are naturally terminal — they depend
 on the features they describe. That is expected, and it is not a reason to
 also chain the feature slices to each other.
+$(plan_size_hint)
 
 End the file with the exact line:
 
@@ -511,6 +539,34 @@ STATUS: in-progress
 
 Do not implement anything yet. Only write the plan file.
 EOF
+}
+
+# build_verify_steps — the proof BUILD must produce before ticking. Default:
+# the full verify command every iteration. Under --verify-at-completion the
+# runner runs the full command itself once the plan is complete, so BUILD
+# proves its item with the tests that cover it — a full run per item was most
+# of an iteration's wall time in the live runs (#88).
+build_verify_steps() {
+  if [[ "$VERIFY_AT_COMPLETION" -eq 1 ]]; then
+    cat <<STEPS
+  1. Run the tests that cover your item — the ones you wrote or changed, and
+     the suite they live in. Do NOT run the full verify command ($VERIFY_CMD):
+     the runner runs it itself once every item is ticked, and a failure there
+     comes back to you as feedback.
+  2. Only if those tests are GREEN, tick that item's checkbox in $PLAN_FILE.
+  3. Append a one-line note to $MEMORY_FILE (what you did / learned).
+  4. Set the STATUS line to 'STATUS: done' ONLY when every checkbox is ticked.
+     Otherwise leave it 'STATUS: in-progress'.
+STEPS
+  else
+    cat <<STEPS
+  1. Run the verify command: $VERIFY_CMD
+  2. Only if it is GREEN, tick that item's checkbox in $PLAN_FILE.
+  3. Append a one-line note to $MEMORY_FILE (what you did / learned).
+  4. Set the STATUS line to 'STATUS: done' ONLY when every checkbox is ticked
+     AND verify is green. Otherwise leave it 'STATUS: in-progress'.
+STEPS
+  fi
 }
 
 build_prompt() { # [selected_id] [selected_line] [repo_map_digest]
@@ -549,12 +605,7 @@ $item_instr Follow the harness 'tdd' skill:
 red-green-refactor — write a failing test, make it pass, refactor. If you make
 an architectural decision (new module boundary, dependency, data-model change),
 write a docs/adr/ entry. Then:
-  1. Run the verify command: $VERIFY_CMD
-  2. Only if it is GREEN, tick that item's checkbox in $PLAN_FILE.
-  3. Append a one-line note to $MEMORY_FILE (what you did / learned).
-  4. Set the STATUS line to 'STATUS: done' ONLY when every checkbox is ticked
-     AND verify is green. Otherwise leave it 'STATUS: in-progress'.
-
+$(build_verify_steps)
 Do not tick a box you didn't prove. Do not fake completion. Do not modify the
 verify command to make it pass.
 $digest_section
@@ -676,6 +727,7 @@ The autonomous run is stuck: $1
 Read $PROMPT_FILE, $PLAN_FILE, and $FEEDBACK_FILE. Revise $PLAN_FILE to unblock
 it. Keep the STATUS line 'STATUS: in-progress'. Do not implement — only revise
 the plan.
+$(plan_size_hint)
 EOF
 }
 
@@ -899,12 +951,29 @@ while :; do
   # in as "wip" without the runner ever verifying it.
   write_status "verifying"
   clock_now VERIFY_T0
-  # BUILD can edit the verify command's script, so the runner runs it without
-  # forge credentials, like a model call (ADR-0007, agent.sh).
-  agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1
-  VERIFY_RC=$?
+  # --verify-at-completion (#88): the full command runs only on the iteration
+  # that completes the plan (STATUS: done, or every box ticked); the others
+  # run --iteration-verify-cmd if one is given, else no machine verify — the
+  # issue-level gate after the run (/deliver's final verify, review, CI)
+  # stands behind them.
+  THIS_VERIFY_CMD="$VERIFY_CMD"; VERIFY_KIND="verify_cmd"
+  if [[ "$VERIFY_AT_COMPLETION" -eq 1 ]] && ! grep -q '^STATUS: done' "$PLAN_FILE" 2>/dev/null \
+     && ! [[ "$TOTAL_BOXES" -gt 0 && "$TICKED_AFTER" -ge "$TOTAL_BOXES" ]]; then
+    THIS_VERIFY_CMD="$ITERATION_VERIFY_CMD"; VERIFY_KIND="iteration_verify"
+  fi
+  if [[ -z "$THIS_VERIFY_CMD" ]]; then
+    VERIFY_RC=0; AGENT_REFUSED=0
+    : > "$STATE_DIR/verify.log"
+  else
+    # BUILD can edit the verify command's script, so the runner runs it
+    # without forge credentials, like a model call (ADR-0007, agent.sh).
+    agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$THIS_VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1
+    VERIFY_RC=$?
+  fi
   clock_now VERIFY_T1; VERIFY_S=$(( VERIFY_T1 - VERIFY_T0 ))
-  if [[ "$VERIFY_RC" -eq 0 ]]; then
+  if [[ -z "$THIS_VERIFY_CMD" ]]; then
+    logline "verify_cmd" "-" 0 0 0 0 0 "deferred"
+  elif [[ "$VERIFY_RC" -eq 0 ]]; then
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
   elif [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
     # The wrapper refused before running anything: not a verify failure.
@@ -913,7 +982,11 @@ while :; do
     FP="verify_cmd"
   else
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 "$VERIFY_RC" "fail"
-    FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    if [[ "$VERIFY_KIND" == "iteration_verify" ]]; then
+      FAIL_REASON="iteration check failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    else
+      FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    fi
     FP="verify_cmd"
   fi
 

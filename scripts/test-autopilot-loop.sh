@@ -1269,6 +1269,55 @@ CALLS31="$(ls "$R31/tmp/autopilot/calls" 2>/dev/null | tr '\n' ' ')"
   && ok "calls/ keeps all 11 replies of a five-slice run, numbered in call order" \
   || note "calls/ after a five-slice run: exit $RC31, '$CALLS31'"
 
+# --- 32-35. Pacing for one PR-sized issue (#88) ------------------------------
+# /deliver hands autopilot an issue that is already a slice: a small plan, and
+# the full verify once, at completion.
+R32="$WORK/r32"; new_repo "$R32"
+run_loop "$R32" progress true --plan-max-items 2
+[[ $? -eq 0 ]] && grep -q 'most 2 items' "$WORK/r32.calls" && grep -q 'ONE issue, already sized' "$WORK/r32.calls" \
+  && ok "--plan-max-items puts the size hint into the PLAN prompt" \
+  || note "--plan-max-items hint missing from the PLAN prompt"
+grep -q 'ONE issue, already sized' "$WORK/r1.calls" \
+  && note "the size hint appears without --plan-max-items" \
+  || ok "without --plan-max-items the PLAN prompt is unchanged"
+
+R33="$WORK/r33"; new_repo "$R33"
+run_loop "$R33" progress "echo x >> '$WORK/r33.verify-count'" --verify-at-completion
+RC33=$?
+VERDICTS33="$(cat "$R33"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="verify_cmd") | .verdict' | sort | uniq -c | tr -s ' ' | tr '\n' ',')"
+[[ "$RC33" -eq 0 && "$(wc -l < "$WORK/r33.verify-count" | tr -d ' ')" -eq 1 ]] \
+  && [[ "$VERDICTS33" == " 4 deferred, 1 pass," ]] \
+  && ok "--verify-at-completion: a five-item run runs the full verify once, at completion (4 deferred, 1 pass)" \
+  || note "--verify-at-completion: exit $RC33, verify ran $(wc -l < "$WORK/r33.verify-count" 2>/dev/null) time(s), verdicts '$VERDICTS33', stderr: $(tail -3 "$WORK/r33.err" | tr '\n' '|')"
+grep -q 'Do NOT run the full verify command' "$WORK/r33.calls" && ! grep -q 'Run the verify command:' "$WORK/r33.calls" \
+  && ok "--verify-at-completion: BUILD is told to run its item's tests, not the full verify" \
+  || note "--verify-at-completion: BUILD prompt still asks for the full verify"
+
+# A completion whose full verify fails is not done: back to work, then done.
+R34="$WORK/r34"; new_repo "$R34"
+run_loop "$R34" progress "n=\$(cat '$WORK/r34.n' 2>/dev/null || echo 0); echo \$((n+1)) > '$WORK/r34.n'; [ \$n -ge 1 ]" --verify-at-completion
+RC34=$?
+[[ "$RC34" -eq 0 && "$(cat "$WORK/r34.n")" -eq 2 ]] \
+  && [[ "$(cat "$R34"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="iteration") | .verdict' | tail -2 | tr '\n' ' ')" == "fail done " ]] \
+  && ok "--verify-at-completion: a failing completion verify sends the run back, the next completion finishes it" \
+  || note "failing completion verify: exit $RC34, verify ran $(cat "$WORK/r34.n" 2>/dev/null) time(s), stderr: $(tail -3 "$WORK/r34.err" | tr '\n' '|')"
+
+R35="$WORK/r35"; new_repo "$R35"
+run_loop "$R35" progress "echo full >> '$WORK/r35.count'" --verify-at-completion --iteration-verify-cmd "echo quick >> '$WORK/r35.count'"
+RC35=$?
+[[ "$RC35" -eq 0 && "$(sort "$WORK/r35.count" | uniq -c | tr -s ' ' | tr '\n' ',')" == " 1 full, 4 quick," ]] \
+  && ok "--iteration-verify-cmd runs on every other iteration, the full verify once" \
+  || note "--iteration-verify-cmd: exit $RC35, runs: $(sort "$WORK/r35.count" 2>/dev/null | uniq -c | tr '\n' ','), stderr: $(tail -3 "$WORK/r35.err" | tr '\n' '|'), status: $(cat "$R35/tmp/autopilot/status.json" 2>/dev/null)"
+R35B="$WORK/r35b"; new_repo "$R35B"
+run_loop "$R35B" progress true --iteration-verify-cmd true
+RC35B=$?
+R35C="$WORK/r35c"; new_repo "$R35C"
+run_loop "$R35C" progress true --plan-max-items 0
+RC35C=$?
+[[ "$RC35B" -eq 1 && "$RC35C" -eq 1 ]] \
+  && ok "--iteration-verify-cmd without --verify-at-completion and --plan-max-items 0 are refused" \
+  || note "flag validation: exit $RC35B / $RC35C — expected 1 / 1"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "test-autopilot-loop: PASS"
