@@ -1394,6 +1394,56 @@ CALLS31="$(ls "$R31/tmp/autopilot/calls" 2>/dev/null | tr '\n' ' ')"
   && ok "calls/ keeps all 11 replies of a five-slice run, numbered in call order" \
   || note "calls/ after a five-slice run: exit $RC31, '$CALLS31'"
 
+# --- 32. S4: loop.sh auto-detects the verify command via detect_verify_cmd -
+# No --verify-cmd given — the runner must fall back to allowlist.sh's
+# detect_verify_cmd (S3) instead of the old inline package.json-only block.
+R32="$WORK/r32"; new_repo "$R32"
+mkdir -p "$R32/scripts"
+cat > "$R32/scripts/verify.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$R32/scripts/verify.sh"
+git -C "$R32" add -A >/dev/null 2>&1
+git -C "$R32" -c user.email=t@t.est -c user.name=test commit -q -m "add scripts/verify.sh"
+( cd "$R32" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32.out" 2>"$WORK/r32.err" )
+RC32=$?
+[[ "$RC32" -ne 1 ]] \
+  && ok "a scripts/verify.sh-only repo runs without --verify-cmd (exit $RC32, not 1)" \
+  || note "a scripts/verify.sh-only repo exited 1 without --verify-cmd — expected auto-detection"
+grep -q "verify='bash scripts/verify.sh'" "$WORK/r32.err" 2>/dev/null \
+  && ok "startup log reports verify='bash scripts/verify.sh'" \
+  || note "startup log missing verify='bash scripts/verify.sh': $(cat "$WORK/r32.err")"
+
+R32B="$WORK/r32b"; new_repo "$R32B"
+cat > "$R32B/Makefile" <<'EOF'
+verify:
+	@true
+EOF
+git -C "$R32B" add -A >/dev/null 2>&1
+git -C "$R32B" -c user.email=t@t.est -c user.name=test commit -q -m "add Makefile"
+( cd "$R32B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32b.out" 2>"$WORK/r32b.err" )
+RC32B=$?
+[[ "$RC32B" -ne 1 ]] \
+  && ok "a Makefile-only repo runs without --verify-cmd (exit $RC32B, not 1)" \
+  || note "a Makefile-only repo exited 1 without --verify-cmd — expected auto-detection"
+grep -q "verify='make verify'" "$WORK/r32b.err" 2>/dev/null \
+  && ok "startup log reports verify='make verify'" \
+  || note "startup log missing verify='make verify': $(cat "$WORK/r32b.err")"
+
+R32C="$WORK/r32c"; new_repo "$R32C"
+( cd "$R32C" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32c.out" 2>"$WORK/r32c.err" )
+RC32C=$?
+[[ "$RC32C" -eq 1 ]] && grep -q "no verify command found" "$WORK/r32c.err" 2>/dev/null \
+  && ok "a repo with no detectable verify command still exits 1 with the expected message" \
+  || note "a repo with no verify command exited $RC32C — expected 1 with 'no verify command found'"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "test-autopilot-loop: PASS"

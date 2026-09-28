@@ -142,11 +142,15 @@ if [[ "$BRANCH" == "main" || "$BRANCH" == "master" || -z "$BRANCH" ]]; then
   exit 1
 fi
 
+# "Nothing broader" is the whole point, so the prefix grant is conditional —
+# see allowlist.sh, which owns the derivation (detect_verify_cmd, verify_grants)
+# so it can be tested on its own.
+# shellcheck source=allowlist.sh
+. "$SCRIPT_DIR/allowlist.sh"
+
 # Auto-detect a verify command if none was given.
 if [[ -z "$VERIFY_CMD" ]]; then
-  if [[ -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
-    if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
-  fi
+  VERIFY_CMD="$(detect_verify_cmd || true)"
 fi
 if [[ -z "$VERIFY_CMD" ]]; then
   log_err "no verify command found and --verify-cmd not given."
@@ -159,11 +163,6 @@ fi
 # script (./scripts/verify.sh, make verify, …) would have that call *denied*,
 # leaving BUILD unable to prove a slice before ticking it. Grant exactly the
 # resolved verify command, nothing broader.
-#
-# "Nothing broader" is the whole point, so the prefix grant is conditional —
-# see allowlist.sh, which owns the derivation so it can be tested on its own.
-# shellcheck source=allowlist.sh
-. "$SCRIPT_DIR/allowlist.sh"
 # select_next_slice() over the Plan DAG (docs/adr/0005-*.md) — own file so it's
 # unit-testable without a run (scripts/verify.sh exercises it directly).
 # shellcheck source=plan.sh
