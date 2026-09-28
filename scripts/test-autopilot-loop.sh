@@ -1467,6 +1467,10 @@ VERDICTS41="$(cat "$R41"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="veri
 grep -q 'Do NOT run the full verify command' "$WORK/r41.calls" && ! grep -q 'Run the verify command:' "$WORK/r41.calls" \
   && ok "--verify-at-completion: BUILD is told to run its item's tests, not the full verify" \
   || note "--verify-at-completion: BUILD prompt still asks for the full verify"
+[[ "$(jq -r '.verify_deferred' "$R41/tmp/autopilot/status.json" 2>/dev/null)" == "4" \
+   && "$(jq -r '.verify_deferred' "$R1/tmp/autopilot/status.json" 2>/dev/null)" == "0" ]] \
+  && ok "status.json counts deferred gate-(b) runs (verify_deferred: 4 here, 0 in a bare run)" \
+  || note "verify_deferred: '$(jq -r '.verify_deferred' "$R41/tmp/autopilot/status.json" 2>/dev/null)' with deferral, '$(jq -r '.verify_deferred' "$R1/tmp/autopilot/status.json" 2>/dev/null)' without"
 
 # A completion whose full verify fails is not done: back to work, then done.
 R42="$WORK/r42"; new_repo "$R42"

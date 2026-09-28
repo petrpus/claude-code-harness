@@ -497,13 +497,14 @@ map), so it answers "did BUILD see one," not "was the flag on."
 
 ### Per-run aggregates (S3B)
 
-`write_status()` recomputes seven aggregates from the run's own JSONL log on
+`write_status()` recomputes eight aggregates from the run's own JSONL log on
 *every* call (not accumulated in a bash variable across the run), and merges
 them into `status.json`:
 
 ```json
 {"iterations":3,"gate_fail_rate":0.667,"cost_per_ticked_slice":3,
- "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1}
+ "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1,
+ "verify_deferred":0}
 ```
 
 - `iterations` — count of `phase:"iteration"` rows so far.
@@ -521,6 +522,10 @@ them into `status.json`:
   slice parked, unparked by a replan, and parked again as two separate
   incidents; the peak answers "how bad did it get."
 - `escalations` — count of iterations with `escalated:true`.
+- `verify_deferred` — count of iterations whose gate (b) was deferred under
+  `--verify-at-completion` (ADR-0009). Those iterations can never fail gate
+  (b), so a run with deferrals has a structurally lower `gate_fail_rate`;
+  compare it only with runs that deferred the same way.
 
 A missing or empty run log (before the first `log_iteration()` call, or a
 0.4.0-era `tmp/autopilot/` with no log at all) yields all-zero aggregates and

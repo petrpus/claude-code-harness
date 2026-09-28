@@ -386,7 +386,7 @@ log_iteration() {
 # again; the max is the "how bad did it get" read /usage-report wants.
 run_aggregates() {
   if [[ ! -s "$RUN_LOG" ]]; then
-    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0}'
     return
   fi
   # $widths drops unmeasured iterations rather than reading them as zero. A
@@ -404,6 +404,7 @@ run_aggregates() {
     | ($it | map(.dag_width) | map(select(. != null))) as $widths
     | ($it | map(.parked_count // 0) | (max // 0)) as $parked_total
     | ($it | map(select(.escalated == true)) | length) as $escalations
+    | (map(select(.phase=="verify_cmd" and .verdict=="deferred")) | length) as $deferred
     | {
         iterations: $n,
         gate_fail_rate: (if $n > 0 then ($failed / $n) else 0 end),
@@ -411,9 +412,10 @@ run_aggregates() {
         replans: $replans,
         mean_dag_width: (if ($widths|length) > 0 then (($widths|add) / ($widths|length)) else 0 end),
         parked_total: $parked_total,
-        escalations: $escalations
+        escalations: $escalations,
+        verify_deferred: $deferred
       }
-  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0}'
 }
 
 write_status() { # state
@@ -978,9 +980,12 @@ while :; do
   FAIL_REASON=""; FP=""
 
   # GATE b: machine verify (runner runs it — no LLM trust).
-  # Runs on EVERY iteration now. Under the old sentinel gate it was skipped
-  # whenever the plan wasn't complete, which meant incremental work was checked
-  # in as "wip" without the runner ever verifying it.
+  # Runs on every iteration by default. Under the old sentinel gate it was
+  # skipped whenever the plan wasn't complete, which meant incremental work
+  # was checked in as "wip" without the runner ever verifying it; that is why
+  # deferring it is an explicit opt-in (--verify-at-completion, ADR-0009) for
+  # a charter with another gate behind it, and still never skips the
+  # completing iteration.
   write_status "verifying"
   clock_now VERIFY_T0
   # --verify-at-completion (#88): the full command runs only on the iteration
@@ -988,9 +993,14 @@ while :; do
   # run --iteration-verify-cmd if one is given, else no machine verify — the
   # issue-level gate after the run (/deliver's final verify, review, CI)
   # stands behind them.
+  # "Completing" is deliberately OR, not AND: STATUS: done alone, or every box
+  # ticked alone, runs the full verify — a BUILD that ticks the last box but
+  # forgets STATUS must not slip through unverified. The box count is taken
+  # now, not before BUILD, because BUILD may have edited the plan.
   THIS_VERIFY_CMD="$VERIFY_CMD"; VERIFY_KIND="verify_cmd"
+  BOXES_NOW="$(count_boxes)"
   if [[ "$VERIFY_AT_COMPLETION" -eq 1 ]] && ! grep -q '^STATUS: done' "$PLAN_FILE" 2>/dev/null \
-     && ! [[ "$TOTAL_BOXES" -gt 0 && "$TICKED_AFTER" -ge "$TOTAL_BOXES" ]]; then
+     && ! [[ "$BOXES_NOW" -gt 0 && "$TICKED_AFTER" -ge "$BOXES_NOW" ]]; then
     THIS_VERIFY_CMD="$ITERATION_VERIFY_CMD"; VERIFY_KIND="iteration_verify"
   fi
   if [[ -z "$THIS_VERIFY_CMD" ]]; then
