@@ -309,6 +309,13 @@ next_num() {
   echo $(( max + 1 ))
 }
 [[ "${1:-}" == "--version" ]] && { echo "gh version 2.60.0 (fake)"; exit 0; }
+# Like real gh: with GH_CONFIG_DIR set to a dir holding no hosts.yml and no
+# token in the environment, there is no one to be.
+if [[ -n "${GH_CONFIG_DIR:-}" && ! -f "$GH_CONFIG_DIR/hosts.yml" && -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+  echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
+  printf 'UNAUTH %s\n' "$*" >> "$S/calls"
+  exit 4
+fi
 cmd="${1:-} ${2:-}"; shift 2 2>/dev/null || true
 case "$cmd" in
   "auth status") [[ -n "${FAKE_GH_UNAUTH:-}" ]] && exit 1; exit 0 ;;
@@ -432,6 +439,12 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    # A BUILD that tries the forge itself (ADR-0007): record what happened.
+    if [[ -n "${STUB_FORGE_PROBE:-}" ]]; then
+      gh auth status >/dev/null 2>&1; echo "gh=$?" >> "$STUB_FORGE_PROBE"
+      echo "helper=[$(git config --get-all credential.helper | tail -1)]" >> "$STUB_FORGE_PROBE"
+      echo "token=${GH_TOKEN-<unset>}" >> "$STUB_FORGE_PROBE"
+    fi
     if [[ -n "${STUB_BUILD_LOG:-}" ]]; then
       prev=""; for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && printf '%s\n' "$a" >> "$STUB_BUILD_LOG"; prev="$a"; done
     fi
@@ -610,6 +623,18 @@ for bad in 'Bash' 'Bash(env gh:*)' 'Read, Bash(/usr/bin/git  push origin x)'; do
   fi
   rm -rf "$WORK/extrabad"
 done
+
+# --- a model phase has no forge credentials; the runner has its own (#77) ------
+new_fixture nocreds
+run_deliver nocreds GH_TOKEN=runner-token STUB_FORGE_PROBE="$WORK/nocreds/probe" -- \
+  --verify-cmd "gh auth status >/dev/null 2>&1; echo verify-gh=\$? >> '$WORK/nocreds/probe'; true"
+RC=$?
+PROBE="$(sort -u "$WORK/nocreds/probe" 2>/dev/null | tr '\n' ' ')"
+[[ "$RC" -eq 0 ]] && [[ "$PROBE" == "gh=4 helper=[] token=<unset> verify-gh=4 " ]] \
+  && grep -q '^UNAUTH auth status' "$WORK/nocreds/gh/calls" \
+  && [[ "$(jq -r .state "$WORK/nocreds/gh/prs/5.json")" == "MERGED" ]] \
+  && ok "BUILD's gh and the verify command's gh are unauthenticated, git has no helper, while the runner (GH_TOKEN) still merges" \
+  || note "no-creds: exit $RC, probe '$PROBE'"
 
 # --- refusals ------------------------------------------------------------------
 new_fixture onmain

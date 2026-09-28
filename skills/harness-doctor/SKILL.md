@@ -115,6 +115,16 @@ or remove the reference."
 If no `CLAUDE.md` in repo root → 🟡: "Plugin's code-reviewer benefits from
 a project rule file."
 
+### 9. Plaintext forge credentials
+
+If `git config --get-all credential.helper` includes `store`, or
+`~/.git-credentials` exists → 🟠: "A plaintext forge token is readable by
+every process you run, model calls included. `/deliver` and autopilot
+withhold credential helpers from model calls, but a model can read this file
+directly (ADR-0007 § Three layers). Prefer `gh auth setup-git` (or an OS
+keychain helper), then remove the `store` helper and the file." Never print
+the file's content.
+
 ## Output
 
 ```markdown

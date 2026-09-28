@@ -877,7 +877,9 @@ while :; do
   # in as "wip" without the runner ever verifying it.
   write_status "verifying"
   VERIFY_T0="$(now_epoch)"
-  if timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
+  # BUILD can edit the verify command's script, so the runner runs it without
+  # forge credentials, like a model call (ADR-0007, agent.sh).
+  if agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
     VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
     logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
   else

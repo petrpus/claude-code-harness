@@ -35,6 +35,34 @@ records who is allowed to do what, and supersedes PRD 0002 contract item 4.
    deletes branches it created** (recorded in its state). When the base moves,
    it merges the base into the issue branch locally, re-verifies and pushes a
    fast-forward.
+6. **Model calls run without forge credentials** (#77). `agent_run`
+   (`skills/autopilot/agent.sh`) starts every `claude -p` — PLAN, BUILD, the
+   verifier, the reviewer — with the gh tokens unset, `GH_CONFIG_DIR` pointed
+   at an empty private dir, every git credential helper cleared (an empty
+   `credential.helper` appended through `GIT_CONFIG_COUNT`), no prompt or
+   askpass, no ssh agent and a failing `GIT_SSH_COMMAND`. The verify command
+   gets the same treatment, because BUILD may edit what it runs and the
+   runner executes it. The runner's own forge calls keep the user's
+   credentials.
+
+## Three layers, one of them missing
+
+Decision 2 is enforced in layers, and they are not equally strong:
+
+1. **Allowlists** (`--allowedTools`, the reviewer's no-shell setup,
+   `forge_grant_violations` for `--extra-allowed-tools`). Defence in depth
+   only: BUILD edits files and runs the verify command, and autopilot's base
+   allowlist already grants `npx`, `pnpm` and `node`, so an allowlist can
+   never prove a model phase cannot reach `gh`.
+2. **Withheld credentials** (decision 6). Stops a model phase from acting on
+   the forge by accident or by following instructions — the credentials are
+   not where `gh` and `git` look. It does not stop a model that deliberately
+   points them back (`git -c credential.helper=store push`,
+   `GH_CONFIG_DIR=~/.config/gh gh …`): the model runs as the same user and
+   can read those files. A plaintext `~/.git-credentials` makes that easier;
+   `harness-doctor` flags it.
+3. **An OS or network sandbox** around model calls — the only layer that
+   holds against a deliberate model. Not built; researched in #79.
 
 ## Considered options
 

@@ -323,7 +323,8 @@ deliver_issue() {
 
   # --- verify the exact head that will be merged ---
   head_sha="$(git rev-parse HEAD)"
-  if ! bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1; then
+  # Autopilot's BUILD may have edited what verify runs: no forge credentials.
+  if ! agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1; then
     [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
     PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
     return 10
