@@ -2,6 +2,22 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
+## [Unreleased]
+
+### Changed
+
+- `scripts/test-deliver.sh`: independent end-to-end fixtures now run in
+  parallel — each already had its own `$WORK/<name>/` dir (remote, repo, gh
+  store, XDG state), so every fixture's `new_fixture` + `run_deliver` launches
+  as a background job, capped at `${TEST_DELIVER_JOBS:-$(nproc)}` concurrent
+  jobs via a `wait -n` semaphore; `TEST_DELIVER_JOBS=1` reruns them
+  sequentially. The two `park` reruns that mutate and re-read the first
+  `park` job's state stay foreground calls. Wall time drops from ~48 s to a
+  few seconds on a multi-core box, with the same assertion count (plus one
+  new check that the happy path's own run log shows `loop.sh` actually ran a
+  `plan` and a `build` phase, closing the "real loop.sh at least once" gap).
+  (#74)
+
 ## [0.5.2] — 2026-09-13
 
 A deny glob that matched a flag inside branch names, and the L2 gap that
