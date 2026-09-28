@@ -432,6 +432,9 @@ grep -q "stuck on 'holdout'" "$WORK/r8.err" 2>/dev/null \
   && ok "the holdout failure is fingerprinted 'holdout', distinct from verify_agent" \
   || note "holdout failure was not fingerprinted as 'holdout' in the runner's log"
 
+ls "$R8"/tmp/autopilot/calls/*-verify_agent.md >/dev/null 2>&1 \
+  && note "a holdout-aware verifier reply was kept in calls/, where BUILD can read it (ADR-0006)" \
+  || ok "with a holdout, the verifier's replies are not kept in calls/ (ADR-0006)"
 grep -q "H1" "$R8/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
   && ok "FEEDBACK.md names the failing holdout scenario id" \
   || note "FEEDBACK.md doesn't mention the failing scenario id H1"
@@ -1252,6 +1255,19 @@ RC30=$?
 [[ "$RC30" -eq 0 ]] && ! grep -q 'time cap' "$WORK/r30.err" \
   && ok "a \`date\` that fails once at startup no longer ends a healthy run as a time cap (exit 0)" \
   || note "with a failing date: exit $RC30 — $(grep -m1 'cap\|clock' "$WORK/r30.err")"
+
+# --- 31. every model reply is kept in calls/ (#86) ---------------------------
+# The run log says an iteration failed; only the reply says why. A five-slice
+# run makes 1 PLAN + 5 BUILD + 5 verifier calls: eleven files, in order.
+R31="$WORK/r31"; new_repo "$R31"
+run_loop "$R31" progress true
+RC31=$?
+CALLS31="$(ls "$R31/tmp/autopilot/calls" 2>/dev/null | tr '\n' ' ')"
+[[ "$RC31" -eq 0 && "$(ls "$R31/tmp/autopilot/calls" | wc -l | tr -d ' ')" -eq 11 ]] \
+  && [[ "$CALLS31" == "001-plan.md 002-build.md 003-verify_agent.md "* ]] \
+  && grep -q '^"built"$\|^built$' "$R31/tmp/autopilot/calls/002-build.md" \
+  && ok "calls/ keeps all 11 replies of a five-slice run, numbered in call order" \
+  || note "calls/ after a five-slice run: exit $RC31, '$CALLS31'"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

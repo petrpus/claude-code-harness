@@ -55,6 +55,7 @@ dir inside the repo that git does not ignore: checkpoint commits are
 | `status.json` | Live run state, iterations done, accumulated cost, HEAD sha, plus S3B's per-run aggregates. |
 | `run-<id>.jsonl` | Structured per-phase log (see below). |
 | `lock` | `PID run_id` — concurrency guard with stale-PID detection. |
+| `calls/<seq>-<phase>.md` | Every model call's reply, in order (PLAN, BUILD, verifier, replan), with its exit code and duration — the only record of *why* an iteration did what it did. Runner-written; never read by a prompt. |
 | `slices.json` | Per-slice retry/park ladder state (S4A, `slices.sh`). Runner-owned; never named in any prompt. Missing = nothing has failed yet. |
 
 `HOLDOUT.md` (optional, S2) is deliberately **not** one of these — it lives
