@@ -136,6 +136,15 @@ case "$prompt" in
       git commit -q -m "build: oops" >/dev/null 2>&1
     elif [[ "${STUB_SECRET_MODE:-}" == "untracked" ]]; then
       printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret_untracked.txt
+    elif [[ "${STUB_SECRET_MODE:-}" == "nearby" ]]; then
+      # Regression (#54 dogfooding): a secret-looking line already at
+      # ITER_BASE_SHA, untouched by this iteration, must not fail the gate
+      # just because an edit lands within the diff's context window (git's
+      # default 3 lines) of it — `git diff`'s unified context reprints
+      # unchanged lines around a real change, and a scan over the raw diff
+      # text (rather than only its +/- lines) can't tell "shown as context"
+      # from "added".
+      sed -i 's/^unrelated line$/unrelated line, edited by BUILD/' config.txt
     fi
     # S2 (issue #54): simulate a BUILD that commits a (non-secret) change
     # itself, moving HEAD before the runner's own `git add -A`/checkpoint —
@@ -1553,6 +1562,26 @@ grep -qF "git diff --cached $PRE_SHA_34" "$WORK/r34.calls" 2>/dev/null \
 grep -qF "build-own-commit.txt" "$WORK/r34-verify.diff" 2>/dev/null \
   && ok "running the prompt's own diff command shows the file BUILD committed itself" \
   || note "the prompt's diff command missed BUILD's own commit: $(cat "$WORK/r34-verify.diff" 2>/dev/null)"
+
+# --- 35. secret_scan() ignores unchanged lines shown only as diff context --
+# (regression, found dogfooding S1/S2 on this very repo: a plan-adjacent test
+# edit landed within 3 lines of an already-committed AKIA-pattern fixture
+# line and tripped the gate even though that line itself was untouched).
+# secret_scan() must judge the actual change, not everything unified diff
+# context reprints around it.
+R35="$WORK/r35"; new_repo "$R35"
+printf -- '- [ ] slice 1\n\nSTATUS: in-progress\n' > "$R35/tmp/autopilot/IMPLEMENTATION_PLAN.md"
+printf 'unrelated line\ntoken = "AKIAABCDEFGHIJKLMNOP"\nunrelated line\n' > "$R35/config.txt"
+git -C "$R35" add config.txt >/dev/null 2>&1
+git -C "$R35" -c user.email=t@t.est -c user.name=test commit -q -m "add config.txt fixture"
+( cd "$R35" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=nearby \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r35.out" 2>"$WORK/r35.err" )
+RC35=$?
+GATE35="$(cat "$R35"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC35" -eq 0 && "$GATE35" == "none" ]] \
+  && ok "an edit merely near a pre-existing secret-looking line (diff context) does not fail the gate" \
+  || note "edit near a pre-existing secret line: exit $RC35 (expected 0), gate_failed='$GATE35', FEEDBACK='$(cat "$R35/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
 
 # --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and
