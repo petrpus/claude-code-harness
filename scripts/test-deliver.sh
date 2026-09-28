@@ -444,7 +444,11 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     printf '{"result":%s,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$(printf '%s' "$r" | jq -Rs .)"
     exit 0 ;;
   *"PLAN phase"*|*"autonomous run is stuck"*)
-    printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
+    if [[ "${STUB_PLAN_SLICES:-1}" == "2" ]]; then
+      printf -- '- [ ] S1 — part one\n- [ ] S2 — part two (after: S1)\n\nSTATUS: in-progress\n' > "$plan"
+    else
+      printf -- '- [ ] S1 — the work\n\nSTATUS: in-progress\n' > "$plan"
+    fi
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
     [[ -n "${STUB_BUILD_SLEEP:-}" ]] && sleep "$STUB_BUILD_SLEEP"
@@ -519,7 +523,7 @@ run_deliver() {
   [[ "${1:-}" == "--" ]] && shift
   ( cd "$d/repo" && env PATH="$BIN:$PATH" FAKE_GH_DIR="$d/gh" XDG_STATE_HOME="$d/state" \
       GIT_CMD_LOG="$d/git.calls" ${envs[@]+"${envs[@]}"} \
-      bash "$DELIVER_ABS" --map 3 --verify-cmd true --issue-max-iterations 6 "$@" \
+      bash "$DELIVER_ABS" --map 3 --verify-cmd true --issue-max-iterations 1 "$@" \
       >"$d/out" 2>"$d/err" )
 }
 
@@ -667,11 +671,11 @@ done
 # Per issue: autopilot's completion verify + deliver's own final verify = 2.
 # With --verify-every-iteration autopilot verifies each of its 2 iterations.
 new_fixture pace
-run_deliver pace -- --verify-cmd "echo v >> '$WORK/pace/count'"
+run_deliver pace STUB_PLAN_SLICES=2 -- --issue-max-iterations 2 --verify-cmd "echo v >> '$WORK/pace/count'"
 RC=$?
 PACE_DEFAULT="$(wc -l < "$WORK/pace/count" 2>/dev/null | tr -d ' ')"
 new_fixture paceall
-run_deliver paceall -- --verify-cmd "echo v >> '$WORK/paceall/count'" --verify-every-iteration
+run_deliver paceall STUB_PLAN_SLICES=2 -- --issue-max-iterations 2 --verify-cmd "echo v >> '$WORK/paceall/count'" --verify-every-iteration
 RC2=$?
 PACE_ALL="$(wc -l < "$WORK/paceall/count" 2>/dev/null | tr -d ' ')"
 [[ "$RC" -eq 0 && "$PACE_DEFAULT" -eq 4 && "$RC2" -eq 0 && "$PACE_ALL" -eq 6 ]] \
