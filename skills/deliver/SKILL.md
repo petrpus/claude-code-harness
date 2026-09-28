@@ -63,15 +63,17 @@ issue's fault: it ends the run with exit 1, where it is.
    passed to each issue's `loop.sh` run. The check fails closed (ADR-0007:
    no model phase holds a forge operation): a `Bash(...)` rule is accepted
    only as a **plain command** — words of `[A-Za-z0-9._/+=:@%,-]`, optionally
-   ending in `:*` or ` *` — whose program (by basename) is not `gh`, `git`
-   or `hub`, not a program that runs other programs (`env`, `command`,
-   `timeout`, `nice`, `xargs`, `eval`, `sudo`, `ssh`, `find`, …) and not an
-   interpreter without a script path (`bash -c`, `bash:*`, `python3 -c`).
+   ending in `:*` or ` *` — whose program (by basename, any letter case) is
+   not a forge CLI (`gh`, `gh-*`, `git`, `hub`, `glab`, `lab`), not a program
+   that runs other programs (`env`, `command`, `timeout`, `nice`, `xargs`,
+   `eval`, `sudo`, `ssh`, `find`, …), not a package runner (`npx`, `npm`,
+   `pnpm`, `yarn`, `bunx`, `deno`, `uvx`, …) and not an interpreter without a
+   script path (`bash -c`, `bash:*`, `python3 -c`).
    Quotes, backslashes, `$`, `;`, `|`, `&`, redirections, a leading `VAR=`,
    wildcards inside the command, a blanket `Bash` and malformed rules are
-   refused outright. This is defence in depth, not the boundary: BUILD edits
-   files and runs the verify command, so it could always put a `gh` call
-   into a script it may run. Keeping forge credentials away from model
+   refused outright. This is defence in depth, not the boundary, and cannot
+   be complete: BUILD edits files and runs the verify command, and
+   autopilot's own base allowlist already grants `npx`, `pnpm` and `node`. Keeping forge credentials away from model
    phases is the boundary, and is tracked in #77 (map #68).
 
 ## The review step

@@ -236,10 +236,15 @@ for g in 'Bash' 'Bash(*)' 'Bash(:*)' 'Bash(gh:*)' 'Bash(git push:*)' 'Bash(git:*
          'Bash("gh":*)' "Bash('git' push)" 'Bash(\gh:*)' 'Bash(g\h pr merge)' 'Bash($HOME/gh:*)' \
          'Bash(env -i gh:*)' 'Bash(env -u X gh)' 'Bash(nice -n 5 git push)' 'Bash(timeout -s KILL 5 gh:*)' \
          'Bash(exec -a x gh)' 'Bash(jq; gh pr merge)' 'Bash(jq && gh)' 'Bash(jq | gh)' 'Bash(`gh`)' \
-         'Bash($(gh))' 'Bash(gh:*' 'Bash(GH=1 jq)' 'Bash(jq > /tmp/x)'; do
+         'Bash($(gh))' 'Bash(gh:*' 'Bash(GH=1 jq)' 'Bash(jq > /tmp/x)' \
+         'Bash(GH:*)' 'Bash(Git push:*)' 'Bash(gh-dash:*)' 'Bash(glab push:*)' 'Bash(lab:*)' \
+         'Bash(deno run:*)' 'Bash(deno eval:*)' 'Bash(deno run data:application/typescript,x%281%29:*)' \
+         'Bash(npx gh:*)' 'Bash(npm exec gh:*)' 'Bash(pnpm dlx gh:*)' 'Bash(yarn dlx git push:*)' \
+         'Bash(bunx gh:*)' 'Bash(corepack pnpm dlx gh:*)'; do
   forge_grant_violations "$g" >/dev/null && { note "grant '$g' was NOT refused"; GV_MISSED=1; }
 done
-[[ "$GV_MISSED" -eq 0 ]] && ok "refuses blanket, wildcard, quoted/escaped, wrapped, chained, redirected, malformed and gh/git grants (45 forms)"
+[[ "$GV_MISSED" -eq 0 ]] && ok "refuses blanket, wildcard, quoted/escaped, wrapped, chained, redirected, malformed, gh/git (any case), package-runner grants (59 forms)"
+GV_MISSED=0
 for g in 'Bash(jq:*)' 'Bash(bash scripts/test-deliver.sh)' 'Bash(bash scripts/x.sh:*)' 'Read,Grep' \
          'Bash(shellcheck:*)' 'Bash(git-lfs:*)' 'Bash(python3 tools/gen.py)' 'Bash(printf a,b)' 'Bash(make test *)'; do
   forge_grant_violations "$g" >/dev/null || { note "grant '$g' was refused: $(forge_grant_violations "$g")"; GV_MISSED=1; }

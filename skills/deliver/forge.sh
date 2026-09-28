@@ -104,10 +104,10 @@ forge_pr_state() {
 #   to spell `gh` that a denylist would have to anticipate. A blanket `Bash`
 #   and a malformed rule are refused too. Rules for other tools pass.
 #
-#   This is defence in depth, not the boundary: BUILD edits files and may run
-#   the verify command and scripts it can edit, so an allowlist alone can
-#   never stop a model phase from reaching gh. Withholding forge credentials
-#   from model phases is that boundary (#77, map #68).
+#   This is defence in depth, not the boundary, and it cannot be complete:
+#   BUILD edits files and may run the verify command and scripts it can
+#   edit, and loop.sh's own base allowlist already grants npx / pnpm / node.
+#   Withholding forge credentials from model calls is the boundary (#77).
 forge_grant_violations() {
   local csv="$1" rule inner cmd base next bad=0 depth=0 cur="" ch i
   local -a rules=() toks=()
@@ -135,14 +135,20 @@ forge_grant_violations() {
     fi
     read -ra toks <<<"$cmd"
     if [[ "${toks[0]}" == *=* ]]; then echo "$rule: starts with an environment assignment"; bad=1; continue; fi
-    base="${toks[0]##*/}"; next="${toks[1]:-}"
+    # Lowercased: on a case-insensitive filesystem (macOS, Windows) `GH`
+    # resolves to the same binary as `gh`.
+    base="$(printf '%s' "${toks[0]##*/}" | tr '[:upper:]' '[:lower:]')"; next="${toks[1]:-}"
     case "$base" in
-      gh|git|hub)
+      gh|gh-*|git|hub|glab|lab)
         echo "$rule: runs $base — forge operations are the runner's alone (ADR-0007)"; bad=1 ;;
+      npx|npm|pnpm|yarn|bunx|bun|corepack|deno|pipx|uvx|uv)
+        # Package runners execute whatever they are told to fetch or find,
+        # and deno also runs code from a data: URL written into the grant.
+        echo "$rule: $base runs programs and code it is handed"; bad=1 ;;
       env|command|builtin|exec|nohup|nice|ionice|time|stdbuf|timeout|setsid|flock|chroot|unshare|strace|ltrace|\
       xargs|eval|sudo|su|doas|pkexec|ssh|parallel|watch|find|script|expect)
         echo "$rule: $base runs other commands"; bad=1 ;;
-      sh|bash|zsh|dash|ksh|fish|python|python3|perl|ruby|node|deno)
+      sh|bash|zsh|dash|ksh|fish|python|python3|perl|ruby|node)
         if [[ -z "$next" || "$next" == -* ]]; then
           echo "$rule: $base without a script path runs arbitrary code"; bad=1
         fi ;;
