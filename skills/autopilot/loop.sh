@@ -142,11 +142,15 @@ if [[ "$BRANCH" == "main" || "$BRANCH" == "master" || -z "$BRANCH" ]]; then
   exit 1
 fi
 
+# "Nothing broader" is the whole point, so the prefix grant is conditional —
+# see allowlist.sh, which owns the derivation (detect_verify_cmd, verify_grants)
+# so it can be tested on its own.
+# shellcheck source=allowlist.sh
+. "$SCRIPT_DIR/allowlist.sh"
+
 # Auto-detect a verify command if none was given.
 if [[ -z "$VERIFY_CMD" ]]; then
-  if [[ -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
-    if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
-  fi
+  VERIFY_CMD="$(detect_verify_cmd || true)"
 fi
 if [[ -z "$VERIFY_CMD" ]]; then
   log_err "no verify command found and --verify-cmd not given."
@@ -159,11 +163,6 @@ fi
 # script (./scripts/verify.sh, make verify, …) would have that call *denied*,
 # leaving BUILD unable to prove a slice before ticking it. Grant exactly the
 # resolved verify command, nothing broader.
-#
-# "Nothing broader" is the whole point, so the prefix grant is conditional —
-# see allowlist.sh, which owns the derivation so it can be tested on its own.
-# shellcheck source=allowlist.sh
-. "$SCRIPT_DIR/allowlist.sh"
 # select_next_slice() over the Plan DAG (docs/adr/0005-*.md) — own file so it's
 # unit-testable without a run (scripts/verify.sh exercises it directly).
 # shellcheck source=plan.sh
@@ -230,10 +229,15 @@ mkdir -p "$STATE_DIR"
 # its own handoff to itself, set right before the exec at the top of the main
 # loop below). A reload always wins when both are present, since it also
 # appends --resume-run to argv.
+RESTORED_START_EPOCH=""
 if [[ -n "${AUTOPILOT_RUN_ID:-}" ]]; then
   RUN_ID="$AUTOPILOT_RUN_ID"
   ITER="${AUTOPILOT_ITER:-0}"
   TOTAL_COST="${AUTOPILOT_TOTAL_COST:-0}"
+  # R1 hands its own already-resolved START_EPOCH across the re-exec — this
+  # process must keep measuring --max-minutes from the ORIGINAL start, not
+  # reset it to "now" just because a reload happened mid-run.
+  RESTORED_START_EPOCH="${AUTOPILOT_START_EPOCH:-}"
 elif [[ "$RESUME" -eq 1 ]]; then
   # Adopt the most recent run's identity instead of silently starting a new
   # run at iteration 0 / cost 0 — until this fix, `--resume-run` only relaxed
@@ -244,7 +248,14 @@ elif [[ "$RESUME" -eq 1 ]]; then
   if [[ -n "$LATEST_LOG" ]]; then
     RUN_ID="$(basename "$LATEST_LOG" .jsonl)"; RUN_ID="${RUN_ID#run-}"
     ITER="$(jq -s 'map(.iter // 0) | max // 0' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
-    TOTAL_COST="$(jq -s '[.[].cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+    TOTAL_COST="$(jq -s '[.[] | select(.phase!="iteration") | .cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+    # #78's time cap must survive a resume too — restore the run's original
+    # start time from the earliest ts in its own log rather than the current
+    # clock, which is what made --max-minutes reset on every manual restart.
+    # `select(. != null)` drops any row whose ts fails fromdateiso8601 (a
+    # corrupt line) before taking the min, so one bad row can't poison the
+    # whole restore; the plausibility check below still has the final say.
+    RESTORED_START_EPOCH="$(jq -s 'map(.ts | fromdateiso8601?) | map(select(. != null)) | min' "$LATEST_LOG" 2>/dev/null)"
   else
     # No prior log to resume from — missing state is never an error
     # (contract item 8), so this behaves like a fresh run.
@@ -282,11 +293,30 @@ HOLDOUT_NOTICE_SHOWN=0
 # first cap check then reported ~29 million minutes elapsed and ended a
 # healthy run as "time-cap" (#78).
 clock_now() { printf -v "$1" '%(%s)T' -1; }
-clock_now START_EPOCH
-# A start time that is not a plausible epoch is never used for a cap.
-if [[ ! "$START_EPOCH" =~ ^[0-9]+$ ]] || (( START_EPOCH < 1000000000 )); then
-  log_err "cannot read the clock (got '$START_EPOCH') — refusing to start rather than misreport a time cap."
+clock_now CURRENT_EPOCH
+# A start time that is not a plausible epoch is never used for a cap. This is
+# the current clock itself failing (extremely rare) — nothing to fall back
+# to, so refuse to start rather than misreport a time cap (#78).
+if [[ ! "$CURRENT_EPOCH" =~ ^[0-9]+$ ]] || (( CURRENT_EPOCH < 1000000000 )); then
+  log_err "cannot read the clock (got '$CURRENT_EPOCH') — refusing to start rather than misreport a time cap."
   exit 1
+fi
+
+# A restored start time (--resume-run's prior-log lookup, or R1's handoff of
+# an already-restored value) is plausible only if it parses AND does not sit
+# in the future — an unreadable/implausible value falls back to the current
+# clock rather than 0 or a hard exit: the run itself is fine, only the exact
+# elapsed-time accounting degrades to "measured from now" (same as before
+# this restore existed). A fresh run or a resume with no prior log never
+# attempts a restore, so START_EPOCH is just CURRENT_EPOCH, as before.
+START_EPOCH="$CURRENT_EPOCH"
+if [[ -n "$RESTORED_START_EPOCH" ]]; then
+  if [[ "$RESTORED_START_EPOCH" =~ ^[0-9]+$ ]] && (( RESTORED_START_EPOCH >= 1000000000 )) \
+     && (( RESTORED_START_EPOCH <= CURRENT_EPOCH )); then
+    START_EPOCH="$RESTORED_START_EPOCH"
+  else
+    log_err "restored start time ('$RESTORED_START_EPOCH') is unreadable/implausible — using the current clock instead."
+  fi
 fi
 
 logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json]
@@ -715,8 +745,9 @@ while :; do
   # allowlist.sh — bash already parsed their function bodies for this
   # process, so a fix just committed to disk would otherwise never apply
   # until a human restarts the run. Catch it before this iteration's SELECT
-  # runs and re-exec ourselves; RUN_ID/iteration count/cost hand across via
-  # env so nothing about the run resets. At most one reload happens here per
+  # runs and re-exec ourselves; RUN_ID/iteration count/cost/start time hand
+  # across via env so nothing about the run resets — a reload must not also
+  # reset the #78 time cap's clock. At most one reload happens here per
   # iteration — the new process computes its own baseline hash at startup, so
   # an unchanged file can never spin.
   if [[ "$(runner_files_hash)" != "$STARTUP_RUNNER_HASH" ]]; then
@@ -726,7 +757,8 @@ while :; do
     # exec skips the EXIT trap; the new process makes its own private dir.
     agent_cleanup
     AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
-      AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_LOCK_OWNED=1 \
+      AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_START_EPOCH="$START_EPOCH" \
+      AUTOPILOT_LOCK_OWNED=1 \
       exec bash "$SELF" "${ORIG_ARGV[@]}" --resume-run
   fi
 
