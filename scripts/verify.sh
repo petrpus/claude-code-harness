@@ -424,6 +424,56 @@ if [[ -f skills/autopilot/allowlist.sh ]]; then
   verify_grants_are_narrow './scripts/verify.sh' \
     && note "'./scripts/verify.sh' wrongly reported as narrow" \
     || ok "prefix grant kept for a direct script path"
+
+  # detect_verify_cmd: project-type precedence (package.json -> scripts/
+  # verify.sh -> Makefile), each exercised in its own throwaway temp dir so
+  # no test's fixture files leak into another's.
+  detect_case() { # desc setup want_cmd want_rc
+    local desc="$1" setup="$2" want_cmd="$3" want_rc="$4"
+    local d out rc
+    d="$(mktemp -d)"
+    ( cd "$d" && eval "$setup" ) >/dev/null 2>&1
+    out="$(cd "$d" && detect_verify_cmd)"; rc=$?
+    rm -rf "$d"
+    if [[ "$out" == "$want_cmd" && "$rc" -eq "$want_rc" ]]; then
+      ok "detect_verify_cmd: $desc"
+    else
+      note "detect_verify_cmd: $desc: got '$out' (rc=$rc), want '$want_cmd' (rc=$want_rc)"
+    fi
+    # A fixture that detects a command must get exactly that command's grant
+    # from verify_grants, with no broad interpreter prefix (Bash(bash:*),
+    # Bash(make:*)) that would hand BUILD arbitrary shell/make access.
+    if [[ "$rc" -eq 0 ]]; then
+      local grants; grants="$(verify_grants "$out")"
+      if [[ "$grants" == *"Bash($out)"* && "$grants" != *'Bash(bash:*)'* && "$grants" != *'Bash(make:*)'* ]]; then
+        ok "verify_grants for detected '$out': narrow"
+      else
+        note "verify_grants for detected '$out': got '$grants'"
+      fi
+    fi
+  }
+  detect_case 'npm project' \
+    'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json' \
+    'npm run verify' 0
+  detect_case 'pnpm project (pnpm-lock.yaml present)' \
+    'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json; touch pnpm-lock.yaml' \
+    'pnpm verify' 0
+  detect_case 'package.json without a verify script falls through to scripts/verify.sh' \
+    'printf "{\"scripts\":{\"test\":\"echo x\"}}" > package.json; mkdir -p scripts; : > scripts/verify.sh' \
+    'bash scripts/verify.sh' 0
+  detect_case 'scripts/verify.sh (need not be executable)' \
+    'mkdir -p scripts; : > scripts/verify.sh' \
+    'bash scripts/verify.sh' 0
+  detect_case 'Makefile with a verify: target' \
+    'printf "verify:\n\techo x\n" > Makefile' \
+    'make verify' 0
+  detect_case 'Makefile without a verify: target (only verify-all:)' \
+    'printf "verify-all:\n\techo x\n" > Makefile' \
+    '' 1
+  detect_case 'empty directory' '' '' 1
+  detect_case 'package.json wins over scripts/verify.sh' \
+    'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json; mkdir -p scripts; : > scripts/verify.sh' \
+    'npm run verify' 0
 else
   note "skills/autopilot/allowlist.sh is missing"
 fi

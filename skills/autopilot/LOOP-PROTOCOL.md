@@ -13,10 +13,28 @@ model pinning. autopilot keeps the insight and adds the enforcement.
 **Fresh context each iteration.** `loop.sh` never passes the CLI `--resume`/
 `--continue` — every `claude -p` starts clean. The `--resume-run` *flag on
 loop.sh* is different: it re-reads `tmp/autopilot/` disk state, adopting the
-most recent `run-<id>.jsonl`'s run id, iteration count and summed `cost_usd`
-(R1), so a killed run picks up its identity and both clocks instead of
-silently starting a new run at iteration 0 / cost 0. Continuity comes from
-disk, not from a growing window.
+most recent `run-<id>.jsonl`'s run id, iteration count, summed `cost_usd` and
+start time (R1), so a killed run picks up its identity and both clocks
+instead of silently starting a new run at iteration 0 / cost 0 / now.
+Continuity comes from disk, not from a growing window.
+
+`--resume-run`'s restore, precisely:
+
+- **id / iter** — the prior log's `run_id`, and its highest `iter`.
+- **cost** — `jq -s '[.[] | select(.phase!="iteration") | .cost_usd // 0] |
+  add // 0'` over the prior log: only per-call rows are summed, never the
+  `phase:"iteration"` summary rows (§ Log format) those calls were rolled up
+  into, so resuming can't double the total.
+- **start time** — the earliest parseable `ts` in the prior log (`jq -s 'map(.ts
+  | fromdateiso8601?) | map(select(. != null)) | min'`), used as `START_EPOCH`
+  instead of the current clock, so `--max-minutes` keeps counting from the
+  run's original start rather than resetting on every resume. An unreadable or
+  implausible restored value (not a plausible epoch, or later than the current
+  clock) falls back to the current clock with a logged notice — never to `0`
+  — and a fresh run, or a resume with no prior log at all, behaves exactly as
+  before this restore existed. R1's reload (below) carries its own
+  already-resolved `START_EPOCH` across the `exec` via `AUTOPILOT_START_EPOCH`,
+  so a mid-run reload doesn't reset the clock either.
 
 ### Runner self-reload (R1)
 
@@ -31,12 +49,13 @@ against the hash taken at startup. On a mismatch it logs a `runner_reload`
 line, writes `status.json`, and `exec`s itself with the original argv plus
 `--resume-run` — `exec` keeps the PID, so the concurrency lock and the
 dirty-tree guard must not re-trip on the process's own prior state.
-`RUN_ID`/iteration count/accumulated cost hand across via
+`RUN_ID`/iteration count/accumulated cost/start time hand across via
 `AUTOPILOT_RUN_ID`/`AUTOPILOT_ITER`/`AUTOPILOT_TOTAL_COST`/
-`AUTOPILOT_LOCK_OWNED`, which the startup block adopts ahead of the
-`--resume-run` disk-based path above. At most one reload happens per
-iteration — the new process computes its own baseline hash fresh at startup,
-so an unchanged file can never spin.
+`AUTOPILOT_START_EPOCH`/`AUTOPILOT_LOCK_OWNED`, which the startup block adopts
+ahead of the `--resume-run` disk-based path above — so a reload never
+re-derives the start time from the log and never resets `--max-minutes`'s
+clock. At most one reload happens per iteration — the new process computes its
+own baseline hash fresh at startup, so an unchanged file can never spin.
 
 ## State files (`tmp/autopilot/`, or `--state-dir`)
 
@@ -298,6 +317,19 @@ exit code. The build model's *claim* that verify passed is never trusted —
 shortcut #5 (modifying the verify command) and #10 ("done" without running it)
 are exactly the failures a self-reported gate misses.
 
+Absent `--verify-cmd`, `loop.sh` sources `allowlist.sh`'s `detect_verify_cmd`
+to pick that command, trying project types in order and falling through on a
+miss at each step: a `package.json` with a `scripts.verify` entry (`pnpm
+verify` if `pnpm-lock.yaml` exists, else `npm run verify`, unchanged from
+0.4.0) → `scripts/verify.sh` (`bash scripts/verify.sh`) → a
+`Makefile`/`makefile`/`GNUmakefile` with a `^verify:` target line (`make
+verify`). No match is empty output and a non-zero return, which is the
+existing "no verify command found" startup error, not a new failure mode.
+`verify_grants` (also `allowlist.sh`) allows exactly the detected command —
+`bash`/`make`/`npm`/`pnpm` are interpreters there, so the grant is always the
+literal `Bash(<detected cmd>)`, never a `Bash(bash:*)`/`Bash(make:*)` prefix
+that would also admit unrelated commands.
+
 When a run's own target repo is this harness, gate (b) is `bash
 scripts/verify.sh`, which runs `scripts/check-consistency.sh` as one of its
 sections (S0) — including that script's `.github/workflows/verify.yml`
@@ -517,9 +549,9 @@ whichever side has no data in the logs given renders as `—`, not an error.
 A killed run leaves its state dir intact and the lock is stale-detected on the
 next start. A stopped run (exit 6) is the same, minus the stale lock: remove the
 stop file and `--resume-run`. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
-iteration count and accumulated cost from its `run-<id>.jsonl` instead of starting
-a new run at iteration 0 / cost 0 — a missing log behaves like a fresh run
-(contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let
+iteration count, accumulated cost and start time from its `run-<id>.jsonl`
+instead of starting a new run at iteration 0 / cost 0 / now — a missing log
+behaves like a fresh run (contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let
 you `git reset` to any clean point. On abort, `FEEDBACK.md` holds the last
 failure for a human to read.
 

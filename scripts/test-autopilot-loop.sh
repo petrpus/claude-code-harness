@@ -542,10 +542,15 @@ cat > "$R12/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
 STATUS: in-progress
 EOF
 PRIOR_RUN_ID="20260101T000000Z-999999"
+# S2: --resume-run now also restores the time cap's start time from this
+# log's earliest ts (see case 12c below) — a fixed past date here would trip
+# a spurious time cap under --max-minutes 30 and has nothing to do with what
+# THIS case tests (cost/iter adoption), so its rows are timestamped "now".
+NOW_TS_12="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cat > "$R12/tmp/autopilot/run-$PRIOR_RUN_ID.jsonl" <<EOF
-{"ts":"2026-01-01T00:00:00Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
-{"ts":"2026-01-01T00:00:01Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
-{"ts":"2026-01-01T00:00:02Z","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
 EOF
 ( cd "$R12" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
     bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
@@ -565,6 +570,122 @@ COST_IS_TWO="$(jq -n --argjson v "${RESUMED_COST:--1}" '$v == 2' 2>/dev/null)"
 [[ "$COST_IS_TWO" == "true" ]] \
   && ok "--resume-run's cost total starts from the prior run's \$2 (1.25+0.75), not \$0" \
   || note "--resume-run's cost total is '$RESUMED_COST', expected 2 (summed from the prior log)"
+
+# --- 12b. --resume-run excludes a phase:"iteration" row's own cost_usd from --
+# the resumed total, even when that row is non-zero, so a per-iteration ------
+# summary cost is never double-counted on top of the per-call rows it summarizes
+R12B="$WORK/r12b"; new_repo "$R12B"
+cat > "$R12B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12B="20260101T000000Z-999998"
+# S2: see the NOW_TS_12 note above — same reasoning, this case tests cost
+# summation, not the time cap.
+NOW_TS_12B="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12B/tmp/autopilot/run-$PRIOR_RUN_ID_12B.jsonl" <<EOF
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"iteration","model":"-","duration_s":0,"cost_usd":2.00,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+EOF
+( cd "$R12B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12b.out" 2>"$WORK/r12b.err" )
+RC12B=$?
+[[ "$RC12B" -eq 2 ]] \
+  && ok "--resume-run (non-zero iteration-row cost) adopts the prior iteration count (hits the iteration cap immediately)" \
+  || note "--resume-run (non-zero iteration-row cost) exited $RC12B — expected 2 (iteration cap)"
+
+RESUMED_COST_12B="$(jq -r '.total_cost_usd // -1' "$R12B/tmp/autopilot/status.json" 2>/dev/null)"
+COST_IS_TWO_12B="$(jq -n --argjson v "${RESUMED_COST_12B:--1}" '$v == 2' 2>/dev/null)"
+[[ "$COST_IS_TWO_12B" == "true" ]] \
+  && ok "--resume-run's cost total excludes the phase:\"iteration\" row's \$2 (1.25+0.75=2, not 4)" \
+  || note "--resume-run's cost total is '$RESUMED_COST_12B', expected 2 (the iteration row's \$2 must not be added on top)"
+
+# --- 12c. S2: the time cap survives resume — a ~2h-old prior run trips it --
+# immediately, before any model call (#78's plausibility check on top of the
+# restored value, not just the current clock).
+R12C="$WORK/r12c"; new_repo "$R12C"
+cat > "$R12C/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12C="20260101T000000Z-999997"
+OLD_TS_12C="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12C/tmp/autopilot/run-$PRIOR_RUN_ID_12C.jsonl" <<EOF
+{"ts":"$OLD_TS_12C","run_id":"$PRIOR_RUN_ID_12C","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12C" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_CALL_LOG="$WORK/r12c.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12c.out" 2>"$WORK/r12c.err" )
+RC12C=$?
+[[ "$RC12C" -eq 3 ]] \
+  && ok "S2: --resume-run restores a ~2h-old start time and hits the time cap (exit 3)" \
+  || note "S2: resume from a ~2h-old log exited $RC12C — expected 3 (time cap)"
+
+STATE_12C="$(jq -r '.state // ""' "$R12C/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$STATE_12C" == "time-cap" ]] \
+  && ok "S2: status.json reports state 'time-cap' for the restored-start resume" \
+  || note "S2: status.json state is '$STATE_12C', expected 'time-cap'"
+
+[[ ! -s "$WORK/r12c.calls" ]] \
+  && ok "S2: the restored time cap trips before any model call" \
+  || note "S2: expected no model calls before the time cap, got: $(cat "$WORK/r12c.calls" 2>/dev/null)"
+
+# --- 12d. S2: a prior run started seconds ago resumes with no time cap -----
+R12D="$WORK/r12d"; new_repo "$R12D"
+cat > "$R12D/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12D="20260101T000000Z-999996"
+RECENT_TS_12D="$(date -u -d '-5 seconds' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12D/tmp/autopilot/run-$PRIOR_RUN_ID_12D.jsonl" <<EOF
+{"ts":"$RECENT_TS_12D","run_id":"$PRIOR_RUN_ID_12D","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12D" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12d.out" 2>"$WORK/r12d.err" )
+RC12D=$?
+[[ "$RC12D" -eq 2 ]] \
+  && ok "S2: --resume-run with a seconds-old prior start runs normally (iteration cap, not time cap)" \
+  || note "S2: resume from a seconds-old log exited $RC12D — expected 2 (iteration cap)"
+
+STATE_12D="$(jq -r '.state // ""' "$R12D/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$STATE_12D" == "iteration-cap" ]] \
+  && ok "S2: status.json reports 'iteration-cap', not a spurious time cap" \
+  || note "S2: status.json state is '$STATE_12D', expected 'iteration-cap'"
+
+# --- 12e. S2: an unparseable prior ts falls back to the current clock, -----
+# never reports a time cap.
+R12E="$WORK/r12e"; new_repo "$R12E"
+cat > "$R12E/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12E="20260101T000000Z-999995"
+cat > "$R12E/tmp/autopilot/run-$PRIOR_RUN_ID_12E.jsonl" <<EOF
+{"ts":"not-a-timestamp","run_id":"$PRIOR_RUN_ID_12E","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12E" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12e.out" 2>"$WORK/r12e.err" )
+RC12E=$?
+[[ "$RC12E" -eq 2 ]] \
+  && ok "S2: an unparseable prior ts falls back to the current clock (iteration cap, not time cap)" \
+  || note "S2: resume from an unparseable-ts log exited $RC12E — expected 2 (iteration cap)"
+
+grep -q "restored start time" "$WORK/r12e.err" 2>/dev/null \
+  && ok "S2: the unparseable restored start time is logged, not silently swallowed" \
+  || note "S2: no fallback notice found in stderr for the unparseable ts"
 
 # --- 13. R2: a verifier stuck on "no verdict" still aborts, and FEEDBACK.md --
 # names the malfunction instead of quoting the refusal as findings ----------
@@ -1180,7 +1301,11 @@ mkdir -p "$S27"
 mv "$R27/tmp/autopilot/PROMPT.md" "$S27/PROMPT.md"
 printf -- '- [ ] slice 1\n- [ ] slice 2\n\nSTATUS: in-progress\n' > "$S27/IMPLEMENTATION_PLAN.md"
 PRIOR27="20260101T000000Z-424242"
-printf '{"ts":"2026-01-01T00:00:00Z","run_id":"%s","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.5,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}\n' "$PRIOR27" \
+# S2: a fixed past date would now also restore the time cap's start time and
+# trip a spurious time cap under --max-minutes 30 — irrelevant to what this
+# case tests (state-dir plumbing), so timestamped "now" like cases 12/12b.
+printf '{"ts":"%s","run_id":"%s","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.5,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PRIOR27" \
   > "$S27/run-$PRIOR27.jsonl"
 ( cd "$R27" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
     bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 \
@@ -1269,54 +1394,104 @@ CALLS31="$(ls "$R31/tmp/autopilot/calls" 2>/dev/null | tr '\n' ' ')"
   && ok "calls/ keeps all 11 replies of a five-slice run, numbered in call order" \
   || note "calls/ after a five-slice run: exit $RC31, '$CALLS31'"
 
-# --- 32-35. Pacing for one PR-sized issue (#88) ------------------------------
+# --- 32. S4: loop.sh auto-detects the verify command via detect_verify_cmd -
+# No --verify-cmd given — the runner must fall back to allowlist.sh's
+# detect_verify_cmd (S3) instead of the old inline package.json-only block.
+R32="$WORK/r32"; new_repo "$R32"
+mkdir -p "$R32/scripts"
+cat > "$R32/scripts/verify.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$R32/scripts/verify.sh"
+git -C "$R32" add -A >/dev/null 2>&1
+git -C "$R32" -c user.email=t@t.est -c user.name=test commit -q -m "add scripts/verify.sh"
+( cd "$R32" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32.out" 2>"$WORK/r32.err" )
+RC32=$?
+[[ "$RC32" -ne 1 ]] \
+  && ok "a scripts/verify.sh-only repo runs without --verify-cmd (exit $RC32, not 1)" \
+  || note "a scripts/verify.sh-only repo exited 1 without --verify-cmd — expected auto-detection"
+grep -q "verify='bash scripts/verify.sh'" "$WORK/r32.err" 2>/dev/null \
+  && ok "startup log reports verify='bash scripts/verify.sh'" \
+  || note "startup log missing verify='bash scripts/verify.sh': $(cat "$WORK/r32.err")"
+
+R32B="$WORK/r32b"; new_repo "$R32B"
+cat > "$R32B/Makefile" <<'EOF'
+verify:
+	@true
+EOF
+git -C "$R32B" add -A >/dev/null 2>&1
+git -C "$R32B" -c user.email=t@t.est -c user.name=test commit -q -m "add Makefile"
+( cd "$R32B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32b.out" 2>"$WORK/r32b.err" )
+RC32B=$?
+[[ "$RC32B" -ne 1 ]] \
+  && ok "a Makefile-only repo runs without --verify-cmd (exit $RC32B, not 1)" \
+  || note "a Makefile-only repo exited 1 without --verify-cmd — expected auto-detection"
+grep -q "verify='make verify'" "$WORK/r32b.err" 2>/dev/null \
+  && ok "startup log reports verify='make verify'" \
+  || note "startup log missing verify='make verify': $(cat "$WORK/r32b.err")"
+
+R32C="$WORK/r32c"; new_repo "$R32C"
+( cd "$R32C" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32c.out" 2>"$WORK/r32c.err" )
+RC32C=$?
+[[ "$RC32C" -eq 1 ]] && grep -q "no verify command found" "$WORK/r32c.err" 2>/dev/null \
+  && ok "a repo with no detectable verify command still exits 1 with the expected message" \
+  || note "a repo with no verify command exited $RC32C — expected 1 with 'no verify command found'"
+
+# --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and
 # the full verify once, at completion.
-R32="$WORK/r32"; new_repo "$R32"
-run_loop "$R32" progress true --plan-max-items 2
-[[ $? -eq 0 ]] && grep -q 'most 2 items' "$WORK/r32.calls" && grep -q 'ONE issue, already sized' "$WORK/r32.calls" \
+R40="$WORK/r40"; new_repo "$R40"
+run_loop "$R40" progress true --plan-max-items 2
+[[ $? -eq 0 ]] && grep -q 'most 2 items' "$WORK/r40.calls" && grep -q 'ONE issue, already sized' "$WORK/r40.calls" \
   && ok "--plan-max-items puts the size hint into the PLAN prompt" \
   || note "--plan-max-items hint missing from the PLAN prompt"
 grep -q 'ONE issue, already sized' "$WORK/r1.calls" \
   && note "the size hint appears without --plan-max-items" \
   || ok "without --plan-max-items the PLAN prompt is unchanged"
 
-R33="$WORK/r33"; new_repo "$R33"
-run_loop "$R33" progress "echo x >> '$WORK/r33.verify-count'" --verify-at-completion
-RC33=$?
-VERDICTS33="$(cat "$R33"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="verify_cmd") | .verdict' | sort | uniq -c | tr -s ' ' | tr '\n' ',')"
-[[ "$RC33" -eq 0 && "$(wc -l < "$WORK/r33.verify-count" | tr -d ' ')" -eq 1 ]] \
-  && [[ "$VERDICTS33" == " 4 deferred, 1 pass," ]] \
+R41="$WORK/r41"; new_repo "$R41"
+run_loop "$R41" progress "echo x >> '$WORK/r41.verify-count'" --verify-at-completion
+RC41=$?
+VERDICTS41="$(cat "$R41"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="verify_cmd") | .verdict' | sort | uniq -c | tr -s ' ' | tr '\n' ',')"
+[[ "$RC41" -eq 0 && "$(wc -l < "$WORK/r41.verify-count" | tr -d ' ')" -eq 1 ]] \
+  && [[ "$VERDICTS41" == " 4 deferred, 1 pass," ]] \
   && ok "--verify-at-completion: a five-item run runs the full verify once, at completion (4 deferred, 1 pass)" \
-  || note "--verify-at-completion: exit $RC33, verify ran $(wc -l < "$WORK/r33.verify-count" 2>/dev/null) time(s), verdicts '$VERDICTS33', stderr: $(tail -3 "$WORK/r33.err" | tr '\n' '|')"
-grep -q 'Do NOT run the full verify command' "$WORK/r33.calls" && ! grep -q 'Run the verify command:' "$WORK/r33.calls" \
+  || note "--verify-at-completion: exit $RC41, verify ran $(wc -l < "$WORK/r41.verify-count" 2>/dev/null) time(s), verdicts '$VERDICTS41', stderr: $(tail -3 "$WORK/r41.err" | tr '\n' '|')"
+grep -q 'Do NOT run the full verify command' "$WORK/r41.calls" && ! grep -q 'Run the verify command:' "$WORK/r41.calls" \
   && ok "--verify-at-completion: BUILD is told to run its item's tests, not the full verify" \
   || note "--verify-at-completion: BUILD prompt still asks for the full verify"
 
 # A completion whose full verify fails is not done: back to work, then done.
-R34="$WORK/r34"; new_repo "$R34"
-run_loop "$R34" progress "n=\$(cat '$WORK/r34.n' 2>/dev/null || echo 0); echo \$((n+1)) > '$WORK/r34.n'; [ \$n -ge 1 ]" --verify-at-completion
-RC34=$?
-[[ "$RC34" -eq 0 && "$(cat "$WORK/r34.n")" -eq 2 ]] \
-  && [[ "$(cat "$R34"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="iteration") | .verdict' | tail -2 | tr '\n' ' ')" == "fail done " ]] \
+R42="$WORK/r42"; new_repo "$R42"
+run_loop "$R42" progress "n=\$(cat '$WORK/r42.n' 2>/dev/null || echo 0); echo \$((n+1)) > '$WORK/r42.n'; [ \$n -ge 1 ]" --verify-at-completion
+RC42=$?
+[[ "$RC42" -eq 0 && "$(cat "$WORK/r42.n")" -eq 2 ]] \
+  && [[ "$(cat "$R42"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="iteration") | .verdict' | tail -2 | tr '\n' ' ')" == "fail done " ]] \
   && ok "--verify-at-completion: a failing completion verify sends the run back, the next completion finishes it" \
-  || note "failing completion verify: exit $RC34, verify ran $(cat "$WORK/r34.n" 2>/dev/null) time(s), stderr: $(tail -3 "$WORK/r34.err" | tr '\n' '|')"
+  || note "failing completion verify: exit $RC42, verify ran $(cat "$WORK/r42.n" 2>/dev/null) time(s), stderr: $(tail -3 "$WORK/r42.err" | tr '\n' '|')"
 
-R35="$WORK/r35"; new_repo "$R35"
-run_loop "$R35" progress "echo full >> '$WORK/r35.count'" --verify-at-completion --iteration-verify-cmd "echo quick >> '$WORK/r35.count'"
-RC35=$?
-[[ "$RC35" -eq 0 && "$(sort "$WORK/r35.count" | uniq -c | tr -s ' ' | tr '\n' ',')" == " 1 full, 4 quick," ]] \
+R43="$WORK/r43"; new_repo "$R43"
+run_loop "$R43" progress "echo full >> '$WORK/r43.count'" --verify-at-completion --iteration-verify-cmd "echo quick >> '$WORK/r43.count'"
+RC43=$?
+[[ "$RC43" -eq 0 && "$(sort "$WORK/r43.count" | uniq -c | tr -s ' ' | tr '\n' ',')" == " 1 full, 4 quick," ]] \
   && ok "--iteration-verify-cmd runs on every other iteration, the full verify once" \
-  || note "--iteration-verify-cmd: exit $RC35, runs: $(sort "$WORK/r35.count" 2>/dev/null | uniq -c | tr '\n' ','), stderr: $(tail -3 "$WORK/r35.err" | tr '\n' '|'), status: $(cat "$R35/tmp/autopilot/status.json" 2>/dev/null)"
-R35B="$WORK/r35b"; new_repo "$R35B"
-run_loop "$R35B" progress true --iteration-verify-cmd true
-RC35B=$?
-R35C="$WORK/r35c"; new_repo "$R35C"
-run_loop "$R35C" progress true --plan-max-items 0
-RC35C=$?
-[[ "$RC35B" -eq 1 && "$RC35C" -eq 1 ]] \
+  || note "--iteration-verify-cmd: exit $RC43, runs: $(sort "$WORK/r43.count" 2>/dev/null | uniq -c | tr '\n' ','), stderr: $(tail -3 "$WORK/r43.err" | tr '\n' '|'), status: $(cat "$R43/tmp/autopilot/status.json" 2>/dev/null)"
+R43B="$WORK/r43b"; new_repo "$R43B"
+run_loop "$R43B" progress true --iteration-verify-cmd true
+RC43B=$?
+R43C="$WORK/r43c"; new_repo "$R43C"
+run_loop "$R43C" progress true --plan-max-items 0
+RC43C=$?
+[[ "$RC43B" -eq 1 && "$RC43C" -eq 1 ]] \
   && ok "--iteration-verify-cmd without --verify-at-completion and --plan-max-items 0 are refused" \
-  || note "flag validation: exit $RC35B / $RC35C — expected 1 / 1"
+  || note "flag validation: exit $RC43B / $RC43C — expected 1 / 1"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

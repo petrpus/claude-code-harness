@@ -31,7 +31,12 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 ## How to run
 
 1. **Provision a verify command** if the project has none: `/project-infra verify`.
-   The loop refuses to start without an objective gate.
+   The loop refuses to start without an objective gate. Absent `--verify-cmd`,
+   `detect_verify_cmd` (`allowlist.sh`) picks one for you, in order: a
+   `package.json` with a `scripts.verify` entry (`pnpm verify` if
+   `pnpm-lock.yaml` exists, else `npm run verify`) → `scripts/verify.sh`
+   (`bash scripts/verify.sh`) → a `Makefile`/`makefile`/`GNUmakefile` with a
+   `verify:` target (`make verify`) → none found, which is a startup error.
 2. **Scaffold the charter.** Create `tmp/autopilot/PROMPT.md` from
    `PROMPT.template.md` — derive it from a PRD or issue, and fill in the source
    link and acceptance criteria (these are mandatory; they're what the verifier
@@ -53,8 +58,13 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    `--plan-model` / `--build-model` / `--verify-model` / `--escalate-model`,
    the last accepting `none` to disable escalation outright). `--dry-run` prints the
    plan of calls without spending. `--resume-run` continues an interrupted run,
-   adopting its prior run id, iteration count and accumulated cost from disk
-   (R1) instead of starting over at iteration 0 / cost 0. `--holdout <path>`
+   adopting its prior run id, iteration count, accumulated cost and start time
+   from disk (R1) instead of starting over at iteration 0 / cost 0 / now. Cost
+   is summed excluding `phase:"iteration"` rows, so a prior run's per-iteration
+   summary rows never get added on top of the per-call rows that made them up
+   (no double-counting); the start time is restored from the earliest `ts` in
+   the prior run log, so `--max-minutes` keeps measuring from the run's
+   original start, not from the moment it was resumed. `--holdout <path>`
    overrides the default holdout location
    (`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`);
    omit it and a missing file just disables gate (e). Every BUILD prompt also
