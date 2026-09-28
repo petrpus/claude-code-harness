@@ -232,17 +232,21 @@ for g in 'Bash' 'Bash(*)' 'Bash(:*)' 'Bash(gh:*)' 'Bash(git push:*)' 'Bash(git:*
          'Bash(/usr/bin/git push:*)' 'Bash(/usr/bin/git:*)' 'Bash(command git push:*)' \
          'Bash(GH_HOST=x gh pr merge:*)' 'Bash(timeout 60 gh:*)' 'Bash(nohup env git push)' \
          'Bash(sh -c:*)' 'Bash(bash -c:*)' 'Bash(bash:*)' 'Bash(xargs:*)' 'Bash(eval:*)' \
-         'Bash(find:*)' 'Bash(python3 -c:*)' 'Bash(gh *)' 'Bash(foo * bar)' 'Read, Bash , Grep'; do
+         'Bash(find:*)' 'Bash(python3 -c:*)' 'Bash(gh *)' 'Bash(foo * bar)' 'Read, Bash , Grep' \
+         'Bash("gh":*)' "Bash('git' push)" 'Bash(\gh:*)' 'Bash(g\h pr merge)' 'Bash($HOME/gh:*)' \
+         'Bash(env -i gh:*)' 'Bash(env -u X gh)' 'Bash(nice -n 5 git push)' 'Bash(timeout -s KILL 5 gh:*)' \
+         'Bash(exec -a x gh)' 'Bash(jq; gh pr merge)' 'Bash(jq && gh)' 'Bash(jq | gh)' 'Bash(`gh`)' \
+         'Bash($(gh))' 'Bash(gh:*' 'Bash(GH=1 jq)' 'Bash(jq > /tmp/x)'; do
   forge_grant_violations "$g" >/dev/null && { note "grant '$g' was NOT refused"; GV_MISSED=1; }
 done
-[[ "$GV_MISSED" -eq 0 ]] && ok "refuses blanket, wildcard, gh/git (direct, wrapped, absolute path, env-prefixed) and exec-wrapper grants (27 forms)"
+[[ "$GV_MISSED" -eq 0 ]] && ok "refuses blanket, wildcard, quoted/escaped, wrapped, chained, redirected, malformed and gh/git grants (45 forms)"
 for g in 'Bash(jq:*)' 'Bash(bash scripts/test-deliver.sh)' 'Bash(bash scripts/x.sh:*)' 'Read,Grep' \
          'Bash(shellcheck:*)' 'Bash(git-lfs:*)' 'Bash(python3 tools/gen.py)' 'Bash(printf a,b)' 'Bash(make test *)'; do
   forge_grant_violations "$g" >/dev/null || { note "grant '$g' was refused: $(forge_grant_violations "$g")"; GV_MISSED=1; }
 done
 [[ "$GV_MISSED" -eq 0 ]] && ok "allows ordinary tool grants and interpreters running a named script"
-WHY="$(forge_grant_violations 'Bash(jq:*),Bash(env gh:*)')"
-[[ "$WHY" == "Bash(env gh:*): runs gh"* && "$(grep -c . <<<"$WHY")" -eq 1 ]] \
+WHY="$(forge_grant_violations 'Bash(jq:*),Bash(/usr/bin/gh:*)')"
+[[ "$WHY" == "Bash(/usr/bin/gh:*): runs gh"* && "$(grep -c . <<<"$WHY")" -eq 1 ]] \
   && ok "names exactly the offending rule and why" || note "reason was: $WHY"
 
 # ===========================================================================

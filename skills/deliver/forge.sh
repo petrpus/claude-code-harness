@@ -90,23 +90,28 @@ forge_pr_state() {
 
 # forge_grant_violations <allowed_tools_csv>
 #   Pure: which Claude Code permission rules in the list would hand a model
-#   phase a forge operation (ADR-0007) or a way to run arbitrary commands
-#   that reach one. Echoes one "<rule>: <why>" per offending rule and returns
-#   1 if there is any. Rules are split on commas outside parentheses; for each
-#   `Bash(...)` rule the command text is read the way a shell would run it:
-#   leading VAR=value assignments and pass-through wrappers (env, command,
-#   exec, nohup, nice, time, stdbuf, timeout <n>) are skipped, and the
-#   program is judged by its basename — so `Bash(env gh:*)` and
-#   `Bash(/usr/bin/git push:*)` are the same grant as `Bash(gh:*)` and
-#   `Bash(git push:*)`.
+#   phase a forge operation (ADR-0007), or cannot be shown not to. Echoes one
+#   "<rule>: <why>" per offending rule and returns 1 if there is any.
+#
+#   Fail closed: a `Bash(...)` rule is accepted only when its command is a
+#   plain command — words made of [A-Za-z0-9._/+=:@%,-], separated by spaces,
+#   optionally ending in `:*` or ` *` — and even then its program (by
+#   basename) must not be gh / git / hub, a program that runs other programs
+#   (env, command, exec, nice, timeout, xargs, eval, sudo, ssh, find, …), or
+#   an interpreter without a script path (bash -c, bash:*, python3 -c).
+#   Quotes, backslashes, $, ;, |, &, <, >, backticks, a leading VAR=value or
+#   a wildcard inside the command are refused, not interpreted: each is a way
+#   to spell `gh` that a denylist would have to anticipate. A blanket `Bash`
+#   and a malformed rule are refused too. Rules for other tools pass.
 #
 #   This is defence in depth, not the boundary: BUILD edits files and may run
 #   the verify command and scripts it can edit, so an allowlist alone can
 #   never stop a model phase from reaching gh. Withholding forge credentials
 #   from model phases is that boundary (#77, map #68).
 forge_grant_violations() {
-  local csv="$1" rule inner cmd tok base next bad=0 depth=0 cur="" ch i
+  local csv="$1" rule inner cmd base next bad=0 depth=0 cur="" ch i
   local -a rules=() toks=()
+  local word='[A-Za-z0-9._/+=:@%,-]+'
   for (( i=0; i<${#csv}; i++ )); do
     ch="${csv:$i:1}"
     case "$ch" in
@@ -118,31 +123,24 @@ forge_grant_violations() {
   done
   rules+=("$cur")
   for rule in "${rules[@]}"; do
-    rule="$(printf '%s' "$rule" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    rule="$(printf '%s' "$rule" | tr '\t\n\r' '   ' | sed -E 's/^ +//; s/ +$//')"
     [[ -n "$rule" ]] || continue
+    [[ "$rule" == Bash* ]] || continue
     if [[ "$rule" == "Bash" ]]; then echo "$rule: a blanket shell grant"; bad=1; continue; fi
-    [[ "$rule" == Bash\(*\) ]] || continue
-    inner="${rule#Bash(}"; inner="${inner%)}"
-    # Prefix (`cmd:*`) and trailing-wildcard (`cmd *`) forms name the same program.
-    cmd="$(printf '%s' "$inner" | sed -E 's/:\*$//; s/[[:space:]]\*$//')"
-    if [[ "$cmd" == *"*"* ]]; then echo "$rule: a wildcard inside the command"; bad=1; continue; fi
+    if [[ ! "$rule" =~ ^Bash\((.*)\)$ ]]; then echo "$rule: not a well-formed Bash(...) rule"; bad=1; continue; fi
+    inner="${BASH_REMATCH[1]}"
+    cmd="$(printf '%s' "$inner" | sed -E 's/:\*$//; s/ \*$//; s/^ +//; s/ +$//')"
+    if [[ ! "$cmd" =~ ^${word}(\ +${word})*$ ]]; then
+      echo "$rule: not a plain command (quotes, escapes, wildcards or shell syntax are refused)"; bad=1; continue
+    fi
     read -ra toks <<<"$cmd"
-    i=0
-    while (( i < ${#toks[@]} )); do
-      tok="${toks[$i]}"
-      if [[ "$tok" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then i=$((i+1)); continue; fi
-      case "${tok##*/}" in
-        env|command|builtin|exec|nohup|nice|time|stdbuf) i=$((i+1)); continue ;;
-        timeout) i=$((i+2)); continue ;;
-      esac
-      break
-    done
-    if (( i >= ${#toks[@]} )); then echo "$rule: no program named — as broad as Bash"; bad=1; continue; fi
-    base="${toks[$i]##*/}"; next="${toks[$((i+1))]:-}"
+    if [[ "${toks[0]}" == *=* ]]; then echo "$rule: starts with an environment assignment"; bad=1; continue; fi
+    base="${toks[0]##*/}"; next="${toks[1]:-}"
     case "$base" in
       gh|git|hub)
         echo "$rule: runs $base — forge operations are the runner's alone (ADR-0007)"; bad=1 ;;
-      xargs|eval|sudo|su|doas|ssh|parallel|watch|find|script)
+      env|command|builtin|exec|nohup|nice|ionice|time|stdbuf|timeout|setsid|flock|chroot|unshare|strace|ltrace|\
+      xargs|eval|sudo|su|doas|pkexec|ssh|parallel|watch|find|script|expect)
         echo "$rule: $base runs other commands"; bad=1 ;;
       sh|bash|zsh|dash|ksh|fish|python|python3|perl|ruby|node|deno)
         if [[ -z "$next" || "$next" == -* ]]; then
@@ -152,4 +150,3 @@ forge_grant_violations() {
   done
   return "$bad"
 }
-
