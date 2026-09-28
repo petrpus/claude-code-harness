@@ -83,6 +83,11 @@ forge_issue_remove_label() { gh issue edit "$1" --remove-label "$2" >/dev/null; 
 # ready to merge to a human skimming the PR list.
 forge_pr_draft() { gh pr ready "$1" --undo >/dev/null; }
 
+# forge_pr_close <pr> — closes without merging, never deleting the branch
+# (forge_delete_remote_branch is the caller's own, explicit call): --retry #N
+# discards an earlier attempt's PR before starting a fresh one (#61 S3).
+forge_pr_close() { gh pr close "$1" >/dev/null; }
+
 # forge_pr_state <pr>  — OPEN | MERGED | CLOSED
 forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'

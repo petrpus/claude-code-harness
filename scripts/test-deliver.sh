@@ -41,6 +41,7 @@ finish() {
 command -v jq >/dev/null 2>&1 || { note "jq is required"; finish; }
 DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 [[ -f "$DELIVER_ABS" ]] || { note "skills/deliver/deliver.sh is missing"; finish; }
+REAL_PLUGIN_VERSION="$(jq -r '.version // "unknown"' .claude-plugin/plugin.json 2>/dev/null)"
 
 # shellcheck source=../skills/autopilot/plan.sh
 . skills/autopilot/plan.sh
@@ -360,6 +361,25 @@ if [[ -n "${FAKE_GH_TOUCH_STOP:-}" ]]; then
   rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
   [[ -n "$rd" ]] && : > "${rd}STOP"
 fi
+# #61 S3: simulate the runner being killed right after a PR exists — SIGKILL
+# the deliver.sh pid (from the run's lock file) the moment a PR is on disk
+# and this is not the "pr create" call itself, so the PR really was opened
+# (and pr-open already recorded, since state_issue_update runs immediately
+# after forge_pr_create returns, before deliver.sh's next gh call) and the
+# kill lands synchronously, deterministically, before this call's own result
+# reaches deliver.sh — leaving a stale lock behind, exactly as an external
+# `kill -9` would.
+if [[ -n "${FAKE_GH_KILL_AFTER_PR_OPEN:-}" && ! -f "$S/.killed-after-pr-open" && "$*" != "pr create"* ]]; then
+  shopt -s nullglob; _prs=("$S"/prs/*.json); shopt -u nullglob
+  if [[ ${#_prs[@]} -gt 0 ]]; then
+    touch "$S/.killed-after-pr-open"
+    rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+    if [[ -n "$rd" && -f "${rd}lock" ]]; then
+      kill -9 "$(cat "${rd}lock" 2>/dev/null)" 2>/dev/null
+      sleep 0.2
+    fi
+  fi
+fi
 arg() { # --flag value from "$@"
   local want="$1"; shift
   while [[ $# -gt 0 ]]; do [[ "$1" == "$want" ]] && { printf '%s' "$2"; return 0; }; shift; done
@@ -403,6 +423,9 @@ case "$cmd" in
   "pr ready")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; has --undo "$@" || exit 64
     jq '.isDraft = true' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+  "pr close")
+    f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1
+    jq '.state="CLOSED"' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   "issue comment")
     f="$S/issues/$1.json"; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -803,6 +826,62 @@ job_budget() {
   echo $? > "$WORK/budget/rc"
 }
 
+# --- #61 S3: --resume / --retry ------------------------------------------------
+job_killresume() {
+  new_fixture killresume
+  run_deliver killresume FAKE_GH_KILL_AFTER_PR_OPEN=1
+  echo $? > "$WORK/killresume/rc1"
+  run_deliver killresume STUB_REVIEW_LOG="$WORK/killresume/review.log" -- --resume
+  echo $? > "$WORK/killresume/rc"
+}
+job_budgetresume() {
+  new_fixture budgetresume
+  run_deliver budgetresume -- --budget-usd 0.06
+  echo $? > "$WORK/budgetresume/rc1"
+  run_deliver budgetresume -- --resume --budget-usd 100
+  echo $? > "$WORK/budgetresume/rc"
+}
+job_stopresume() {
+  new_fixture stopresume
+  run_deliver stopresume FAKE_GH_TOUCH_STOP=1
+  echo $? > "$WORK/stopresume/rc1"
+  run_deliver stopresume -- --resume
+  echo $? > "$WORK/stopresume/rc"
+}
+job_locklive() {
+  new_fixture locklive
+  local d="$WORK/locklive"
+  sleep 60 & local holder=$!
+  mkdir -p "$d/repo/tmp/deliver/fakerun-live"
+  jq -n --argjson map 3 --arg base integration/x --arg run_id fakerun-live --arg version 0.0.0 \
+     '{run_id:$run_id, map:$map, base:$base, runner_version:$version, active_seconds:0, issues:{}}' \
+     > "$d/repo/tmp/deliver/fakerun-live/state.json"
+  echo "$holder" > "$d/repo/tmp/deliver/fakerun-live/lock"
+  run_deliver locklive -- --resume
+  echo $? > "$d/rc"
+  kill "$holder" 2>/dev/null
+}
+job_lockstale() {
+  new_fixture lockstale
+  local d="$WORK/lockstale"
+  ( exit 0 ) & local deadpid=$!
+  wait "$deadpid" 2>/dev/null
+  mkdir -p "$d/repo/tmp/deliver/fakerun-stale"
+  jq -n --argjson map 3 --arg base integration/x --arg run_id fakerun-stale --arg version 0.0.0-test \
+     '{run_id:$run_id, map:$map, base:$base, runner_version:$version, active_seconds:7, issues:{}}' \
+     > "$d/repo/tmp/deliver/fakerun-stale/state.json"
+  echo "$deadpid" > "$d/repo/tmp/deliver/fakerun-stale/lock"
+  run_deliver lockstale -- --resume
+  echo $? > "$d/rc"
+}
+job_retry() {
+  new_fixture retry with4
+  run_deliver retry STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+  echo $? > "$WORK/retry/rc1"
+  run_deliver retry -- --resume --retry '#1'
+  echo $? > "$WORK/retry/rc"
+}
+
 bg job_happy
 bg job_extra
 for i in "${!EXTRABAD_VALUES[@]}"; do bg job_extrabad "$i" "${EXTRABAD_VALUES[$i]}"; done
@@ -839,6 +918,12 @@ bg job_rvwronghead
 bg job_refused
 bg job_stopfile
 bg job_budget
+bg job_killresume
+bg job_budgetresume
+bg job_stopresume
+bg job_locklive
+bg job_lockstale
+bg job_retry
 wait
 
 # ===========================================================================

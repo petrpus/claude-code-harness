@@ -20,6 +20,7 @@
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
 #              [--budget-usd <n>] [--max-minutes <n>]
+#              [--resume [--retry '#N']]
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. State lives under tmp/deliver/<run-id>/: state.json
@@ -36,6 +37,22 @@
 # Delivery line merged · 1 precondition or runner failure · 2 partial (an
 # issue was parked; its dependents were skipped) · 3 global time cap ·
 # 4 global budget cap · 6 stopped (STOP file present).
+#
+# --resume picks the newest tmp/deliver/*/state.json for this --map, removes
+# a stale lock (a pid that is no longer alive; a live one refuses the run),
+# switches the checkout back to that run's recorded base branch if it is not
+# there already, makes a fresh private runner copy (warning on stderr when
+# plugin.json's version differs from the one state.json recorded), restores
+# active_seconds, then reconciles every issue this run's state still calls
+# non-terminal against GitHub — GitHub wins (docs/adr/0010-*.md) — before
+# walking the graph exactly as a fresh run would: an issue whose branch this
+# run's own state.json still names is continued (a pushed head without a PR
+# gets one; an open PR is re-entered for review — round 1's dedupe marker,
+# #61 S2, keeps that from posting twice — then merged; a local-only branch
+# resumes autopilot with loop.sh --resume-run); any other leftover branch is
+# still parked, unchanged from #58. --retry '#N' (with --resume) forgets a
+# parked issue's recorded branch/PR, closes/deletes what it left behind,
+# drops needs-human, and gives it a fresh inner run.
 
 set -uo pipefail
 
@@ -60,6 +77,8 @@ ITERATION_VERIFY_CMD=""
 REVIEW_MODEL=sonnet
 BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
+RESUME=0
+RETRY_ISSUE=""         # set by --retry '#N'; only meaningful with --resume
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -79,7 +98,9 @@ while [[ $# -gt 0 ]]; do
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
     --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
-    -h|--help)              sed -n '2,38p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --resume)               RESUME=1; shift ;;
+    --retry)                RETRY_ISSUE="${2#\#}"; shift 2 ;;
+    -h|--help)              sed -n '2,55p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -90,6 +111,8 @@ done
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 [[ -z "$BUDGET_USD" || "$BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--budget-usd takes a non-negative number"
 [[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
+[[ -z "$RETRY_ISSUE" || "$RETRY_ISSUE" =~ ^[0-9]+$ ]] || die "--retry takes an issue number ('#N' or N)"
+[[ -z "$RETRY_ISSUE" || "$RESUME" -eq 1 ]] || die "--retry only makes sense with --resume"
 
 # shellcheck source=../autopilot/plan.sh
 . "$PLUGIN_ROOT/skills/autopilot/plan.sh"
@@ -126,6 +149,42 @@ cd "$(git rev-parse --show-toplevel)" || die "cannot cd to repo root"
 [[ -f "$LOOP" ]] || die "autopilot runner not found at $LOOP"
 [[ -f "$REVIEW_AGENT" ]] || die "reviewer charter not found at $REVIEW_AGENT"
 
+# ---------------------------------------------------------------------------
+# --resume: find the run, handle its lock, and get the checkout back onto its
+# recorded base *before* the base-branch precondition below reads whatever
+# branch happens to be checked out — a run killed mid-issue leaves that on
+# the issue branch, not the integration branch (docs/adr/0010-*.md).
+# ---------------------------------------------------------------------------
+RESUME_RUN_ID=""
+if [[ "$RESUME" -eq 1 ]]; then
+  shopt -s nullglob
+  for _cand in tmp/deliver/*/; do
+    _cand="${_cand%/}"
+    [[ -f "$_cand/state.json" ]] || continue
+    [[ "$(jq -r '.map // empty' "$_cand/state.json" 2>/dev/null)" == "$MAP" ]] && RESUME_RUN_ID="${_cand#tmp/deliver/}"
+  done
+  shopt -u nullglob
+  [[ -n "$RESUME_RUN_ID" ]] || die "--resume: no run found for map #$MAP under tmp/deliver/"
+  RESUME_STATE_JSON="tmp/deliver/$RESUME_RUN_ID/state.json"
+  RESUME_LOCK="tmp/deliver/$RESUME_RUN_ID/lock"
+  if [[ -f "$RESUME_LOCK" ]]; then
+    RESUME_OLD_PID="$(cat "$RESUME_LOCK" 2>/dev/null)"
+    if [[ -n "$RESUME_OLD_PID" ]] && kill -0 "$RESUME_OLD_PID" 2>/dev/null; then
+      die "run $RESUME_RUN_ID (map #$MAP) is still active (pid $RESUME_OLD_PID) — refusing to resume a live run"
+    fi
+    log "run $RESUME_RUN_ID: removing a stale lock (pid ${RESUME_OLD_PID:-?} not alive)"
+    rm -f "$RESUME_LOCK"
+  fi
+  RESUME_BASE="$(jq -r '.base' "$RESUME_STATE_JSON")"
+  RESUME_CUR_BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  if [[ "$RESUME_CUR_BRANCH" != "$RESUME_BASE" ]]; then
+    [[ -z "$(git status --porcelain 2>/dev/null)" ]] \
+      || die "--resume: checkout is dirty and not on '$RESUME_BASE' (this run's recorded base) — resolve by hand first."
+    log "run $RESUME_RUN_ID: switching the checkout back to '$RESUME_BASE' (was on '${RESUME_CUR_BRANCH:-<detached>}')"
+    git switch -q "$RESUME_BASE" || die "--resume: cannot switch to '$RESUME_BASE'"
+  fi
+fi
+
 BASE="$(git branch --show-current 2>/dev/null || true)"
 case "$BASE" in
   "")          die "detached HEAD — check out the integration branch first." ;;
@@ -159,15 +218,19 @@ MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
 # code running the change are never the same file — whoever launched us.
 # ---------------------------------------------------------------------------
 if [[ "${DELIVER_SNAPSHOT:-0}" != "1" ]]; then
-  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  RUN_ID="$RESUME_RUN_ID"
+  [[ -n "$RUN_ID" ]] || RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   SNAP="${XDG_STATE_HOME:-$HOME/.local/state}/claude-code-harness/deliver/$RUN_ID/runner"
   mkdir -p "$SNAP/.claude-plugin" || die "cannot create $SNAP"
   cp -R "$PLUGIN_ROOT/skills" "$PLUGIN_ROOT/agents" "$SNAP/" || die "cannot copy the runner to $SNAP"
   cp "$PLUGIN_ROOT/.claude-plugin/plugin.json" "$SNAP/.claude-plugin/" 2>/dev/null || true
   log "running from private copy $SNAP"
-  DELIVER_SNAPSHOT=1 DELIVER_RUN_ID="$RUN_ID" exec bash "$SNAP/skills/deliver/deliver.sh" "${ORIG_ARGV[@]}"
+  DELIVER_SNAPSHOT=1 DELIVER_RUN_ID="$RUN_ID" DELIVER_RESUME="$RESUME" DELIVER_RETRY_ISSUE="$RETRY_ISSUE" \
+    exec bash "$SNAP/skills/deliver/deliver.sh" "${ORIG_ARGV[@]}"
 fi
 RUN_ID="${DELIVER_RUN_ID:?}"
+RESUME="${DELIVER_RESUME:-0}"
+RETRY_ISSUE="${DELIVER_RETRY_ISSUE:-}"
 RUN_DIR="tmp/deliver/$RUN_ID"
 mkdir -p "$RUN_DIR"
 RUN_LOG="$RUN_DIR/run-$RUN_ID.jsonl"
@@ -182,9 +245,10 @@ trap 'rm -f "$RUN_DIR/lock" 2>/dev/null; review_cleanup; agent_cleanup; exit 130
 
 # ---------------------------------------------------------------------------
 # Run state (#61 S1): state.json (resume truth), events.jsonl, status.json,
-# lock. --resume (S3) is not implemented yet, so ACTIVE_SECONDS_BASE always
-# starts at 0 — a future --resume restores it from a prior run's state.json
-# before this point.
+# lock. A fresh run initializes all of it; --resume (S3) keeps the existing
+# state.json (issues and all), restores active_seconds, and only warns — it
+# never refuses — when this copy's plugin.json version differs from the one
+# the run started with.
 # ---------------------------------------------------------------------------
 START_EPOCH="$(date +%s)"
 ACTIVE_SECONDS_BASE=0
@@ -192,7 +256,23 @@ CUR_ISSUE=""
 RUNNER_VERSION="$(jq -r '.version // "unknown"' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null)"
 [[ -n "$RUNNER_VERSION" ]] || RUNNER_VERSION="unknown"
 echo $$ > "$RUN_DIR/lock"
-state_init "$RUN_DIR" "$MAP" "$BASE" "$RUN_ID" "$RUNNER_VERSION"
+if [[ "$RESUME" -eq 1 && -f "$RUN_DIR/state.json" ]]; then
+  RESUME_OLD_VERSION="$(jq -r '.runner_version // "unknown"' "$RUN_DIR/state.json")"
+  ACTIVE_SECONDS_BASE="$(jq -r '.active_seconds // 0' "$RUN_DIR/state.json" 2>/dev/null || echo 0)"
+  if [[ "$RESUME_OLD_VERSION" != "$RUNNER_VERSION" ]]; then
+    log "WARNING: plugin version changed since run $RUN_ID started ($RESUME_OLD_VERSION -> $RUNNER_VERSION) — resuming anyway."
+  fi
+  jq --arg v "$RUNNER_VERSION" '.runner_version = $v' "$RUN_DIR/state.json" > "$RUN_DIR/state.json.tmp" \
+    && mv "$RUN_DIR/state.json.tmp" "$RUN_DIR/state.json"
+  # A STOP file is this run's own instruction to itself, not GitHub's or the
+  # issue's; --resume is the human overriding it, so the old one (still on
+  # disk if that is why the run last stopped) must not immediately stop the
+  # resumed run again.
+  rm -f "$RUN_DIR/STOP"
+  state_event "$RUN_DIR" "" resumed "plugin version $RESUME_OLD_VERSION -> $RUNNER_VERSION"
+else
+  state_init "$RUN_DIR" "$MAP" "$BASE" "$RUN_ID" "$RUNNER_VERSION"
+fi
 
 # active_seconds_now — this run's persisted active time plus this process's
 # own elapsed time; the figure both the time cap and status.json report.
@@ -281,6 +361,7 @@ MAP_BODY="$RUN_DIR/map.body.md"
 MAP_PLAN="$RUN_DIR/map.plan.md"
 MERGED=()   # issue numbers merged by this run
 PARKED=()   # issue refs (#N) parked by this run
+CLOSED=()   # issue refs (#N) closed on the forge without this run's help
 PARK_REASON=""   # set by deliver_issue before it returns 10
 CUR_PR=""        # the PR of the issue in flight, once opened
 CUR_BRANCH=""    # its branch, once created
@@ -304,9 +385,6 @@ PROBLEMS="$(map_validate "$MAP_PLAN")" || die "map #$MAP is invalid: $(printf '%
 select_next_slice "$MAP_PLAN" >/dev/null; rc=$?
 [[ "$rc" -eq 2 ]] && die "map #$MAP has a dependency cycle in its after: edges"
 
-log "run $RUN_ID: map #$MAP into '$BASE' — verify='$VERIFY_CMD', $(grep -c '\[ \]' "$MAP_PLAN") issue(s) left"
-run_status running
-
 # tick_map <number> — tick the issue's Delivery line on the forge. Re-read,
 # change one line, write, read back; retried because a human editing the Map
 # at the same moment can silently drop our write (ADR-0008 decision 6).
@@ -321,6 +399,125 @@ tick_map() {
   done
   return 1
 }
+
+# record_merge <n> <pr> <branch> — after the PR for issue <n> is confirmed
+# MERGED, whether this run just merged it or --resume reconciliation found it
+# already was: fast-forward the base, drop the branch, tick the Map, comment
+# on the issue, update state.json. The one place both paths leave identical
+# bookkeeping behind.
+record_merge() {
+  local n="$1" pr="$2" branch="$3" merged_sha
+  git fetch -q origin && git merge -q --ff-only "origin/$BASE" \
+    || { log "#$n: cannot fast-forward '$BASE' to origin — stopping."; return 1; }
+  merged_sha="$(git rev-parse --short HEAD)"
+  if [[ -n "$branch" ]]; then
+    git branch -q -D "$branch" 2>/dev/null || true
+    forge_delete_remote_branch "$branch" || log "#$n: could not delete remote branch '$branch' (continuing)"
+  fi
+  MERGED+=("$n")
+  tick_map "$n" || log "#$n: could not tick map #$MAP (continuing; this run will not redeliver it)"
+  mkdir -p "$RUN_DIR/issues/$n"
+  {
+    echo "<!-- deliver:merged issue=$n pr=$pr -->"
+    printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
+      "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP"
+  } > "$RUN_DIR/issues/$n/issue-comment.md"
+  forge_issue_comment_has_marker "$n" "<!-- deliver:merged issue=$n pr=$pr -->" \
+    || forge_issue_comment "$n" "$RUN_DIR/issues/$n/issue-comment.md" || true
+  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$merged_sha" --argjson p "$pr" '{state:"merged", head:$h, pr:$p}')"
+  state_event "$RUN_DIR" "$n" merged ""
+  run_status running
+  log "#$n: merged as $merged_sha"
+  return 0
+}
+
+# reconcile_retry <n> <state_json_entry> — --retry '#N' (with --resume):
+# forget this issue's recorded branch/PR, close/delete what it left behind,
+# drop needs-human, and remove its old issues/<N>/ state so the graph walk
+# gives it a fresh inner run, as if it had never been attempted.
+reconcile_retry() {
+  local n="$1" entry="$2" branch pr
+  branch="$(jq -r '.branch // empty' <<<"$entry")"
+  pr="$(jq -r '.pr // empty' <<<"$entry")"
+  log "#$n: --retry — discarding the recorded branch/PR and starting a fresh inner run."
+  forge_issue_remove_label "$n" needs-human 2>/dev/null || true
+  [[ -n "$pr" ]] && { forge_pr_close "$pr" || log "#$n: could not close the old PR #$pr (continuing)"; }
+  if [[ -n "$branch" ]]; then
+    git branch -q -D "$branch" 2>/dev/null || true
+    forge_delete_remote_branch "$branch" || true
+  fi
+  jq --arg n "$n" 'del(.issues[$n])' "$RUN_DIR/state.json" > "$RUN_DIR/state.json.tmp" \
+    && mv "$RUN_DIR/state.json.tmp" "$RUN_DIR/state.json"
+  rm -rf "${RUN_DIR:?}/issues/$n"
+  state_event "$RUN_DIR" "$n" retry ""
+}
+
+# reconcile_run — --resume only, called once before the graph walk. Every
+# issue this run's state.json still calls non-terminal (not merged, not
+# parked) is checked against GitHub, which wins over whatever state.json last
+# recorded (docs/adr/0010-*.md): the Map tick or a MERGED PR settles it as
+# merged; the issue itself closed settles it as closed-externally (skipped
+# like a parked one, but no label or comment — a human closed it on purpose);
+# needs-human settles it as parked. Anything else — still building, a PR
+# still open, pushed with no PR yet — is left exactly as state.json has it;
+# deliver_issue's branch-exists dispatch picks it up again, lazily, the
+# moment the graph walk reaches it.
+reconcile_run() {
+  local n entry st branch pr
+  for n in $(jq -r '.issues | keys[]' "$RUN_DIR/state.json" 2>/dev/null); do
+    entry="$(jq -c --arg n "$n" '.issues[$n]' "$RUN_DIR/state.json")"
+    if [[ "$n" == "$RETRY_ISSUE" ]]; then
+      reconcile_retry "$n" "$entry"
+      RETRY_MATCHED=1
+      continue
+    fi
+    st="$(jq -r '.state // empty' <<<"$entry")"
+    if [[ "$st" == "merged" ]]; then MERGED+=("$n"); continue; fi
+    if [[ "$st" == "parked"  ]]; then PARKED+=("#$n"); continue; fi
+    mkdir -p "$RUN_DIR/issues/$n"
+    if ! forge_issue_json "$n" > "$RUN_DIR/issues/$n/issue.json" 2>/dev/null; then
+      log "#$n: --resume could not re-read the issue — leaving it as recorded ($st)."
+      continue
+    fi
+    if [[ "$(jq -r '.state' "$RUN_DIR/issues/$n/issue.json")" != "OPEN" ]]; then
+      log "#$n: closed on the forge since this run started — closed-externally, left alone."
+      CLOSED+=("#$n")
+      state_issue_update "$RUN_DIR" "$n" '{"state":"closed-external"}'
+      state_event "$RUN_DIR" "$n" closed-external ""
+      continue
+    fi
+    if jq -e '[.labels[]?.name] | index("needs-human")' "$RUN_DIR/issues/$n/issue.json" >/dev/null 2>&1; then
+      log "#$n: labelled needs-human — parked."
+      PARKED+=("#$n")
+      state_issue_update "$RUN_DIR" "$n" '{"state":"parked"}'
+      state_event "$RUN_DIR" "$n" parked "needs-human, found on --resume"
+      continue
+    fi
+    if map_is_ticked "$MAP_BODY" "$n"; then
+      log "#$n: already ticked on the Map — merged."
+      MERGED+=("$n")
+      state_issue_update "$RUN_DIR" "$n" '{"state":"merged"}'
+      continue
+    fi
+    branch="$(jq -r '.branch // empty' <<<"$entry")"
+    [[ -n "$branch" ]] || continue
+    if pr="$(forge_pr_for_branch "$branch")" && [[ "$(forge_pr_state "$pr")" == "MERGED" ]]; then
+      log "#$n: PR #$pr already merged — catching up the bookkeeping."
+      record_merge "$n" "$pr" "$branch" || die "#$n: --resume could not fast-forward '$BASE' after an already-merged PR"
+    fi
+  done
+  if [[ -n "$RETRY_ISSUE" && "${RETRY_MATCHED:-0}" -ne 1 ]]; then
+    die "--retry #$RETRY_ISSUE: no such issue in run $RUN_ID's state (nothing to retry)"
+  fi
+}
+
+if [[ "$RESUME" -eq 1 ]]; then
+  reconcile_run
+  refresh_map || die "cannot re-read map #$MAP after --resume reconciliation"
+fi
+
+log "run $RUN_ID: map #$MAP into '$BASE' — verify='$VERIFY_CMD', $(grep -c '\[ \]' "$MAP_PLAN") issue(s) left"
+run_status running
 
 # ---------------------------------------------------------------------------
 # Independent review of one PR head (review.sh). Returns 0 when the runner's
@@ -374,9 +571,35 @@ review_issue() {
 # ---------------------------------------------------------------------------
 # Returns 0 merged, 10 park (PARK_REASON says why), 11 already parked (left
 # alone, skipped with its dependents), 1 end the run.
+# ensure_pr_body <dir> <n> <head_sha> — (re)writes $dir/pr-body.md from the
+# issue's IMPLEMENTATION_PLAN.md and autopilot's status.json. Idempotent, so
+# both a fresh PR and a --resume that only needs to open the PR for an
+# already-pushed head call it the same way.
+ensure_pr_body() {
+  local dir="$1" n="$2" head_sha="$3" iters cost
+  iters="$(jq -r '.iterations_done // 0' "$dir/status.json" 2>/dev/null || echo 0)"
+  cost="$(jq -r '.total_cost_usd // 0' "$dir/status.json" 2>/dev/null || echo 0)"
+  {
+    echo "Refs #$n · Part of map #$MAP"
+    echo
+    echo "## What"
+    echo
+    grep -E '^[[:space:]]*[-*][[:space:]]+\[[xX]\]' "$dir/IMPLEMENTATION_PLAN.md" 2>/dev/null || echo "- (no plan items recorded)"
+    echo
+    echo "## Verification"
+    echo
+    echo "- \`$VERIFY_CMD\` passed on \`${head_sha:0:12}\`"
+    echo "- autopilot: ${iters:-0} iteration(s), \$${cost:-0}"
+    echo
+    echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
+  } > "$dir/pr-body.md"
+}
+
+# Returns 0 merged, 10 park (PARK_REASON says why), 11 already parked (left
+# alone, skipped with its dependents), 1 end the run.
 deliver_issue() {
   local id="$1" n dir line map_title issue_title labels state title branch
-  local pr head_sha status_state iters cost merged_sha
+  local pr="" head_sha status_state iters cost
   n="$(map_issue_number "$id")"
   dir="$RUN_DIR/issues/$n"
   mkdir -p "$dir"
@@ -407,117 +630,142 @@ deliver_issue() {
 
   check_caps "before a branch (#$n)"
 
-  # A branch left by an earlier attempt (a parked one, typically). Until
-  # resume exists (#61) the runner cannot tell whether that work should be
-  # continued or discarded, so it parks the issue — and only the issue.
-  if git rev-parse --verify -q "refs/heads/$branch" >/dev/null \
+  # A branch left by an earlier attempt. A --resume whose own state.json
+  # still names this exact branch for this issue continues it (docs/adr/
+  # 0010-*.md); any other leftover branch — a stray one, or this branch under
+  # a fresh (non-resuming) run — cannot be told apart from someone else's
+  # work, so it still parks the issue and only the issue (#58).
+  local resume_point="fresh"
+  if git rev-parse --verify -q "refs/heads/$branch" >/dev/null 2>&1 \
      || [[ -n "$(git ls-remote --heads origin "$branch" 2>/dev/null)" ]]; then
-    PARK_REASON="branch \`$branch\` from an earlier attempt still exists; delete it (locally and on origin), and close its PR if it has one, to start over — resuming it arrives with #61"
-    return 10
-  fi
-  log "#$n: $title → $branch"
-  git switch -q -c "$branch" "origin/$BASE" || return 1
-  CUR_BRANCH="$branch"
-  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg b "$branch" '{state:"building", branch:$b}')"
-
-  charter_from_issue "$dir/issue.json" "$MAP_PLAN" "$MAP" > "$dir/PROMPT.md"
-
-  # --- autopilot, one run per issue in its own state dir ---
-  # --extra-allowed-tools reaches autopilot's BUILD only — never the verifier
-  # or the reviewer, and it is the caller's to keep free of gh / git push
-  # (ADR-0007); the runner refuses such entries below.
-  # Indented line by line with a read loop, not sed: sed block-buffers into a
-  # pipe, and a run log behind `| tee` then stayed empty for half an hour.
-  local -a loop_timeout=() loop_pace=()
-  [[ -n "$PER_CALL_TIMEOUT" ]] && loop_timeout=(--per-call-timeout "$PER_CALL_TIMEOUT")
-  [[ "$PLAN_MAX_ITEMS" -gt 0 ]] && loop_pace+=(--plan-max-items "$PLAN_MAX_ITEMS")
-  if [[ "$VERIFY_EVERY_ITERATION" -eq 0 ]]; then
-    loop_pace+=(--verify-at-completion)
-    [[ -n "$ITERATION_VERIFY_CMD" ]] && loop_pace+=(--iteration-verify-cmd "$ITERATION_VERIFY_CMD")
-  fi
-  local -a loop_extra=()
-  [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
-  # Per-issue caps never exceed what the global --budget-usd / --max-minutes
-  # have left (#61); recorded on the issue's state before the call so a
-  # future --resume (S3) can see what this attempt was actually bounded by.
-  local issue_budget_eff issue_minutes_eff
-  issue_budget_eff="$(clipped_issue_budget)"
-  issue_minutes_eff="$(clipped_issue_minutes)"
-  state_issue_update "$RUN_DIR" "$n" \
-    "$(jq -cn --argjson b "$issue_budget_eff" --argjson m "$issue_minutes_eff" \
-         '{issue_budget_usd:$b, issue_max_minutes:$m}')"
-  bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
-    --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$issue_minutes_eff" \
-    --budget-usd "$issue_budget_eff" --stop-file "$RUN_DIR/STOP" \
-    ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
-    2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
-  local loop_rc=$?
-  status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
-  # loop.sh's own STOP-file exit is this run's stop, never a park (#61) — the
-  # STOP file it found is the same one check_caps below would find.
-  [[ "$loop_rc" -eq 6 ]] && stop_run 6 stopped
-  check_caps "after a build (#$n)"
-  # Exit 1 is autopilot refusing to start (its preconditions) — the machinery,
-  # not this issue. Anything else short of done is this issue not finishing.
-  if [[ "$loop_rc" -eq 1 ]]; then
-    log "#$n: autopilot refused to start (exit 1) — stopping the run. State: $dir"
-    return 1
-  fi
-  [[ -z "$(git status --porcelain)" ]] || { log "#$n: autopilot left a dirty tree — stopping."; return 1; }
-  if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
-    PARK_REASON="autopilot ended '$status_state' (exit $loop_rc) without finishing"
-    return 10
-  fi
-  if [[ "$(git rev-list --count "origin/$BASE..HEAD")" -eq 0 ]]; then
-    PARK_REASON="autopilot reported done without a single commit"
-    return 10
+    local known_branch=""
+    [[ "$RESUME" -eq 1 ]] && known_branch="$(jq -r --arg n "$n" '.issues[$n].branch // empty' "$RUN_DIR/state.json" 2>/dev/null)"
+    if [[ "$known_branch" != "$branch" ]]; then
+      PARK_REASON="branch \`$branch\` from an earlier attempt still exists; delete it (locally and on origin), and close its PR if it has one, to start over — --resume only continues a branch its own state.json recorded"
+      return 10
+    fi
+    CUR_BRANCH="$branch"
+    if pr="$(forge_pr_for_branch "$branch")"; then
+      resume_point="pr-open"
+    elif [[ -n "$(git ls-remote --heads origin "$branch" 2>/dev/null)" ]]; then
+      resume_point="pr-needed"
+    else
+      resume_point="building"
+    fi
+    log "#$n: --resume continuing \`$branch\` ($resume_point)"
   fi
 
-  # --- verify the exact head that will be merged ---
-  head_sha="$(git rev-parse HEAD)"
-  # Autopilot's BUILD may have edited what verify runs: no forge credentials.
-  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
-  local verify_rc=$?
-  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
-    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
-    return 1
-  fi
-  if [[ "$verify_rc" -ne 0 ]]; then
-    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
-    PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
-    return 10
-  fi
-  [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
-    || { log "#$n: verify changed the checkout — stopping."; return 1; }
+  if [[ "$resume_point" == "fresh" || "$resume_point" == "building" ]]; then
+    if [[ "$resume_point" == "fresh" ]]; then
+      log "#$n: $title → $branch"
+      git switch -q -c "$branch" "origin/$BASE" || return 1
+      CUR_BRANCH="$branch"
+    else
+      git switch -q "$branch" || return 1
+    fi
+    state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg b "$branch" '{state:"building", branch:$b}')"
+    [[ -f "$dir/PROMPT.md" ]] || charter_from_issue "$dir/issue.json" "$MAP_PLAN" "$MAP" > "$dir/PROMPT.md"
 
-  # --- PR ---
-  iters="$(jq -r '.iterations_done // 0' "$dir/status.json")"
-  cost="$(jq -r '.total_cost_usd // 0' "$dir/status.json")"
-  {
-    echo "Refs #$n · Part of map #$MAP"
-    echo
-    echo "## What"
-    echo
-    grep -E '^[[:space:]]*[-*][[:space:]]+\[[xX]\]' "$dir/IMPLEMENTATION_PLAN.md" 2>/dev/null || echo "- (no plan items recorded)"
-    echo
-    echo "## Verification"
-    echo
-    echo "- \`$VERIFY_CMD\` passed on \`${head_sha:0:12}\`"
-    echo "- autopilot: $iters iteration(s), \$$cost"
-    echo
-    echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
-  } > "$dir/pr-body.md"
+    # --- autopilot, one run per issue in its own state dir ---
+    # --extra-allowed-tools reaches autopilot's BUILD only — never the verifier
+    # or the reviewer, and it is the caller's to keep free of gh / git push
+    # (ADR-0007); the runner refuses such entries below.
+    # Indented line by line with a read loop, not sed: sed block-buffers into a
+    # pipe, and a run log behind `| tee` then stayed empty for half an hour.
+    local -a loop_timeout=() loop_pace=()
+    [[ -n "$PER_CALL_TIMEOUT" ]] && loop_timeout=(--per-call-timeout "$PER_CALL_TIMEOUT")
+    [[ "$PLAN_MAX_ITEMS" -gt 0 ]] && loop_pace+=(--plan-max-items "$PLAN_MAX_ITEMS")
+    if [[ "$VERIFY_EVERY_ITERATION" -eq 0 ]]; then
+      loop_pace+=(--verify-at-completion)
+      [[ -n "$ITERATION_VERIFY_CMD" ]] && loop_pace+=(--iteration-verify-cmd "$ITERATION_VERIFY_CMD")
+    fi
+    local -a loop_extra=()
+    [[ -n "$EXTRA_ALLOWED_TOOLS" ]] && loop_extra=(--extra-allowed-tools "$EXTRA_ALLOWED_TOOLS")
+    local -a loop_resume=()
+    [[ "$resume_point" == "building" ]] && loop_resume=(--resume-run)
+    # Per-issue caps never exceed what the global --budget-usd / --max-minutes
+    # have left (#61); recorded on the issue's state before the call so a
+    # --resume can see what this attempt was actually bounded by.
+    local issue_budget_eff issue_minutes_eff
+    issue_budget_eff="$(clipped_issue_budget)"
+    issue_minutes_eff="$(clipped_issue_minutes)"
+    state_issue_update "$RUN_DIR" "$n" \
+      "$(jq -cn --argjson b "$issue_budget_eff" --argjson m "$issue_minutes_eff" \
+           '{issue_budget_usd:$b, issue_max_minutes:$m}')"
+    bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
+      --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$issue_minutes_eff" \
+      --budget-usd "$issue_budget_eff" --stop-file "$RUN_DIR/STOP" \
+      ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} ${loop_resume[@]+"${loop_resume[@]}"} \
+      2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
+    local loop_rc=$?
+    status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
+    # loop.sh's own STOP-file exit is this run's stop, never a park (#61) — the
+    # STOP file it found is the same one check_caps below would find.
+    [[ "$loop_rc" -eq 6 ]] && stop_run 6 stopped
+    check_caps "after a build (#$n)"
+    # Exit 1 is autopilot refusing to start (its preconditions) — the machinery,
+    # not this issue. Anything else short of done is this issue not finishing.
+    if [[ "$loop_rc" -eq 1 ]]; then
+      log "#$n: autopilot refused to start (exit 1) — stopping the run. State: $dir"
+      return 1
+    fi
+    [[ -z "$(git status --porcelain)" ]] || { log "#$n: autopilot left a dirty tree — stopping."; return 1; }
+    if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
+      PARK_REASON="autopilot ended '$status_state' (exit $loop_rc) without finishing"
+      return 10
+    fi
+    if [[ "$(git rev-list --count "origin/$BASE..HEAD")" -eq 0 ]]; then
+      PARK_REASON="autopilot reported done without a single commit"
+      return 10
+    fi
 
-  check_caps "before a PR (#$n)"
-  forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
-  pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
-    || { log "#$n: opening the PR failed — stopping."; return 1; }
+    # --- verify the exact head that will be merged ---
+    head_sha="$(git rev-parse HEAD)"
+    # Autopilot's BUILD may have edited what verify runs: no forge credentials.
+    agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
+    local verify_rc=$?
+    if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
+      log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
+      return 1
+    fi
+    if [[ "$verify_rc" -ne 0 ]]; then
+      [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
+      PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
+      return 10
+    fi
+    [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
+      || { log "#$n: verify changed the checkout — stopping."; return 1; }
+
+    ensure_pr_body "$dir" "$n" "$head_sha"
+    check_caps "before a PR (#$n)"
+    forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
+    pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
+      || { log "#$n: opening the PR failed — stopping."; return 1; }
+  elif [[ "$resume_point" == "pr-needed" ]]; then
+    # Pushed on an earlier attempt, never got as far as opening the PR.
+    head_sha="$(git ls-remote --heads origin "$branch" 2>/dev/null | awk '{print $1}')"
+    [[ -n "$head_sha" ]] || { log "#$n: pushed branch \`$branch\` has no remote head — stopping."; return 1; }
+    ensure_pr_body "$dir" "$n" "$head_sha"
+    check_caps "before a PR (#$n)"
+    pr="$(forge_pr_create "$BASE" "$branch" "$title" "$dir/pr-body.md")" \
+      || { log "#$n: opening the PR failed — stopping."; return 1; }
+  else
+    # resume_point == pr-open: an earlier attempt already opened PR $pr.
+    head_sha="$(git ls-remote --heads origin "$branch" 2>/dev/null | awk '{print $1}')"
+    [[ -n "$head_sha" ]] || { log "#$n: PR #$pr's branch \`$branch\` has no remote head — stopping."; return 1; }
+    ensure_pr_body "$dir" "$n" "$head_sha"
+  fi
+
   CUR_PR="$pr"
-  log "#$n: PR #$pr opened"
+  log "#$n: PR #$pr open"
   state_issue_update "$RUN_DIR" "$n" "$(jq -cn --argjson p "$pr" '{state:"pr-open", pr:$p}')"
   state_event "$RUN_DIR" "$n" pr-open ""
 
   # --- independent review of the pushed head, before anything merges ---
+  # Review round is always 1 — fix rounds arrive with #63 — so a --resume
+  # re-entering here recomputes the exact same marker (#61 S2) and never
+  # posts the review comment twice, whether or not the earlier attempt
+  # managed to post it before it was interrupted.
   check_caps "before a review (#$n)"
   state_issue_update "$RUN_DIR" "$n" '{"state":"reviewing","round":1}'
   review_issue "$n" "$pr" "$(git rev-parse "origin/$BASE")" "$head_sha" "$dir"
@@ -533,26 +781,7 @@ deliver_issue() {
     return 10
   fi
   [[ "$(forge_pr_state "$pr")" == "MERGED" ]] || { log "#$n: PR #$pr is not MERGED after merge — stopping."; return 1; }
-
-  git fetch -q origin && git merge -q --ff-only "origin/$BASE" \
-    || { log "#$n: cannot fast-forward '$BASE' to origin — stopping."; return 1; }
-  merged_sha="$(git rev-parse --short HEAD)"
-  git branch -q -D "$branch" 2>/dev/null || true
-  forge_delete_remote_branch "$branch" || log "#$n: could not delete remote branch '$branch' (continuing)"
-
-  MERGED+=("$n")
-  tick_map "$n" || log "#$n: could not tick map #$MAP (continuing; this run will not redeliver it)"
-  {
-    echo "<!-- deliver:merged issue=$n pr=$pr -->"
-    printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
-      "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP"
-  } > "$dir/issue-comment.md"
-  forge_issue_comment_has_marker "$n" "<!-- deliver:merged issue=$n pr=$pr -->" \
-    || forge_issue_comment "$n" "$dir/issue-comment.md" || true
-  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$merged_sha" '{state:"merged", head:$h}')"
-  state_event "$RUN_DIR" "$n" merged ""
-  run_status running
-  log "#$n: merged as $merged_sha"
+  record_merge "$n" "$pr" "$branch" || return 1
   return 0
 }
 
@@ -595,7 +824,7 @@ park_issue() {
       jq -r '"- Autopilot: state `\(.state)`, \(.iterations_done) iteration(s), $\(.total_cost_usd)"' "$st" 2>/dev/null
     fi
     echo "- Issues that wait on this one are skipped in this run; independent ones continue."
-    echo "- To retry: resolve the cause, delete the issue branch${CUR_BRANCH:+ \`$CUR_BRANCH\`} (locally and on origin)${CUR_PR:+ and close PR #$CUR_PR}, remove \`needs-human\`, and run /deliver on map #$MAP again. While the label is on, /deliver leaves this issue alone."
+    echo "- To retry: \`/deliver --map $MAP --resume --retry '#$n'\` — it removes \`needs-human\`, discards this attempt's branch${CUR_PR:+ and PR #$CUR_PR} for you, and starts a fresh one. While the label is on, a plain \`--resume\` leaves this issue alone."
     if [[ -s "$dir/FEEDBACK.md" ]]; then
       local fence
       fence="$(tail -n 40 "$dir/FEEDBACK.md" | md_tilde_fence)"
@@ -624,12 +853,13 @@ finish() {
   for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
     [[ "${PLAN_ROW_TICKED[$i]}" == "1" ]] && continue
     [[ " ${PARKED[*]:-} " == *" ${PLAN_IDS[$i]} "* ]] && continue
+    [[ " ${CLOSED[*]:-} " == *" ${PLAN_IDS[$i]} "* ]] && continue
     skipped+=("${PLAN_IDS[$i]}")
   done
-  log "map #$MAP: ${#MERGED[@]} merged this run${PARKED[*]:+, parked: ${PARKED[*]}}${skipped[*]:+, skipped (blocked by a parked issue): ${skipped[*]}}."
+  log "map #$MAP: ${#MERGED[@]} merged this run${PARKED[*]:+, parked: ${PARKED[*]}}${CLOSED[*]:+, closed-externally: ${CLOSED[*]}}${skipped[*]:+, skipped (blocked by a parked issue): ${skipped[*]}}."
   CUR_ISSUE=""
   state_set_active_seconds "$RUN_DIR" "$(active_seconds_now)"
-  if [[ ${#PARKED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]]; then
+  if [[ ${#PARKED[@]} -eq 0 && ${#CLOSED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]]; then
     run_status done
     exit 0
   fi
@@ -645,9 +875,10 @@ while :; do
   # The Map may have been edited since the last issue; a duplicate or a bad
   # ref should stop the run with its own name, not as a confusing later error.
   PROBLEMS="$(map_validate "$MAP_PLAN")" || die "map #$MAP became invalid mid-run: $(printf '%s' "$PROBLEMS" | tr '\n' ';')"
-  # Parked issues are passed as parked slices: select_next_slice never picks
-  # them or anything that waits on them (rc 3 once only those are left).
-  NEXT="$(select_next_slice "$MAP_PLAN" "$(IFS=,; echo "${PARKED[*]:-}")")"; rc=$?
+  # Parked and closed-externally issues are passed as blocked slices:
+  # select_next_slice never picks them or anything that waits on them (rc 3
+  # once only those are left).
+  NEXT="$(select_next_slice "$MAP_PLAN" "$(IFS=,; echo "${PARKED[*]:-} ${CLOSED[*]:-}" | tr ' ' ',')")"; rc=$?
   case "$rc" in
     0) ;;
     1|3) finish ;;
