@@ -1350,4 +1350,93 @@ jq -e '(.issues["1"].issue_budget_usd // 10) < 10 and (.issues["2"].issue_budget
   && ok "clipped per-issue caps are recorded on state.json: less than the default --issue-budget-usd (10)" \
   || note "clipped caps: issues=$(jq -c .issues "${BDRUNDIR}state.json" 2>/dev/null)"
 
+# --- #61 S3: --resume after the runner is killed right after a PR opens -------
+RC1="$(cat "$WORK/killresume/rc1")"
+RC="$(cat "$WORK/killresume/rc")"
+KR="$WORK/killresume"
+[[ "$RC1" -ge 128 ]] \
+  && ok "kill+resume: the first attempt is killed right after PR #4 opens (terminated by signal)" \
+  || note "kill+resume: first attempt exited $RC1 (expected a signal kill)"
+[[ "$RC" -eq 0 ]] \
+  && ok "kill+resume: --resume finishes the run (exit 0)" \
+  || note "kill+resume: --resume exited $RC — $(tail -3 "$KR/err" | tr '\n' '|')"
+[[ "$(jq -r .state "$KR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$KR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "kill+resume: both issues' PRs end up merged" \
+  || note "kill+resume: PR states #4=$(jq -r .state "$KR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$KR/gh/prs/5.json" 2>/dev/null)"
+[[ "$(jq -r '.comments | length' "$KR/gh/prs/4.json" 2>/dev/null)" -eq 1 ]] \
+  && [[ "$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)" -eq 2 ]] \
+  && ok "kill+resume: the issue resumed at pr-open gets exactly one PR and one review comment, not two" \
+  || note "kill+resume: PR #4 comments=$(jq -r '.comments|length' "$KR/gh/prs/4.json" 2>/dev/null), pr-create calls=$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)"
+
+# --- #61 S3: --resume after a global budget cap ---------------------------------
+RC1="$(cat "$WORK/budgetresume/rc1")"
+RC="$(cat "$WORK/budgetresume/rc")"
+BR="$WORK/budgetresume"
+[[ "$RC1" -eq 4 ]] \
+  && ok "budget+resume: a small global budget trips after the first issue (exit 4)" \
+  || note "budget+resume: first attempt exited $RC1"
+[[ "$RC" -eq 0 ]] \
+  && ok "budget+resume: --resume with a larger --budget-usd finishes the run (exit 0)" \
+  || note "budget+resume: --resume exited $RC — $(tail -3 "$BR/err" | tr '\n' '|')"
+[[ "$(jq -r .state "$BR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$BR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "budget+resume: both issues end up merged" \
+  || note "budget+resume: PR states #4=$(jq -r .state "$BR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$BR/gh/prs/5.json" 2>/dev/null)"
+
+# --- #61 S3: --resume after a STOP file -----------------------------------------
+RC1="$(cat "$WORK/stopresume/rc1")"
+RC="$(cat "$WORK/stopresume/rc")"
+SR="$WORK/stopresume"
+[[ "$RC1" -eq 6 ]] \
+  && ok "stop+resume: a STOP file present before the first issue stops the run (exit 6)" \
+  || note "stop+resume: first attempt exited $RC1"
+[[ "$RC" -eq 0 ]] \
+  && ok "stop+resume: --resume after a STOP finishes the run (exit 0)" \
+  || note "stop+resume: --resume exited $RC — $(tail -3 "$SR/err" | tr '\n' '|')"
+[[ "$(jq -r .state "$SR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$SR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "stop+resume: both issues end up merged" \
+  || note "stop+resume: PR states #4=$(jq -r .state "$SR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$SR/gh/prs/5.json" 2>/dev/null)"
+
+# --- #61 S3: --resume refuses a live lock, removes a stale one ------------------
+RC="$(cat "$WORK/locklive/rc")"
+LL="$WORK/locklive"
+[[ "$RC" -eq 1 ]] && grep -q 'refusing to resume a live run' "$LL/err" \
+  && ok "resume: a lock whose pid is still alive is refused, not removed" \
+  || note "live lock: exit $RC — $(tail -3 "$LL/err" | tr '\n' '|')"
+
+RC="$(cat "$WORK/lockstale/rc")"
+LS="$WORK/lockstale"
+[[ "$RC" -eq 0 ]] \
+  && ok "resume: a stale lock (dead pid) is removed and the run proceeds (exit 0)" \
+  || note "stale lock: exit $RC — $(tail -3 "$LS/err" | tr '\n' '|')"
+grep -q 'removing a stale lock' "$LS/err" \
+  && ok "resume: the stale-lock removal is logged" \
+  || note "stale lock: no removal message: $(tail -3 "$LS/err" | tr '\n' '|')"
+grep -q "plugin version changed since run fakerun-stale started (0.0.0-test -> $REAL_PLUGIN_VERSION)" "$LS/err" \
+  && ok "resume: a plugin.json version different from the one state.json recorded is warned about, not refused" \
+  || note "version warning: $(grep -o 'plugin version changed.*' "$LS/err" | head -1)"
+
+# --- #61 S3: --retry '#N' on a parked issue starts a fresh inner run ------------
+RC1="$(cat "$WORK/retry/rc1")"
+RC="$(cat "$WORK/retry/rc")"
+RT="$WORK/retry"
+# parked_one checks issue #1's *current* state, which --retry has since moved
+# on from (needs-human removed, Map line ticked) — this checks the historical
+# park comment instead, which --retry never removes.
+[[ "$RC1" -eq 2 ]] \
+  && jq -r '[.comments[].body] | join("\n")' "$RT/gh/issues/1.json" | grep -q '^\*\*Parked by `/deliver`\*\*' \
+  && ok "retry: the first attempt stalls on #1, parks it, still delivers independent #4 (exit 2)" \
+  || note "retry: first attempt exited $RC1"
+[[ "$RC" -eq 0 ]] \
+  && ok "retry: --resume --retry '#1' finishes the run (exit 0)" \
+  || note "retry: --resume --retry exited $RC — $(tail -3 "$RT/err" | tr '\n' '|')"
+MAPB_RT="$(jq -r .body "$RT/gh/issues/3.json")"
+[[ "$MAPB_RT" == *"- [x] #1 "* && "$MAPB_RT" == *"- [x] #2 "* && "$MAPB_RT" == *"- [x] #4 "* ]] \
+  && [[ "$(jq -r '[.labels[].name] | index("needs-human")' "$RT/gh/issues/1.json")" == "null" ]] \
+  && ok "retry: #1 is delivered on a fresh branch, #2 (after #1) follows, needs-human is gone" \
+  || note "retry: map=$(printf '%s' "$MAPB_RT" | grep '#' | tr '\n' '|') labels=$(jq -c '[.labels[].name]' "$RT/gh/issues/1.json")"
+RTRUNDIR="$(ls -d "$RT"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+grep -q '"issue":1,"event":"retry"' "${RTRUNDIR}events.jsonl" 2>/dev/null \
+  && ok "retry: the retry transition for #1 is recorded in events.jsonl" \
+  || note "retry: events.jsonl missing a retry row for #1: $(tr '\n' '|' < "${RTRUNDIR}events.jsonl" 2>/dev/null)"
+
 finish
