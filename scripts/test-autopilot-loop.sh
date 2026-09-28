@@ -137,6 +137,16 @@ case "$prompt" in
     elif [[ "${STUB_SECRET_MODE:-}" == "untracked" ]]; then
       printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret_untracked.txt
     fi
+    # S2 (issue #54): simulate a BUILD that commits a (non-secret) change
+    # itself, moving HEAD before the runner's own `git add -A`/checkpoint —
+    # the verifier's prompt must still diff the whole iteration against
+    # ITER_BASE_SHA (recorded before this call ran), not HEAD, or a
+    # same-iteration BUILD commit would make the change invisible to it.
+    if [[ -n "${STUB_BUILD_SELF_COMMIT_FILE:-}" ]]; then
+      printf 'build committed this itself\n' > "$STUB_BUILD_SELF_COMMIT_FILE"
+      git add "$STUB_BUILD_SELF_COMMIT_FILE" >/dev/null 2>&1
+      git commit -q -m "build: self-commit" >/dev/null 2>&1
+    fi
     # R1 (runner self-reload): simulate a slice whose own job is to edit
     # loop.sh, exactly once, guarded by a flag file so it doesn't keep
     # editing on every subsequent iteration (which would never converge).
@@ -183,6 +193,20 @@ case "$prompt" in
     emit '"built"'
     ;;
   *"verdict"*|*"shortcut"*|*"Verdict"*)
+    # S2 (issue #54): the stub verifier plays along with the prompt's own
+    # instructions — it extracts the `git diff --cached <sha>` command the
+    # prompt tells it to run and actually runs it (read-only, same as the
+    # real verifier's allowlist), so the outer test can assert on what a
+    # verifier obeying the prompt would actually have seen, not just on the
+    # prompt text containing a SHA.
+    if [[ -n "${STUB_VERIFY_DIFF_LOG:-}" ]]; then
+      diff_cmd_seen="$(printf '%s' "$prompt" | grep -oE 'git diff --cached [0-9a-f]{7,40}' | head -1)"
+      if [[ -n "$diff_cmd_seen" ]]; then
+        $diff_cmd_seen > "$STUB_VERIFY_DIFF_LOG" 2>&1
+      else
+        : > "$STUB_VERIFY_DIFF_LOG"
+      fi
+    fi
     # R2: a verifier that declines to judge (prose, a clarifying question, no
     # parseable `.pass`) must be told apart from a real {"pass": false} — the
     # three STUB_VERIFY_* knobs below simulate each shape the runner has to
@@ -1512,6 +1536,23 @@ grep -q 'ONE iteration of an autonomous BUILD loop' "$WORK/r1.calls" 2>/dev/null
 grep -qF 'Do not run `git add` or `git commit`' "$WORK/r1.calls" 2>/dev/null \
   && ok "the BUILD prompt tells BUILD the runner stages and commits the checkpoint" \
   || note "the BUILD prompt doesn't mention the runner owning the commit"
+
+# --- 34. S2 (#54): the verifier diffs the whole iteration against ----------
+# ITER_BASE_SHA, not HEAD — a change BUILD committed itself must still be
+# visible to the verifier, exactly as it must to the secret scan (test 33a).
+R34="$WORK/r34"; new_repo "$R34"
+PRE_SHA_34="$(git -C "$R34" rev-parse HEAD)"
+( cd "$R34" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    STUB_BUILD_SELF_COMMIT_FILE="build-own-commit.txt" \
+    STUB_VERIFY_DIFF_LOG="$WORK/r34-verify.diff" STUB_CALL_LOG="$WORK/r34.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r34.out" 2>"$WORK/r34.err" )
+grep -qF "git diff --cached $PRE_SHA_34" "$WORK/r34.calls" 2>/dev/null \
+  && ok "the verifier's prompt names the pre-BUILD SHA (ITER_BASE_SHA), not HEAD" \
+  || note "verifier prompt doesn't name $PRE_SHA_34: $(grep -oE 'git diff[^\`]*' "$WORK/r34.calls" 2>/dev/null | sort -u | tr '\n' ' ')"
+grep -qF "build-own-commit.txt" "$WORK/r34-verify.diff" 2>/dev/null \
+  && ok "running the prompt's own diff command shows the file BUILD committed itself" \
+  || note "the prompt's diff command missed BUILD's own commit: $(cat "$WORK/r34-verify.diff" 2>/dev/null)"
 
 # --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and

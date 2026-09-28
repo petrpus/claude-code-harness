@@ -106,7 +106,11 @@ loop:
                                       staged since ITER_BASE_SHA, including
                                       new untracked files and anything BUILD
                                       would otherwise have committed itself
-  GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict
+  GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict;
+                                      told to run `git diff --cached ITER_BASE_SHA`
+                                      (not `git diff HEAD`) — same base as gate c,
+                                      so a same-iteration BUILD commit is still
+                                      in view
   GATE e  holdout          haiku     same call as gate d — HOLDOUT.md's content
                                       inlined into the verifier prompt only, if any
   then, gates green:
