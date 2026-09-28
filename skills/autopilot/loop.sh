@@ -272,8 +272,18 @@ HOLDOUT_NOTICE_SHOWN=0
 # ---------------------------------------------------------------------------
 # Logging + status helpers.
 # ---------------------------------------------------------------------------
-now_epoch() { date +%s 2>/dev/null || echo 0; }
-START_EPOCH="$(now_epoch)"
+# The clock is read with bash's own printf (bash >= 4.2), not `date`: no
+# external program, no fork that can fail under load. It used to be
+# `date +%s || echo 0`, and a failed read at startup made START_EPOCH 0 — the
+# first cap check then reported ~29 million minutes elapsed and ended a
+# healthy run as "time-cap" (#78).
+now_epoch() { local t; printf -v t '%(%s)T' -1; echo "$t"; }
+printf -v START_EPOCH '%(%s)T' -1
+# A start time that is not a plausible epoch is never used for a cap.
+if [[ ! "$START_EPOCH" =~ ^[0-9]+$ ]] || (( START_EPOCH < 1000000000 )); then
+  log_err "cannot read the clock (got '$START_EPOCH') — refusing to start rather than misreport a time cap."
+  exit 1
+fi
 
 logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \

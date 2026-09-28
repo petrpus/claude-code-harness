@@ -99,7 +99,7 @@ agent_run() {
   local t0 t1 out rc errlog="${AGENT_STDERR_LOG:-/dev/null}"
   # Resolve a relative log path before the call changes directory into cwd.
   [[ "$errlog" == /* ]] || errlog="$PWD/$errlog"
-  t0="$(date +%s 2>/dev/null || echo 0)"
+  printf -v t0 '%(%s)T' -1   # builtin clock: no fork, no `date` (#78)
   if [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]]; then
     echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
     out='{"result":"dry-run","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}'
@@ -123,7 +123,7 @@ agent_run() {
     )"
     rc=$?
   fi
-  t1="$(date +%s 2>/dev/null || echo 0)"
+  printf -v t1 '%(%s)T' -1
 
   AGENT_LAST_RC="$rc"
   AGENT_LAST_JSON="$out"

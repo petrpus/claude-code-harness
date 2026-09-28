@@ -1220,6 +1220,31 @@ esac
   && ok "--dry-run spends \$0 and records no timed verifier call" \
   || note "--dry-run recorded a cost or a timed verifier call"
 
+# --- 30. the clock does not depend on `date` (#78) --------------------------
+# now_epoch used to be `date +%s || echo 0`: one failed `date` at startup made
+# START_EPOCH 0 and the first cap check exited 3 ("time cap") on a healthy
+# run. The stub `date` fails only its FIRST `+%s` read — the startup one —
+# and answers every later one, which is exactly the shape of that bug (a
+# `date` that always fails reads 0 twice and hides it).
+DATE_BIN="$WORK/brokendate"; mkdir -p "$DATE_BIN"
+REAL_DATE="$(command -v date)"
+cat > "$DATE_BIN/date" <<DATESTUB
+#!/bin/sh
+if [ "\$1" = "+%s" ] && [ ! -f "$WORK/date-failed-once" ]; then
+  : > "$WORK/date-failed-once"; exit 1
+fi
+exec "$REAL_DATE" "\$@"
+DATESTUB
+chmod +x "$DATE_BIN/date"; rm -f "$WORK/date-failed-once"
+R30="$WORK/r30"; new_repo "$R30"
+( cd "$R30" && PATH="$DATE_BIN:$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r30.out" 2>"$WORK/r30.err" )
+RC30=$?
+[[ "$RC30" -eq 0 ]] && ! grep -q 'time cap' "$WORK/r30.err" \
+  && ok "a \`date\` that fails once at startup no longer ends a healthy run as a time cap (exit 0)" \
+  || note "with a failing date: exit $RC30 — $(grep -m1 'cap\|clock' "$WORK/r30.err")"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "test-autopilot-loop: PASS"
