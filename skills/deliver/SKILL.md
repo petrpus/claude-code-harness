@@ -19,8 +19,8 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
-> independent review (#59), parking (#58) and final-verify's base-moved
-> handling and merge retry (#60, partial). Not yet: CI wait, review fix
+> independent review (#59), parking (#58), final-verify's base-moved
+> handling and merge retry, and the CI wait (#60, partial). Not yet: CI fix
 > rounds, resume, the tmux launcher.
 
 ## When an issue does not make it
@@ -29,13 +29,13 @@ An issue that cannot reach its merge is **parked** and the run carries on:
 autopilot did not finish (stuck, or an iteration / time / budget cap), it
 finished without a commit, verify failed on its head, the review held its PR
 (changes requested, or no usable verdict twice), the integration branch moved
-into a conflict, or the forge refused the merge twice. Before merging,
-**final-verify** re-fetches and, if the integration branch moved, merges it
-into the issue branch (a conflict parks the issue; a clean merge is
-re-verified and pushed); a merge the forge refuses goes back through
-final-verify once — a repo whose branch protection forbids squash merges gets
-a plain `--merge` instead, tried automatically, before that ever counts as a
-refusal. Parking:
+into a conflict, CI failed or stayed pending past `--ci-timeout`, or the forge
+refused the merge twice. Before merging, **final-verify** re-fetches and, if
+the integration branch moved, merges it into the issue branch (a conflict
+parks the issue; a clean merge is re-verified and pushed); a merge the forge
+refuses goes back through final-verify once — a repo whose branch protection
+forbids squash merges gets a plain `--merge` instead, tried automatically,
+before that ever counts as a refusal. Parking:
 
 - labels the issue `needs-human` (created if the repo lacks it) and removes
   `ready-for-agent`;
@@ -61,7 +61,8 @@ issue's fault: it ends the run with exit 1, where it is.
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
      [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
-     [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
+     [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
+     [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -108,6 +109,21 @@ says "approve" still holds the PR. A reply with no usable verdict is retried
 once, then holds the PR (fail closed). The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
+
+## The CI wait
+
+Once the review approves, `ci_wait` polls `gh pr checks` (`forge_pr_checks`)
+every `--ci-poll-seconds` (default 30) before the PR may merge:
+
+- **no check reported at all** once `--ci-grace-seconds` (default 120) has
+  passed is **"no CI"** — the runner logs it (`ci` phase, verdict `none`) and
+  merges anyway, noting `CI: no CI reported.` on the issue's merge comment;
+- **all reported checks pass** (nothing left `pending`): merges, logged with
+  verdict `pass`;
+- **any reported check fails**: parks with the failed checks' names in the
+  reason (a fix round arrives with #63); logged with verdict `fail`;
+- **still `pending` past `--ci-timeout`** (default 1800 s): parks ("CI still
+  pending after …"); logged with verdict `timeout`.
 
 **Pacing.** An issue is already one PR-sized slice, so by default autopilot
 gets `--plan-max-items 3` (a small plan; `--plan-max-items 0` lifts it) and

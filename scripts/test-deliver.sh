@@ -361,6 +361,20 @@ case "$cmd" in
     echo "https://github.com/o/r/pull/$n" ;;
   "pr view")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; cat "$f" ;;
+  "pr checks")
+    n="$1"; f="$S/prs/$n.json"; [[ -f "$f" ]] || exit 1
+    # A per-PR checks script at $S/ci/<n>: one JSON array of
+    # {name,state,bucket,link} per line, one per poll — the last line
+    # repeats once the script is exhausted. No script file at all: no
+    # checks reported (ci_wait's "no CI" / grace path); like real gh,
+    # nothing goes to stdout.
+    script="$S/ci/$n"
+    [[ -f "$script" ]] || { echo "no checks reported on the '$n' branch" >&2; exit 8; }
+    cnt="$(( $(cat "$S/ci/$n.count" 2>/dev/null || echo 0) + 1 ))"
+    echo "$cnt" > "$S/ci/$n.count"
+    total="$(wc -l < "$script" | tr -d ' ')"
+    [[ "$cnt" -gt "$total" ]] && cnt="$total"
+    sed -n "${cnt}p" "$script" ;;
   "pr comment")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -789,6 +803,44 @@ job_baseadv_conflict() {
   echo $? > "$WORK/baseadvconflict/rc"
 }
 
+# --- ci_wait (#60): PR #4 is always issue #1's, #5 issue #2's (deterministic
+# next_num order — see new_fixture). A fixture's $gh/ci/<pr> file is the fake
+# gh's per-PR checks script: one JSON array of {name,state,bucket,link} per
+# poll, repeating its last line once exhausted; no file at all is "no checks
+# reported" (ci_wait's grace / "no CI" path). --ci-poll-seconds 0 and
+# --ci-grace-seconds 0 keep the polling loop instant in tests.
+job_ci_none() {
+  new_fixture cinone
+  run_deliver cinone -- --ci-poll-seconds 0 --ci-grace-seconds 0
+  echo $? > "$WORK/cinone/rc"
+}
+job_ci_pending_green() {
+  new_fixture cigreen
+  mkdir -p "$WORK/cigreen/gh/ci"
+  printf '%s\n%s\n' \
+    '[{"name":"build","state":"IN_PROGRESS","bucket":"pending","link":"http://x/1"}]' \
+    '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"http://x/1"}]' \
+    > "$WORK/cigreen/gh/ci/4"
+  run_deliver cigreen -- --ci-poll-seconds 0 --ci-grace-seconds 0
+  echo $? > "$WORK/cigreen/rc"
+}
+job_ci_fail() {
+  new_fixture cifail
+  mkdir -p "$WORK/cifail/gh/ci"
+  printf '%s\n' '[{"name":"build","state":"FAILURE","bucket":"fail","link":"http://x/1"}]' \
+    > "$WORK/cifail/gh/ci/4"
+  run_deliver cifail -- --ci-poll-seconds 0 --ci-grace-seconds 0
+  echo $? > "$WORK/cifail/rc"
+}
+job_ci_timeout() {
+  new_fixture citimeout
+  mkdir -p "$WORK/citimeout/gh/ci"
+  printf '%s\n' '[{"name":"build","state":"IN_PROGRESS","bucket":"pending","link":"http://x/1"}]' \
+    > "$WORK/citimeout/gh/ci/4"
+  run_deliver citimeout -- --ci-poll-seconds 1 --ci-timeout 1 --ci-grace-seconds 0
+  echo $? > "$WORK/citimeout/rc"
+}
+
 bg job_happy
 bg job_extra
 for i in "${!EXTRABAD_VALUES[@]}"; do bg job_extrabad "$i" "${EXTRABAD_VALUES[$i]}"; done
@@ -827,6 +879,10 @@ bg job_refusedonce
 bg job_squash
 bg job_baseadv_clean
 bg job_baseadv_conflict
+bg job_ci_none
+bg job_ci_pending_green
+bg job_ci_fail
+bg job_ci_timeout
 wait
 
 # ===========================================================================
@@ -1212,5 +1268,43 @@ LOG_BC="$(git -C "$BC/remote.git" log --format=%s main..integration/x 2>/dev/nul
   && grep -qx 'feat: independent thing (#5)' <<<"$LOG_BC" \
   && ok "a conflicting base move aborts the merge, parks the issue (no PR ever opened) and lets an independent issue still merge" \
   || note "base-advance conflict: exit $RC, #1 comment: $(head -3 <<<"$C1_BC" | tr '\n' '|'), log: $(tr '\n' '|' <<<"$LOG_BC")"
+
+# --- ci_wait (#60) ------------------------------------------------------------
+# no checks reported at all: "no CI", both issues merge anyway.
+CN="$WORK/cinone"
+RC="$(cat "$CN/rc")"
+CN_RUNDIR="$(ls -d "$CN"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CN/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$CN/gh/prs/5.json")" == "MERGED" ]] \
+  && jq -r '.comments[-1].body' "$CN/gh/issues/1.json" | grep -qF 'CI: no CI reported.' \
+  && [[ "$(cat "$CN_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci" and .verdict=="none")] | length')" -eq 2 ]] \
+  && ok "CI: no checks reported at all merges anyway, recorded as 'no CI' in the run log and the merge comment" \
+  || note "ci none: exit $RC, PR states $(jq -r .state "$CN/gh/prs/4.json" 2>/dev/null)/$(jq -r .state "$CN/gh/prs/5.json" 2>/dev/null)"
+
+# pending then green merges, without a "no CI" note on that issue.
+CG="$WORK/cigreen"
+RC="$(cat "$CG/rc")"
+CG_RUNDIR="$(ls -d "$CG"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CG/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(grep -c '^pr checks 4' "$CG/gh/calls")" -ge 2 ]] \
+  && ! jq -r '.comments[-1].body' "$CG/gh/issues/1.json" | grep -qF 'CI:' \
+  && [[ "$(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci" and .verdict=="pass")] | length')" -ge 1 ]] \
+  && ok "CI: pending polled until green, then merged (no 'no CI' note once CI reported)" \
+  || note "ci pending->green: exit $RC, pr checks calls $(grep -c '^pr checks 4' "$CG/gh/calls" 2>/dev/null)"
+
+# a failed check parks the issue (PR back to draft), a fix round arrives with #63.
+CF="$WORK/cifail"
+RC="$(cat "$CF/rc")"
+[[ "$RC" -eq 2 ]] && held cifail \
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qF 'CI failed on PR #4: build' \
+  && ok "CI: a failed check parks the issue with the failed check names (PR back to draft, #2 skipped)" \
+  || note "ci fail: exit $RC"
+
+# CI stuck pending past the timeout parks the issue too.
+CT="$WORK/citimeout"
+RC="$(cat "$CT/rc")"
+[[ "$RC" -eq 2 ]] && held citimeout \
+  && jq -r '.comments[-1].body' "$CT/gh/issues/1.json" | grep -qF 'CI still pending after 1s on PR #4' \
+  && ok "CI: still pending after --ci-timeout parks the issue" \
+  || note "ci timeout: exit $RC"
 
 finish

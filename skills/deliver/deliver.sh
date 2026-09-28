@@ -12,12 +12,14 @@
 # --merge; anything else) goes back through final_verify once before giving
 # up. An issue that cannot get there — autopilot did not finish, verify
 # failed on its head, the review held it, the base moved into a conflict, the
-# forge refused the merge twice — is PARKED (#58): labelled needs-human, its
-# PR back to draft, a comment saying why; issues that depend on it are
-# skipped and independent ones continue. A failure of the machinery itself
-# (the forge unreachable, a dirty checkout, a review that touched the
-# checkout) ends the run instead. Not built yet: CI wait, fix rounds, resume,
-# the launcher.
+# forge refused the merge twice, or CI failed or timed out — is PARKED (#58):
+# labelled needs-human, its PR back to draft, a comment saying why; issues
+# that depend on it are skipped and independent ones continue. Before
+# merging, ci_wait (#60) polls `gh pr checks` until nothing is pending or
+# --ci-timeout passes; no checks at all after --ci-grace-seconds is "no CI"
+# and merges anyway. A failure of the machinery itself (the forge
+# unreachable, a dirty checkout, a review that touched the checkout) ends
+# the run instead. Not built yet: CI fix rounds, resume, the launcher.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
@@ -25,6 +27,7 @@
 #              [--issue-budget-usd 10] [--review-model sonnet]
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
+#              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
@@ -52,6 +55,9 @@ PLAN_MAX_ITEMS=3       # 0: no size hint
 VERIFY_EVERY_ITERATION=0
 ITERATION_VERIFY_CMD=""
 REVIEW_MODEL=sonnet
+CI_POLL_SECONDS=30
+CI_TIMEOUT_SECONDS=1800
+CI_GRACE_SECONDS=120
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -69,13 +75,19 @@ while [[ $# -gt 0 ]]; do
     --verify-every-iteration) VERIFY_EVERY_ITERATION=1; shift ;;
     --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
-    -h|--help)              sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --ci-poll-seconds)      CI_POLL_SECONDS="$2"; shift 2 ;;
+    --ci-timeout)           CI_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --ci-grace-seconds)     CI_GRACE_SECONDS="$2"; shift 2 ;;
+    -h|--help)              sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 [[ "$MAP" =~ ^[0-9]+$ ]] || die "--map <issue number> is required"
 [[ -z "$PER_CALL_TIMEOUT" || "$PER_CALL_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--per-call-timeout takes whole seconds"
 [[ "$PLAN_MAX_ITEMS" =~ ^[0-9]+$ ]] || die "--plan-max-items takes a whole number (0: no limit)"
+[[ "$CI_POLL_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-poll-seconds takes whole seconds"
+[[ "$CI_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-timeout takes whole seconds"
+[[ "$CI_GRACE_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-grace-seconds takes whole seconds"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
@@ -315,7 +327,56 @@ final_verify() {
 }
 
 # ---------------------------------------------------------------------------
-# One issue: branch → autopilot → push → PR → review → verify → merge → tick.
+# ci_wait <n> <pr> <dir> — between review and merge (#60). Polls
+# forge_pr_checks every $CI_POLL_SECONDS until no reported check is pending
+# or $CI_TIMEOUT_SECONDS passes. No checks reported at all once
+# $CI_GRACE_SECONDS has elapsed is "no CI" — logged (deliver_logline ci) and
+# merges anyway, same as all green; CI_NOTE is set for the merge comment. A
+# reported failure parks with the failed check names (a fix round arrives
+# with #63); still pending at the timeout parks too.
+# Returns 0 merge (CI_NOTE set) · 10 park (PARK_REASON set) · 1 stop the run.
+# ---------------------------------------------------------------------------
+CI_NOTE=""
+ci_wait() {
+  local n="$1" pr="$2" dir="$3" start now elapsed checks pending failed
+  start="$(date +%s)"
+  CI_NOTE=""
+  while :; do
+    checks="$(forge_pr_checks "$pr")"
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$checks" || checks="[]"
+    now="$(date +%s)"; elapsed=$(( now - start ))
+    if [[ "$(jq 'length' <<<"$checks")" -eq 0 ]]; then
+      if [[ "$elapsed" -ge "$CI_GRACE_SECONDS" ]]; then
+        log "#$n: no CI reported on PR #$pr after ${CI_GRACE_SECONDS}s — merging without it."
+        deliver_logline ci "$n" 1 none
+        CI_NOTE="no CI reported"
+        return 0
+      fi
+    else
+      pending="$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$checks")"
+      if [[ "$pending" -eq 0 ]]; then
+        failed="$(jq -r '[.[] | select(.bucket == "fail")] | .[].name' <<<"$checks" | tr '\n' ',' | sed 's/,$//')"
+        if [[ -n "$failed" ]]; then
+          deliver_logline ci "$n" 1 fail
+          PARK_REASON="CI failed on PR #$pr: $failed"
+          return 10
+        fi
+        deliver_logline ci "$n" 1 pass
+        log "#$n: CI is green on PR #$pr"
+        return 0
+      fi
+    fi
+    if [[ "$elapsed" -ge "$CI_TIMEOUT_SECONDS" ]]; then
+      deliver_logline ci "$n" 1 timeout
+      PARK_REASON="CI still pending after ${CI_TIMEOUT_SECONDS}s on PR #$pr"
+      return 10
+    fi
+    sleep "$CI_POLL_SECONDS"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# One issue: branch → autopilot → push → PR → review → CI → merge → tick.
 # ---------------------------------------------------------------------------
 # Returns 0 merged, 10 park (PARK_REASON says why), 11 already parked (left
 # alone, skipped with its dependents), 1 end the run.
@@ -437,6 +498,10 @@ deliver_issue() {
   local review_rc=$?
   [[ "$review_rc" -eq 0 ]] || return "$review_rc"
 
+  # --- wait for CI before merging (#60) ---
+  ci_wait "$n" "$pr" "$dir"; local ci_rc=$?
+  [[ "$ci_rc" -eq 0 ]] || return "$ci_rc"
+
   # --- merge (from the base, so the forge never has the head checked out) ---
   # A refusal (branch protection, a base that moved again, …) goes back
   # through final_verify exactly once before parking (#60); forge_pr_merge
@@ -473,8 +538,11 @@ deliver_issue() {
 
   MERGED+=("$n")
   tick_map "$n" || log "#$n: could not tick map #$MAP (continuing; this run will not redeliver it)"
-  printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
-    "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP" > "$dir/issue-comment.md"
+  {
+    printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
+      "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP"
+    [[ -n "$CI_NOTE" ]] && printf 'CI: %s.\n' "$CI_NOTE"
+  } > "$dir/issue-comment.md"
   forge_issue_comment "$n" "$dir/issue-comment.md" || true
   log "#$n: merged as $merged_sha"
   return 0

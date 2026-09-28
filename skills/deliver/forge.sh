@@ -107,6 +107,18 @@ forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'
 }
 
+# forge_pr_checks <pr>  — JSON array of {name,state,bucket,link} for every
+# check reported on the PR (ci_wait, #60). `gh pr checks` exits non-zero
+# whenever a check is pending or failing, and again when none has reported
+# yet at all — only the JSON on stdout matters here, so the exit code is not
+# checked; no checks reported prints nothing on stdout, normalised to "[]".
+forge_pr_checks() {
+  local out
+  out="$(gh pr checks "$1" --json name,state,bucket,link 2>/dev/null)"
+  [[ -n "$out" ]] && printf '%s\n' "$out" || echo "[]"
+  return 0
+}
+
 # forge_grant_violations <allowed_tools_csv>
 #   Pure: which Claude Code permission rules in the list would hand a model
 #   phase a forge operation (ADR-0007), or cannot be shown not to. Echoes one
