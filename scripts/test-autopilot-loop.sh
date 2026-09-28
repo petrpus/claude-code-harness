@@ -542,10 +542,15 @@ cat > "$R12/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
 STATUS: in-progress
 EOF
 PRIOR_RUN_ID="20260101T000000Z-999999"
+# S2: --resume-run now also restores the time cap's start time from this
+# log's earliest ts (see case 12c below) — a fixed past date here would trip
+# a spurious time cap under --max-minutes 30 and has nothing to do with what
+# THIS case tests (cost/iter adoption), so its rows are timestamped "now".
+NOW_TS_12="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cat > "$R12/tmp/autopilot/run-$PRIOR_RUN_ID.jsonl" <<EOF
-{"ts":"2026-01-01T00:00:00Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
-{"ts":"2026-01-01T00:00:01Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
-{"ts":"2026-01-01T00:00:02Z","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
 EOF
 ( cd "$R12" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
     bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
@@ -577,10 +582,13 @@ cat > "$R12B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
 STATUS: in-progress
 EOF
 PRIOR_RUN_ID_12B="20260101T000000Z-999998"
+# S2: see the NOW_TS_12 note above — same reasoning, this case tests cost
+# summation, not the time cap.
+NOW_TS_12B="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cat > "$R12B/tmp/autopilot/run-$PRIOR_RUN_ID_12B.jsonl" <<EOF
-{"ts":"2026-01-01T00:00:00Z","run_id":"$PRIOR_RUN_ID_12B","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
-{"ts":"2026-01-01T00:00:01Z","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
-{"ts":"2026-01-01T00:00:02Z","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"iteration","model":"-","duration_s":0,"cost_usd":2.00,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"iteration","model":"-","duration_s":0,"cost_usd":2.00,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
 EOF
 ( cd "$R12B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
     bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
@@ -595,6 +603,89 @@ COST_IS_TWO_12B="$(jq -n --argjson v "${RESUMED_COST_12B:--1}" '$v == 2' 2>/dev/
 [[ "$COST_IS_TWO_12B" == "true" ]] \
   && ok "--resume-run's cost total excludes the phase:\"iteration\" row's \$2 (1.25+0.75=2, not 4)" \
   || note "--resume-run's cost total is '$RESUMED_COST_12B', expected 2 (the iteration row's \$2 must not be added on top)"
+
+# --- 12c. S2: the time cap survives resume — a ~2h-old prior run trips it --
+# immediately, before any model call (#78's plausibility check on top of the
+# restored value, not just the current clock).
+R12C="$WORK/r12c"; new_repo "$R12C"
+cat > "$R12C/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12C="20260101T000000Z-999997"
+OLD_TS_12C="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12C/tmp/autopilot/run-$PRIOR_RUN_ID_12C.jsonl" <<EOF
+{"ts":"$OLD_TS_12C","run_id":"$PRIOR_RUN_ID_12C","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12C" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_CALL_LOG="$WORK/r12c.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12c.out" 2>"$WORK/r12c.err" )
+RC12C=$?
+[[ "$RC12C" -eq 3 ]] \
+  && ok "S2: --resume-run restores a ~2h-old start time and hits the time cap (exit 3)" \
+  || note "S2: resume from a ~2h-old log exited $RC12C — expected 3 (time cap)"
+
+STATE_12C="$(jq -r '.state // ""' "$R12C/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$STATE_12C" == "time-cap" ]] \
+  && ok "S2: status.json reports state 'time-cap' for the restored-start resume" \
+  || note "S2: status.json state is '$STATE_12C', expected 'time-cap'"
+
+[[ ! -s "$WORK/r12c.calls" ]] \
+  && ok "S2: the restored time cap trips before any model call" \
+  || note "S2: expected no model calls before the time cap, got: $(cat "$WORK/r12c.calls" 2>/dev/null)"
+
+# --- 12d. S2: a prior run started seconds ago resumes with no time cap -----
+R12D="$WORK/r12d"; new_repo "$R12D"
+cat > "$R12D/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12D="20260101T000000Z-999996"
+RECENT_TS_12D="$(date -u -d '-5 seconds' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12D/tmp/autopilot/run-$PRIOR_RUN_ID_12D.jsonl" <<EOF
+{"ts":"$RECENT_TS_12D","run_id":"$PRIOR_RUN_ID_12D","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12D" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12d.out" 2>"$WORK/r12d.err" )
+RC12D=$?
+[[ "$RC12D" -eq 2 ]] \
+  && ok "S2: --resume-run with a seconds-old prior start runs normally (iteration cap, not time cap)" \
+  || note "S2: resume from a seconds-old log exited $RC12D — expected 2 (iteration cap)"
+
+STATE_12D="$(jq -r '.state // ""' "$R12D/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$STATE_12D" == "iteration-cap" ]] \
+  && ok "S2: status.json reports 'iteration-cap', not a spurious time cap" \
+  || note "S2: status.json state is '$STATE_12D', expected 'iteration-cap'"
+
+# --- 12e. S2: an unparseable prior ts falls back to the current clock, -----
+# never reports a time cap.
+R12E="$WORK/r12e"; new_repo "$R12E"
+cat > "$R12E/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12E="20260101T000000Z-999995"
+cat > "$R12E/tmp/autopilot/run-$PRIOR_RUN_ID_12E.jsonl" <<EOF
+{"ts":"not-a-timestamp","run_id":"$PRIOR_RUN_ID_12E","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12E" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12e.out" 2>"$WORK/r12e.err" )
+RC12E=$?
+[[ "$RC12E" -eq 2 ]] \
+  && ok "S2: an unparseable prior ts falls back to the current clock (iteration cap, not time cap)" \
+  || note "S2: resume from an unparseable-ts log exited $RC12E — expected 2 (iteration cap)"
+
+grep -q "restored start time" "$WORK/r12e.err" 2>/dev/null \
+  && ok "S2: the unparseable restored start time is logged, not silently swallowed" \
+  || note "S2: no fallback notice found in stderr for the unparseable ts"
 
 # --- 13. R2: a verifier stuck on "no verdict" still aborts, and FEEDBACK.md --
 # names the malfunction instead of quoting the refusal as findings ----------
@@ -1210,7 +1301,11 @@ mkdir -p "$S27"
 mv "$R27/tmp/autopilot/PROMPT.md" "$S27/PROMPT.md"
 printf -- '- [ ] slice 1\n- [ ] slice 2\n\nSTATUS: in-progress\n' > "$S27/IMPLEMENTATION_PLAN.md"
 PRIOR27="20260101T000000Z-424242"
-printf '{"ts":"2026-01-01T00:00:00Z","run_id":"%s","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.5,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}\n' "$PRIOR27" \
+# S2: a fixed past date would now also restore the time cap's start time and
+# trip a spurious time cap under --max-minutes 30 — irrelevant to what this
+# case tests (state-dir plumbing), so timestamped "now" like cases 12/12b.
+printf '{"ts":"%s","run_id":"%s","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.5,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PRIOR27" \
   > "$S27/run-$PRIOR27.jsonl"
 ( cd "$R27" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
     bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 \
