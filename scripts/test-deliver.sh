@@ -418,6 +418,12 @@ case "$cmd" in
     echo "https://github.com/o/r/pull/$n" ;;
   "pr view")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; cat "$f" ;;
+  "pr list")
+    head="$(arg --head "$@")"
+    shopt -s nullglob; files=("$S"/prs/*.json); shopt -u nullglob
+    if [[ ${#files[@]} -eq 0 ]]; then echo '[]'; else
+      jq -n --arg h "$head" '[ inputs | select(.headRefName == $h) | {number, state} ]' "${files[@]}"
+    fi ;;
   "pr comment")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -917,6 +923,45 @@ REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
 [[ "$(cat "$RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .verdict=="approve")] | length')" -eq 2 ]] \
   && ok "review: both calls are in the run's own log (phase review, issue, verdict, cost)" \
   || note "review: run log rows missing under $RUNDIR"
+
+# --- forge.sh: marker dedupe and PR lookup (#61 S2, on the happy fixture) -----
+PR1="$(jq -r '.issues["1"].pr' "$RUNDIR/state.json")"
+HEAD1="$(jq -r .headRefOid "$H/gh/prs/$PR1.json")"
+MARKER1="$(review_marker 1 1 "$HEAD1")"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment_has_marker "$PR1" "$MARKER1" \
+  && ok "forge_pr_comment_has_marker: finds the marker actually posted on PR #$PR1" \
+  || note "forge_pr_comment_has_marker: did not find '$MARKER1' on PR #$PR1"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment_has_marker "$PR1" "$(review_marker 1 99 deadbeef)" \
+  && note "forge_pr_comment_has_marker: found a marker that was never posted" \
+  || ok "forge_pr_comment_has_marker: misses a marker that was never posted"
+MERGED_MARKER="<!-- deliver:merged issue=1 pr=$PR1 -->"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_issue_comment_has_marker 1 "$MERGED_MARKER" \
+  && ok "forge_issue_comment_has_marker: finds the merged-notice marker on issue #1" \
+  || note "forge_issue_comment_has_marker: did not find '$MERGED_MARKER' on issue #1"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_issue_comment_has_marker 1 "<!-- deliver:park issue=1 -->" \
+  && note "forge_issue_comment_has_marker: found a park marker on an issue that was never parked" \
+  || ok "forge_issue_comment_has_marker: misses a marker that was never posted"
+BRANCH1="$(jq -r .headRefName "$H/gh/prs/$PR1.json")"
+FOUND_PR="$(PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_for_branch "$BRANCH1")"
+[[ "$FOUND_PR" == "$PR1" ]] \
+  && ok "forge_pr_for_branch: finds the (now-merged) PR opened for the branch, by name alone" \
+  || note "forge_pr_for_branch: expected #$PR1, got '$FOUND_PR'"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_for_branch "feat/999-does-not-exist" \
+  && note "forge_pr_for_branch: found a PR for a branch that never had one" \
+  || ok "forge_pr_for_branch: no PR for a branch that never had one"
+# The exact guard review_issue/park_issue/the merged comment use in deliver.sh:
+# post only when the marker is absent. Calling it twice for the same head must
+# still add exactly one comment — this is what makes review_issue idempotent
+# across a resume (#61 S3 will call it again for an issue already reviewed).
+echo "a second review attempt for the same head" > "$WORK/happy/dup-comment.md"
+for _ in 1 2; do
+  PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment_has_marker "$PR1" "$MARKER1" \
+    || PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment "$PR1" "$WORK/happy/dup-comment.md"
+done
+POST_CALLS="$(grep -c "^pr comment $PR1 " "$H/gh/calls")"
+[[ "$(jq -r '.comments | length' "$H/gh/prs/$PR1.json")" -eq 1 && "$POST_CALLS" -eq 1 ]] \
+  && ok "review comment dedupe: the marker guard run twice on the same head posts one comment" \
+  || note "review comment dedupe: PR #$PR1 has $(jq -r '.comments | length' "$H/gh/prs/$PR1.json") comment(s) after $POST_CALLS 'pr comment' call(s)"
 
 # --- run state (#61 S1): state.json / events.jsonl / status.json / lock -------
 jq -e '.map==3 and .base=="integration/x" and (.runner_version|type=="string") and (.active_seconds|type=="number")

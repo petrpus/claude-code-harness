@@ -348,7 +348,8 @@ review_issue() {
            continue
          fi
          review_comment "$n" "$round" "$head_sha" "$out.md" "" > "$comment"
-         forge_pr_comment "$pr" "$comment" || true
+         forge_pr_comment_has_marker "$pr" "$(review_marker "$n" "$round" "$head_sha")" \
+           || forge_pr_comment "$pr" "$comment" || true
          PARK_REASON="the reviewer returned no usable verdict twice (PR #$pr)"
          return 10 ;;
       3) deliver_logline review "$n" "$round" breach
@@ -357,7 +358,8 @@ review_issue() {
     esac
   done
   review_comment "$n" "$round" "$head_sha" "$out.md" "$out.json" > "$comment"
-  forge_pr_comment "$pr" "$comment" || log "#$n: could not post the review on PR #$pr (continuing)"
+  forge_pr_comment_has_marker "$pr" "$(review_marker "$n" "$round" "$head_sha")" \
+    || forge_pr_comment "$pr" "$comment" || log "#$n: could not post the review on PR #$pr (continuing)"
   verdict="$(jq -r '.verdict' "$out.json")"
   if [[ "$verdict" != "approve" ]]; then
     PARK_REASON="the review requests changes on PR #$pr (fix rounds arrive with #63)"
@@ -540,9 +542,13 @@ deliver_issue() {
 
   MERGED+=("$n")
   tick_map "$n" || log "#$n: could not tick map #$MAP (continuing; this run will not redeliver it)"
-  printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
-    "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP" > "$dir/issue-comment.md"
-  forge_issue_comment "$n" "$dir/issue-comment.md" || true
+  {
+    echo "<!-- deliver:merged issue=$n pr=$pr -->"
+    printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
+      "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP"
+  } > "$dir/issue-comment.md"
+  forge_issue_comment_has_marker "$n" "<!-- deliver:merged issue=$n pr=$pr -->" \
+    || forge_issue_comment "$n" "$dir/issue-comment.md" || true
   state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$merged_sha" '{state:"merged", head:$h}')"
   state_event "$RUN_DIR" "$n" merged ""
   run_status running
@@ -557,6 +563,11 @@ deliver_issue() {
 park_issue() {
   local n="$1" dir="$RUN_DIR/issues/$1" comment="$RUN_DIR/issues/$1/park-comment.md"
   local st="$RUN_DIR/issues/$1/status.json"
+  # Keyed on the reason, not just the issue: a real re-park for a different
+  # cause (the #58 branch-exists rule after a label was removed by hand, say)
+  # must still get its own comment. Only an exact repeat — the case a resume
+  # can hit — is deduped.
+  local marker="<!-- deliver:park issue=$n reason=$(printf '%s' "$PARK_REASON" | cksum | cut -d' ' -f1) -->"
   log "#$n: PARKED — $PARK_REASON"
   # Back to the base so the next issue starts clean; anything else means the
   # checkout is not in the state the runner left it, and parking stops there.
@@ -572,6 +583,7 @@ park_issue() {
     forge_pr_draft "$CUR_PR" || log "#$n: could not turn PR #$CUR_PR back into a draft"
   fi
   {
+    echo "$marker"
     echo "**Parked by \`/deliver\`** (run \`$RUN_ID\`, map #$MAP): $PARK_REASON."
     echo
     if [[ -n "$CUR_PR" ]]; then
@@ -597,7 +609,8 @@ park_issue() {
       echo "</details>"
     fi
   } > "$comment"
-  forge_issue_comment "$n" "$comment" || log "#$n: could not post the parking comment"
+  forge_issue_comment_has_marker "$n" "$marker" \
+    || forge_issue_comment "$n" "$comment" || log "#$n: could not post the parking comment"
   PARKED+=("#$n")
   state_issue_update "$RUN_DIR" "$n" '{"state":"parked"}'
   state_event "$RUN_DIR" "$n" parked "$PARK_REASON"

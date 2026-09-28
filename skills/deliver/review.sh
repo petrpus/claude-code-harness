@@ -223,6 +223,13 @@ review_run() {
   return 0
 }
 
+# review_marker <issue> <round> <head>  — the exact HTML marker review_comment
+# opens with. deliver.sh recomputes it (never parses a comment body itself)
+# to ask forge_pr_comment_has_marker whether this round already has a
+# comment on the PR — the dedupe key a resumed run relies on to never post
+# the same review twice (#61 S2).
+review_marker() { echo "<!-- deliver:review issue=$1 round=$2 head=$3 -->"; }
+
 # review_comment <issue> <round> <head_sha> <report_md> <verdict_json|""> > comment.md
 #   The PR comment: a marker a resumed run can find (never post the same
 #   review twice), the runner's verdict, then the reviewer's own report.
@@ -239,7 +246,7 @@ review_comment() {
   else
     verdict="no verdict"; model_verdict="—"; counts="the reviewer's reply carried no usable JSON verdict for this head"
   fi
-  echo "<!-- deliver:review issue=$n round=$round head=$head -->"
+  review_marker "$n" "$round" "$head"
   echo "## Independent review — round $round (\`code-reviewer\` via \`/deliver\`)"
   echo
   echo "**Runner verdict: $verdict** (reviewer said: $model_verdict) — $counts"
