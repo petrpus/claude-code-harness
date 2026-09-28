@@ -95,9 +95,17 @@ loop:
        fingerprint plan_dag, straight to replan — bypasses the ladder below
   BUILD           sonnet (or --escalate-model on rung 2)   acceptEdits + explicit --allowedTools
     └─ exactly the selected plan item, TDD (red-green-refactor), ADR if
-       architectural, run verify, tick box, append MEMORY, set STATUS
+       architectural, run verify, tick box, append MEMORY, set STATUS —
+       does NOT `git add`/`git commit` (not in its allowlist): the runner
+       stages (`git add -A`) and commits the checkpoint itself, after BUILD
+       and before the gates below, from `ITER_BASE_SHA` (HEAD as recorded
+       right before this BUILD call)
   GATE b  machine verify   runner    executes the verify command itself
-  GATE c  secret scan      runner    greps the diff for keys/tokens
+  GATE c  secret scan      runner    greps `git diff --cached ITER_BASE_SHA`
+                                      for keys/tokens — covers everything
+                                      staged since ITER_BASE_SHA, including
+                                      new untracked files and anything BUILD
+                                      would otherwise have committed itself
   GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict
   GATE e  holdout          haiku     same call as gate d — HOLDOUT.md's content
                                       inlined into the verifier prompt only, if any

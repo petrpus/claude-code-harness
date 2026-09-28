@@ -67,7 +67,11 @@ REPO_MAP_ENABLED=1
 # reproducing S4A's own "rung 2 is just another retry" behaviour exactly.
 ESCALATE_MODEL=opus
 
-BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
+# No `git add`/`git commit` here: the runner owns the iteration's checkpoint
+# commit (ITER_BASE_SHA, below) so the secret scan and the verifier see the
+# whole iteration, including anything BUILD would otherwise have committed
+# out from under them.
+BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
 
 log_err() { echo "autopilot: $*" >&2; }
@@ -639,7 +643,8 @@ an architectural decision (new module boundary, dependency, data-model change),
 write a docs/adr/ entry. Then:
 $(build_verify_steps)
 Do not tick a box you didn't prove. Do not fake completion. Do not modify the
-verify command to make it pass.
+verify command to make it pass. Do not run \`git add\` or \`git commit\` — the
+runner stages and commits the checkpoint itself once you're done.
 $digest_section
 EOF
 }
@@ -745,8 +750,14 @@ parse_violations() {
 }
 
 secret_scan() { # returns 0 clean, 1 hit; echoes hits
+  # $ITER_BASE_SHA (recorded before BUILD ran) instead of HEAD, and --cached
+  # instead of a working-tree diff: the runner stages the whole iteration
+  # (git add -A) before this runs, so a commit BUILD itself made and a new
+  # untracked file are both in the index and both covered — `git diff HEAD`
+  # missed both (a same-iteration commit moves HEAD to match the working
+  # tree; an untracked file never appears in a diff against HEAD at all).
   local diff hits
-  diff="$(git diff HEAD 2>/dev/null || true)"
+  diff="$(git diff --cached "$ITER_BASE_SHA" 2>/dev/null || true)"
   hits="$(printf '%s' "$diff" | grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[po]_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[bap]-[A-Za-z0-9-]+|(password|secret|token)\s*=\s*["'"'"'][^"'"'"']{6,}' 2>/dev/null || true)"
   [[ -z "$hits" ]] && return 0
   echo "$hits"; return 1
@@ -959,8 +970,22 @@ while :; do
   fi
 
   # BUILD
+  # Recorded immediately before the call so the secret scan and the verifier
+  # can diff the whole iteration against it, not just what's still unstaged
+  # after BUILD (which is nothing, once BUILD_ALLOWED_TOOLS drops git
+  # add/commit and can no longer hide its own changes inside a commit).
+  ITER_BASE_SHA="$(git rev-parse HEAD)"
   BUILD_COST_START="$TOTAL_COST"
   run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
+
+  # Stage the whole iteration now, before any gate runs — GATE b (verify)
+  # reads the working tree either way, but GATE c (secret scan) and GATE d
+  # (verifier, S2) need the index to contain everything BUILD touched,
+  # including new untracked files, which a diff against HEAD alone would
+  # never see. The state dir stays excluded, same as the checkpoint commits
+  # below: it's gitignored (checked at startup), and `git add -A` never adds
+  # an ignored path.
+  git add -A
 
   # S4B cost guard: escalation counts against --budget-usd like any other
   # call — there is no separate ceiling, a hard cap here would just move the
