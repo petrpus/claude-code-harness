@@ -327,6 +327,21 @@ done
 grep -qF 'integration/<slug>' CLAUDE.md && ok "CLAUDE.md branch model covers integration branches" \
   || note "CLAUDE.md branch model does not cover integration/<slug> branches"
 
+# ---------------------------------------------------------------------------
+section "user guide pages: version + Deliver path + no external assets"
+PV="$(jq -r .version .claude-plugin/plugin.json)"
+for f in docs/guide.html docs/index.html; do
+  grep -qF -- "v$PV" "$f" && ok "$f shows v$PV" || note "$f does not show plugin.json version v$PV"
+  if grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$f" | grep -vqxF "v$PV"; then note "$f mentions a stale version string"; fi
+  if grep -qE '<(script|img|iframe|link)[^>]*(src|href)=|rel="stylesheet"' "$f"; then
+    note "$f loads an external asset"
+  else
+    ok "$f loads no external assets"
+  fi
+done
+grep -qF 'id="deliver"' docs/guide.html && grep -qF '/deliver' docs/guide.html \
+  && ok "guide.html has a Deliver a map path" || note "guide.html lacks a Deliver a map path (id=\"deliver\")"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
