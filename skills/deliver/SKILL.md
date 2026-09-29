@@ -20,9 +20,9 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
 > independent review (#59), parking (#58), final-verify's base-moved
-> handling and merge retry, the CI wait with its fix round (#60), and bounded
-> review fix rounds with follow-up issues (#63). Not yet: resume, the tmux
-> launcher.
+> handling and merge retry, the CI wait with its fix round (#60), bounded
+> review fix rounds with follow-up issues (#63), and run state / resume /
+> stop / global caps (#61). Not yet: the tmux launcher.
 
 ## When an issue does not make it
 
@@ -64,7 +64,8 @@ issue's fault: it ends the run with exit 1, where it is.
      [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
      [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120] \
-     [--max-fix-rounds 2]
+     [--max-fix-rounds 2] [--budget-usd <n>] [--max-minutes <n>] \
+     [--resume [--retry '#N']]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -181,8 +182,8 @@ every `--ci-poll-seconds` (default 30) before the PR may merge:
   rounds above). The fix round fetches the failed run's log tail
   (`forge_ci_failed_log`, `gh run view <id> --log-failed`), appends a
   `- [ ] C<round> Fix red CI: <check>` plan item with the log fenced as data,
-  reopens `STATUS: in-progress` and resumes autopilot (`loop.sh
-  --resume-run`); a clean finish goes back through final-verify and
+  reopens `STATUS: in-progress` and runs autopilot again on the same state
+  dir (a fresh `loop.sh` run, like a review fix round); a clean finish goes back through final-verify and
   `ci_wait`. No round left, autopilot not finishing the fix, or CI still red
   after the round parks — with the failed checks' names in the reason and
   the failed run's log tail in the park comment — logged with verdict
@@ -204,11 +205,60 @@ review — in whole seconds (default 1200). Raise it when the verify command is
 slow: BUILD runs verify itself, and in this repo (`scripts/verify.sh` ≈ 6 min)
 the default cut the first BUILD off after a couple of runs.
 
-**Stopping a run today.** Ctrl-C in the terminal does not stop it: `timeout`
-runs each `claude -p` in its own process group, so the signal never reaches
-the call, and the runner waits for it. Terminate the runner's process tree
-instead (from the `deliver.sh` PID down, leaves first). A graceful `--stop`
-arrives with #61.
+**Stopping a run.** Ctrl-C in the terminal does not stop it: `timeout` runs
+each `claude -p` in its own process group, so the signal never reaches the
+call, and the runner waits for it. Instead, drop a `STOP` file at
+`tmp/deliver/<run-id>/STOP` (e.g. `touch tmp/deliver/*/STOP`) — it is checked
+between phases (before a branch, after a build, before a PR, before a
+review, on every poll of the CI wait, before a merge) and passed to every `loop.sh` call as `--stop-file`,
+so a build already in flight stops the same way. The run ends with exit
+**6**, state `stopped`, the in-flight issue left non-terminal — resumable.
+
+**Global caps.** `--budget-usd <n>` / `--max-minutes <n>` bound the whole
+run: total cost sums the runner's own model calls and every issue's inner
+`loop.sh` run (excluding `loop.sh`'s own per-iteration summary rows); active
+time is this run's accumulated `active_seconds`, which survives a
+`--resume`. Checked at the same phase boundaries as the STOP file. Tripping
+a cap ends the run with exit **4** (budget) or **3** (time), state
+`budget_exhausted` / `time_exhausted`, the in-flight issue left non-terminal.
+Each issue's own `--issue-budget-usd` / `--issue-max-minutes` is clipped to
+whatever the global cap has left before that issue's `loop.sh` call, so no
+single issue can spend past the point the whole run is allowed to reach.
+
+**Resuming a run.** `--resume` picks the newest `tmp/deliver/*/state.json`
+for this `--map`, removes a stale `lock` (a pid no longer alive; a live one
+refuses the run outright), switches the checkout back to the run's recorded
+base if needed, makes a fresh private runner copy (warning on stderr, never
+refusing, when `plugin.json`'s version differs from the one `state.json`
+recorded), restores `active_seconds`, then reconciles every issue this run's
+state still calls non-terminal against GitHub — **GitHub wins**
+(`docs/adr/0012-*.md`): the Map tick or a merged PR settles an issue as
+merged, the issue closed settles it as closed-externally, `needs-human`
+settles it as parked. Anything else resumes exactly where this run's own
+`state.json` left it: a pushed head without a PR gets one; an open PR is
+re-entered where `state.json` says it was: at the review round it recorded
+(the round's marker — issue, round, head — keeps a review the interrupted
+attempt already posted from being posted twice); inside a review or CI fix
+round that was left unfinished (`fix`), which is finished — its local
+commits kept, no second round spent — rather than redone or skipped; or
+straight at the CI wait once `approved_head` is the PR's head, so a resume
+from the CI wait or the merge never pays for a second review. A local copy
+of the branch ahead of origin with no fix round pending is re-verified and
+pushed first; one that diverged stops the run. A local-only branch gets a
+fresh `loop.sh` run on the same state dir (plan, memory and commits carry
+over; a `--resume-run` would restore the old run's clock and trip
+`--issue-max-minutes` after any long pause). A fix round's budget spend is
+keyed (`review-<k>`, `ci@<head>`), so a run killed between spending a round
+and recording it never pays for the same round twice. A leftover branch this run's state does *not* know about is
+still parked, unchanged from #58 — `--resume` only continues a branch its
+own run started.
+
+A parked issue stays parked across `--resume`, label or not. `--retry '#N'`
+(with `--resume`, and only for an issue this run recorded as parked —
+anything else is refused, since it would discard live work) forgets a parked issue's recorded
+branch/PR, closes/deletes what it left behind, drops `needs-human`, and
+gives it a fresh inner run — same as the park comment's own "To retry" line
+says.
 
 The runner first copies the plugin to
 `${XDG_STATE_HOME:-~/.local/state}/claude-code-harness/deliver/<run-id>/runner/`
@@ -222,10 +272,16 @@ edits the script running it.
 - The Map's Delivery lines ticked `[x]`, a comment on each merged issue.
   Issues stay open: GitHub closes them only when the final integration →
   default-branch PR merges.
-- Run state in `tmp/deliver/<run-id>/` — the Map as read, the runner's own
-  model calls in `run-<run-id>.jsonl` (loop.sh's schema plus `issue`/`round`,
-  readable by `/usage-report`), and per issue `issues/<N>/` (autopilot state
-  dir: charter, plan, run log, status, PR body, `review-<k>.md/.json`).
+- Run state in `tmp/deliver/<run-id>/` — `state.json` (resume truth: map,
+  base, runner version, active time, per-issue state/branch/PR/round/head),
+  `events.jsonl` (one row per issue-state transition), `status.json` (the
+  run's current headline), a `lock` (this process's pid, removed on exit),
+  the Map as read, the runner's own model calls in `run-<run-id>.jsonl`
+  (loop.sh's schema plus `issue`/`round`, readable by `/usage-report`), and
+  per issue `issues/<N>/` (autopilot state dir: charter, plan, run log,
+  status, PR body, `review-<k>.md/.json`).
 
 Exit codes: 0 every Delivery line merged · 1 precondition or runner failure ·
-2 partial (something was parked, and whatever waits on it skipped).
+2 partial (something was parked, and whatever waits on it skipped) · 3 global
+`--max-minutes` reached · 4 global `--budget-usd` reached · 6 stopped (a
+`STOP` file was present). 3, 4 and 6 leave the run resumable with `--resume`.

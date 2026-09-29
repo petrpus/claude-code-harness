@@ -125,9 +125,42 @@ forge_issue_remove_label() { gh issue edit "$1" --remove-label "$2" >/dev/null; 
 # ready to merge to a human skimming the PR list.
 forge_pr_draft() { gh pr ready "$1" --undo >/dev/null; }
 
+# forge_pr_close <pr> — closes without merging, never deleting the branch
+# (forge_delete_remote_branch is the caller's own, explicit call): --retry #N
+# discards an earlier attempt's PR before starting a fresh one (#61 S3).
+forge_pr_close() { gh pr close "$1" >/dev/null; }
+
 # forge_pr_state <pr>  — OPEN | MERGED | CLOSED
 forge_pr_state() {
   gh pr view "$1" --json state | jq -r '.state'
+}
+
+# forge_pr_comment_has_marker <pr> <marker>  — true when a comment on the PR
+# already carries this exact text. The dedupe key for review comments
+# (review_comment's `<!-- deliver:review issue=N round=k head=<sha> -->`):
+# a resumed run must never post the same review twice.
+forge_pr_comment_has_marker() {
+  gh pr view "$1" --json comments 2>/dev/null | jq -e --arg m "$2" \
+    '[(.comments // [])[] | (.body // "") | select(contains($m))] | length > 0' >/dev/null 2>&1
+}
+
+# forge_issue_comment_has_marker <issue> <marker>  — same, for the issue's own
+# comments: the park (`<!-- deliver:park issue=N -->`) and merged
+# (`<!-- deliver:merged issue=N pr=P -->`) notices post there, not to a PR.
+forge_issue_comment_has_marker() {
+  gh issue view "$1" --json comments 2>/dev/null | jq -e --arg m "$2" \
+    '[(.comments // [])[] | (.body // "") | select(contains($m))] | length > 0' >/dev/null 2>&1
+}
+
+# forge_pr_for_branch <branch>  — the number of the open or merged PR whose
+# head is this branch; empty (rc 1) when there is none. A closed-without-merge
+# PR does not count: that branch is free for a fresh attempt (--resume, #61 S3).
+forge_pr_for_branch() {
+  local n
+  n="$(gh pr list --head "$1" --state all --json number,state 2>/dev/null \
+       | jq -r '[.[] | select(.state=="OPEN" or .state=="MERGED")][0].number // empty')"
+  [[ -n "$n" ]] || return 1
+  printf '%s\n' "$n"
 }
 
 # forge_pr_checks <pr>  — JSON array of {name,state,bucket,link} for every

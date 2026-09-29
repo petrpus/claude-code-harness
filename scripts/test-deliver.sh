@@ -41,6 +41,7 @@ finish() {
 command -v jq >/dev/null 2>&1 || { note "jq is required"; finish; }
 DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 [[ -f "$DELIVER_ABS" ]] || { note "skills/deliver/deliver.sh is missing"; finish; }
+REAL_PLUGIN_VERSION="$(jq -r '.version // "unknown"' .claude-plugin/plugin.json 2>/dev/null)"
 
 # shellcheck source=../skills/autopilot/plan.sh
 . skills/autopilot/plan.sh
@@ -50,6 +51,8 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 . skills/deliver/charter.sh
 # shellcheck source=../skills/deliver/review.sh
 . skills/deliver/review.sh
+# shellcheck source=../skills/deliver/state.sh
+. skills/deliver/state.sh
 # forge.sh is sourced for its one pure function (forge_grant_violations);
 # nothing here calls gh through it.
 # shellcheck source=../skills/deliver/forge.sh
@@ -57,6 +60,7 @@ DELIVER_ABS="$(pwd)/skills/deliver/deliver.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+REPORT_ABS="$(pwd)/skills/usage-report/report.sh"
 
 # ===========================================================================
 # Unit: map.sh
@@ -280,6 +284,52 @@ review_parse '{"verdict":"approve","findings":"none"}' >/dev/null && note "parse
   || ok "parse: findings that are not an array are no verdict"
 
 # ===========================================================================
+# Unit: state.sh (#61 S1 — state.json, events.jsonl, status.json, cost sums)
+# ===========================================================================
+echo "-- state.sh"
+ST="$WORK/state1"; mkdir -p "$ST"
+state_init "$ST" 3 "integration/x" "run-1" "0.6.0"
+jq -e '.map==3 and .base=="integration/x" and .run_id=="run-1" and .runner_version=="0.6.0" and .active_seconds==0 and (.issues=={})' "$ST/state.json" >/dev/null \
+  && ok "state_init: run identity, active_seconds 0, an empty issues map" \
+  || note "state_init: $(cat "$ST/state.json" 2>/dev/null)"
+state_issue_update "$ST" 1 '{"state":"building","branch":"feat/1-x"}'
+state_issue_update "$ST" 1 '{"round":1}'
+jq -e '.issues["1"].state=="building" and .issues["1"].branch=="feat/1-x" and .issues["1"].round==1' "$ST/state.json" >/dev/null \
+  && ok "state_issue_update: shallow-merges into one issue, keeping fields set by an earlier call" \
+  || note "state_issue_update: $(jq -c .issues "$ST/state.json" 2>/dev/null)"
+state_set_active_seconds "$ST" 42
+[[ "$(jq -r .active_seconds "$ST/state.json")" == "42" ]] \
+  && ok "state_set_active_seconds: updates the run-level field" || note "active_seconds not set"
+state_event "$ST" 1 building ""
+state_event "$ST" "" stopped "STOP file present"
+EV2="$(sed -n 2p "$ST/events.jsonl")"
+[[ "$(wc -l < "$ST/events.jsonl" | tr -d ' ')" -eq 2 ]] \
+  && [[ "$(jq -r .issue <<<"$EV2")" == "null" ]] && [[ "$(jq -r .event <<<"$EV2")" == "stopped" ]] \
+  && ok "state_event: appended, one row per transition; a run-level event carries no issue" \
+  || note "events.jsonl: $(tr '\n' '|' < "$ST/events.jsonl")"
+mkdir -p "$ST/issues/1"
+printf '%s\n' '{"phase":"plan","cost_usd":1}' '{"phase":"build","cost_usd":2}' '{"phase":"iteration","cost_usd":99}' \
+  > "$ST/issues/1/run-a.jsonl"
+printf '%s\n' '{"phase":"review","cost_usd":4}' > "$ST/run-run-1.jsonl"
+[[ "$(state_total_cost "$ST")" == "7" ]] \
+  && ok "state_total_cost: sums the runner's own log and every issue's log, excluding phase:iteration" \
+  || note "state_total_cost: $(state_total_cost "$ST")"
+EMPTY="$WORK/state-empty"; mkdir -p "$EMPTY"
+[[ "$(state_total_cost "$EMPTY")" == "0" ]] \
+  && ok "state_total_cost: no logs on disk yet is 0, not an error" \
+  || note "state_total_cost (empty): $(state_total_cost "$EMPTY")"
+state_write_status "$ST" running 1 2 0 7 120
+jq -e '.state=="running" and .current_issue==1 and .merged_count==2 and .parked_count==0 and .cost_usd==7 and .elapsed_s==120' "$ST/status.json" >/dev/null \
+  && ok "state_write_status: the run's headline fields" || note "status.json: $(cat "$ST/status.json" 2>/dev/null)"
+state_write_status "$ST" done "" 2 0 7 130
+[[ "$(jq -r .current_issue "$ST/status.json")" == "null" ]] \
+  && ok "state_write_status: no current issue writes null, not the empty string" \
+  || note "status.json current_issue: $(jq .current_issue "$ST/status.json" 2>/dev/null)"
+[[ "$(state_clip_num 5 10)" == "5" && "$(state_clip_num 10 5)" == "5" && "$(state_clip_num -1 5)" == "0" ]] \
+  && ok "state_clip_num: min(remaining, requested); a negative remaining floors at 0" \
+  || note "state_clip_num: $(state_clip_num 5 10)/$(state_clip_num 10 5)/$(state_clip_num -1 5)"
+
+# ===========================================================================
 # Unit: forge_grant_violations (ADR-0007 for --extra-allowed-tools)
 # ===========================================================================
 echo "-- forge_grant_violations"
@@ -352,6 +402,44 @@ set -uo pipefail
 S="${FAKE_GH_DIR:?}"
 printf '%s\n' "$*" >> "$S/calls"
 mkdir -p "$S/issues" "$S/prs"
+# #61 S1: drop a STOP file into the run dir the moment it exists (the first
+# real gh call happens after deliver.sh has already created it) — lets a
+# test place STOP before the run's very first issue without knowing its
+# dynamic run-id ahead of time.
+if [[ -n "${FAKE_GH_TOUCH_STOP:-}" ]]; then
+  rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+  [[ -n "$rd" ]] && : > "${rd}STOP"
+fi
+# Same, but only on the Nth (default: first) call whose argv starts with
+# $FAKE_GH_STOP_ON (e.g. "pr checks": a STOP that lands during a CI wait).
+if [[ -n "${FAKE_GH_STOP_ON:-}" && "$*" == "$FAKE_GH_STOP_ON"* && ! -f "$S/.stopped-on" ]]; then
+  stop_seen="$(( $(cat "$S/.stop-on-count" 2>/dev/null || echo 0) + 1 ))"
+  echo "$stop_seen" > "$S/.stop-on-count"
+  if [[ "$stop_seen" -ge "${FAKE_GH_STOP_ON_NTH:-1}" ]]; then
+    touch "$S/.stopped-on"
+    rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+    [[ -n "$rd" ]] && : > "${rd}STOP"
+  fi
+fi
+# #61 S3: simulate the runner being killed right after a PR exists — SIGKILL
+# the deliver.sh pid (from the run's lock file) the moment a PR is on disk
+# and this is not the "pr create" call itself, so the PR really was opened
+# (and pr-open already recorded, since state_issue_update runs immediately
+# after forge_pr_create returns, before deliver.sh's next gh call) and the
+# kill lands synchronously, deterministically, before this call's own result
+# reaches deliver.sh — leaving a stale lock behind, exactly as an external
+# `kill -9` would.
+if [[ -n "${FAKE_GH_KILL_AFTER_PR_OPEN:-}" && ! -f "$S/.killed-after-pr-open" && "$*" != "pr create"* ]]; then
+  shopt -s nullglob; _prs=("$S"/prs/*.json); shopt -u nullglob
+  if [[ ${#_prs[@]} -gt 0 ]]; then
+    touch "$S/.killed-after-pr-open"
+    rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+    if [[ -n "$rd" && -f "${rd}lock" ]]; then
+      kill -9 "$(cat "${rd}lock" 2>/dev/null)" 2>/dev/null
+      sleep 0.2
+    fi
+  fi
+fi
 arg() { # --flag value from "$@"
   local want="$1"; shift
   while [[ $# -gt 0 ]]; do [[ "$1" == "$want" ]] && { printf '%s' "$2"; return 0; }; shift; done
@@ -395,6 +483,9 @@ case "$cmd" in
   "pr ready")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; has --undo "$@" || exit 64
     jq '.isDraft = true' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+  "pr close")
+    f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1
+    jq '.state="CLOSED"' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   "issue comment")
     f="$S/issues/$1.json"; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
@@ -433,6 +524,12 @@ case "$cmd" in
     if [[ -n "$jqexpr" ]]; then printf '%s' "$matches" | jq -r "$jqexpr"; else printf '%s' "$matches"; fi ;;
   "pr view")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; cat "$f" ;;
+  "pr list")
+    head="$(arg --head "$@")"
+    shopt -s nullglob; files=("$S"/prs/*.json); shopt -u nullglob
+    if [[ ${#files[@]} -eq 0 ]]; then echo '[]'; else
+      jq -n --arg h "$head" '[ inputs | select(.headRefName == $h) | {number, state} ]' "${files[@]}"
+    fi ;;
   "pr edit")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1
     b="$(arg --body-file "$@")" || exit 64
@@ -607,6 +704,13 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
     if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
+      # A STOP that lands while BUILD works on plan item $STUB_STOP_ON_SLICE
+      # (once): the item still gets built and committed, the run stops after.
+      if [[ -n "${STUB_STOP_ON_SLICE:-}" && "$sel" == "$STUB_STOP_ON_SLICE" && ! -f "${STUB_STOP_MARKER:?}" ]]; then
+        touch "$STUB_STOP_MARKER"
+        stop_rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+        [[ -n "$stop_rd" ]] && : > "${stop_rd}STOP"
+      fi
       [[ ",${STUB_NOWORK_ISSUES:-}," == *",$n,"* ]] || { mkdir -p work && echo "issue $n slice $sel" >> "work/issue-$n.txt"; }
       awk -v id="$sel" 'BEGIN{d=0} { if (!d && $0 ~ ("^- \\[ \\] " id "([[:space:]]|$)")) { sub(/^- \[ \]/, "- [x]"); d=1 } print }' \
         "$plan" > "$plan.tmp" && mv "$plan.tmp" "$plan"
@@ -666,7 +770,8 @@ run_deliver() {
   [[ "${1:-}" == "--" ]] && shift
   ( cd "$d/repo" && env PATH="$BIN:$PATH" FAKE_GH_DIR="$d/gh" XDG_STATE_HOME="$d/state" \
       GIT_CMD_LOG="$d/git.calls" ${envs[@]+"${envs[@]}"} \
-      bash "$DELIVER_ABS" --map 3 --verify-cmd true --issue-max-iterations 1 "$@" \
+      bash "$DELIVER_ABS" --map 3 --verify-cmd true --issue-max-iterations 1 \
+        --ci-poll-seconds 0 --ci-grace-seconds 0 "$@" \
       >"$d/out" 2>"$d/err" )
 }
 
@@ -889,6 +994,134 @@ job_refused() {
   run_deliver refused FAKE_GH_MERGE_FAIL=1
   echo $? > "$WORK/refused/rc"
 }
+job_stopfile() {
+  new_fixture stopfile
+  run_deliver stopfile FAKE_GH_TOUCH_STOP=1
+  echo $? > "$WORK/stopfile/rc"
+}
+job_budget() {
+  new_fixture budget
+  run_deliver budget -- --budget-usd 0.06
+  echo $? > "$WORK/budget/rc"
+}
+
+# --- #61 S3: --resume / --retry ------------------------------------------------
+job_killresume() {
+  new_fixture killresume
+  run_deliver killresume FAKE_GH_KILL_AFTER_PR_OPEN=1
+  echo $? > "$WORK/killresume/rc1"
+  run_deliver killresume STUB_REVIEW_LOG="$WORK/killresume/review.log" -- --resume
+  echo $? > "$WORK/killresume/rc"
+}
+job_budgetresume() {
+  new_fixture budgetresume
+  run_deliver budgetresume -- --budget-usd 0.06
+  echo $? > "$WORK/budgetresume/rc1"
+  run_deliver budgetresume -- --resume --budget-usd 100
+  echo $? > "$WORK/budgetresume/rc"
+}
+job_stopresume() {
+  new_fixture stopresume
+  run_deliver stopresume FAKE_GH_TOUCH_STOP=1
+  echo $? > "$WORK/stopresume/rc1"
+  run_deliver stopresume -- --resume
+  echo $? > "$WORK/stopresume/rc"
+}
+job_locklive() {
+  new_fixture locklive
+  local d="$WORK/locklive"
+  sleep 60 & local holder=$!
+  mkdir -p "$d/repo/tmp/deliver/fakerun-live"
+  jq -n --argjson map 3 --arg base integration/x --arg run_id fakerun-live --arg version 0.0.0 \
+     '{run_id:$run_id, map:$map, base:$base, runner_version:$version, active_seconds:0, issues:{}}' \
+     > "$d/repo/tmp/deliver/fakerun-live/state.json"
+  echo "$holder" > "$d/repo/tmp/deliver/fakerun-live/lock"
+  run_deliver locklive -- --resume
+  echo $? > "$d/rc"
+  kill "$holder" 2>/dev/null
+}
+job_lockstale() {
+  new_fixture lockstale
+  local d="$WORK/lockstale"
+  ( exit 0 ) & local deadpid=$!
+  wait "$deadpid" 2>/dev/null
+  mkdir -p "$d/repo/tmp/deliver/fakerun-stale"
+  jq -n --argjson map 3 --arg base integration/x --arg run_id fakerun-stale --arg version 0.0.0-test \
+     '{run_id:$run_id, map:$map, base:$base, runner_version:$version, active_seconds:7, issues:{}}' \
+     > "$d/repo/tmp/deliver/fakerun-stale/state.json"
+  echo "$deadpid" > "$d/repo/tmp/deliver/fakerun-stale/lock"
+  run_deliver lockstale -- --resume
+  echo $? > "$d/rc"
+}
+job_retry() {
+  new_fixture retry with4
+  run_deliver retry STUB_STALL_ISSUES=1 -- --issue-max-iterations 2
+  echo $? > "$WORK/retry/rc1"
+  run_deliver retry -- --resume --retry '#1'
+  echo $? > "$WORK/retry/rc"
+}
+job_stopfixresume() {
+  # A STOP while BUILD works on review fix item R1.1; --resume must finish
+  # that fix round (not redo it, not skip it, not spend a second round).
+  new_fixture stopfix
+  run_deliver stopfix STUB_REVIEW=blocker-once STUB_REVIEW_STATE="$WORK/stopfix/review.state" \
+    STUB_STOP_ON_SLICE=R1.1 STUB_STOP_MARKER="$WORK/stopfix/stop.marker"
+  echo $? > "$WORK/stopfix/rc1"
+  cp "$(ls -d "$WORK"/stopfix/repo/tmp/deliver/*/ | head -1)state.json" "$WORK/stopfix/state1.json" 2>/dev/null
+  run_deliver stopfix STUB_REVIEW=blocker-once STUB_REVIEW_STATE="$WORK/stopfix/review.state" -- --resume
+  echo $? > "$WORK/stopfix/rc"
+}
+job_stopciresume() {
+  # A STOP during the CI wait (after an approving review): --resume goes
+  # straight back to CI and the merge — no second review call.
+  new_fixture stopci
+  run_deliver stopci FAKE_GH_STOP_ON="pr checks" STUB_REVIEW_LOG="$WORK/stopci/review.log"
+  echo $? > "$WORK/stopci/rc1"
+  run_deliver stopci STUB_REVIEW_LOG="$WORK/stopci/review.log" -- --resume
+  echo $? > "$WORK/stopci/rc"
+}
+job_stopcifixresume() {
+  # A STOP while BUILD works on CI fix item C1 (CI red, then green): --resume
+  # must finish that CI fix round — no second round, C1 once, then merge.
+  new_fixture stopcifix
+  mkdir -p "$WORK/stopcifix/gh/ci" "$WORK/stopcifix/gh/runs"
+  printf '%s\n%s\n' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/556/job/1"}]' \
+    '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"https://github.com/o/r/actions/runs/556/job/1"}]' \
+    > "$WORK/stopcifix/gh/ci/4"
+  printf 'Error: red\n' > "$WORK/stopcifix/gh/runs/556.log"
+  run_deliver stopcifix STUB_STOP_ON_SLICE=C1 STUB_STOP_MARKER="$WORK/stopcifix/stop.marker" -- --issue-max-iterations 2
+  echo $? > "$WORK/stopcifix/rc1"
+  cp "$(ls -d "$WORK"/stopcifix/repo/tmp/deliver/*/ | head -1)state.json" "$WORK/stopcifix/state1.json" 2>/dev/null
+  run_deliver stopcifix STUB_REVIEW_LOG="$WORK/stopcifix/review.log" -- --resume --issue-max-iterations 2
+  echo $? > "$WORK/stopcifix/rc"
+}
+job_stopciredresume() {
+  # Red → CI fix round → the second CI wait is interrupted (STOP on the 2nd
+  # poll, still pending) → --resume finds CI red again: one CI fix round per
+  # issue, so it parks — it must not spend a second round on the new head.
+  new_fixture stopcired
+  mkdir -p "$WORK/stopcired/gh/ci" "$WORK/stopcired/gh/runs"
+  printf '%s\n%s\n%s\n' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/557/job/1"}]' \
+    '[{"name":"build","state":"IN_PROGRESS","bucket":"pending","link":"https://github.com/o/r/actions/runs/557/job/1"}]' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/557/job/1"}]' \
+    > "$WORK/stopcired/gh/ci/4"
+  printf 'Error: still red\n' > "$WORK/stopcired/gh/runs/557.log"
+  run_deliver stopcired FAKE_GH_STOP_ON="pr checks" FAKE_GH_STOP_ON_NTH=2 -- --issue-max-iterations 2
+  echo $? > "$WORK/stopcired/rc1"
+  run_deliver stopcired -- --resume --issue-max-iterations 2
+  echo $? > "$WORK/stopcired/rc"
+}
+job_retrynotparked() {
+  # --retry on an issue the run left in flight (PR open, not parked) must be
+  # refused, and must not close the PR or delete the branch (#61 review I1).
+  new_fixture retrynotparked
+  run_deliver retrynotparked FAKE_GH_KILL_AFTER_PR_OPEN=1
+  echo $? > "$WORK/retrynotparked/rc1"
+  run_deliver retrynotparked -- --resume --retry '#1'
+  echo $? > "$WORK/retrynotparked/rc"
+}
 job_refusedonce() {
   new_fixture refusedonce
   run_deliver refusedonce FAKE_GH_MERGE_REFUSE_ONCE=1
@@ -1030,6 +1263,19 @@ bg job_rvmutatevariant mutate-hook
 bg job_rvexample
 bg job_rvwronghead
 bg job_refused
+bg job_stopfile
+bg job_budget
+bg job_killresume
+bg job_budgetresume
+bg job_stopresume
+bg job_locklive
+bg job_lockstale
+bg job_retry
+bg job_retrynotparked
+bg job_stopfixresume
+bg job_stopciresume
+bg job_stopcifixresume
+bg job_stopciredresume
 bg job_refusedonce
 bg job_squash
 bg job_baseadv_clean
@@ -1129,6 +1375,65 @@ REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
   && jq -r '.comments[0].body' "$H/gh/prs/4.json" | grep -q 'nit' \
   && ok "review: a suggestion's note never lands in the plan or PR body, only the review comment" \
   || note "review: suggestion 'nit' leaked into the plan or PR body, or missing from the comment"
+
+# --- forge.sh: marker dedupe and PR lookup (#61 S2, on the happy fixture) -----
+PR1="$(jq -r '.issues["1"].pr' "$RUNDIR/state.json")"
+HEAD1="$(jq -r .headRefOid "$H/gh/prs/$PR1.json")"
+MARKER1="$(review_marker 1 1 "$HEAD1")"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment_has_marker "$PR1" "$MARKER1" \
+  && ok "forge_pr_comment_has_marker: finds the marker actually posted on PR #$PR1" \
+  || note "forge_pr_comment_has_marker: did not find '$MARKER1' on PR #$PR1"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment_has_marker "$PR1" "$(review_marker 1 99 deadbeef)" \
+  && note "forge_pr_comment_has_marker: found a marker that was never posted" \
+  || ok "forge_pr_comment_has_marker: misses a marker that was never posted"
+MERGED_MARKER="<!-- deliver:merged issue=1 pr=$PR1 -->"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_issue_comment_has_marker 1 "$MERGED_MARKER" \
+  && ok "forge_issue_comment_has_marker: finds the merged-notice marker on issue #1" \
+  || note "forge_issue_comment_has_marker: did not find '$MERGED_MARKER' on issue #1"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_issue_comment_has_marker 1 "<!-- deliver:park issue=1 -->" \
+  && note "forge_issue_comment_has_marker: found a park marker on an issue that was never parked" \
+  || ok "forge_issue_comment_has_marker: misses a marker that was never posted"
+BRANCH1="$(jq -r .headRefName "$H/gh/prs/$PR1.json")"
+FOUND_PR="$(PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_for_branch "$BRANCH1")"
+[[ "$FOUND_PR" == "$PR1" ]] \
+  && ok "forge_pr_for_branch: finds the (now-merged) PR opened for the branch, by name alone" \
+  || note "forge_pr_for_branch: expected #$PR1, got '$FOUND_PR'"
+PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_for_branch "feat/999-does-not-exist" \
+  && note "forge_pr_for_branch: found a PR for a branch that never had one" \
+  || ok "forge_pr_for_branch: no PR for a branch that never had one"
+# The exact guard review_issue/park_issue/the merged comment use in deliver.sh:
+# post only when the marker is absent. Calling it twice for the same head must
+# still add exactly one comment — this is what makes review_issue idempotent
+# across a resume (#61 S3 will call it again for an issue already reviewed).
+echo "a second review attempt for the same head" > "$WORK/happy/dup-comment.md"
+for _ in 1 2; do
+  PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment_has_marker "$PR1" "$MARKER1" \
+    || PATH="$BIN:$PATH" FAKE_GH_DIR="$H/gh" forge_pr_comment "$PR1" "$WORK/happy/dup-comment.md"
+done
+POST_CALLS="$(grep -c "^pr comment $PR1 " "$H/gh/calls")"
+[[ "$(jq -r '.comments | length' "$H/gh/prs/$PR1.json")" -eq 1 && "$POST_CALLS" -eq 1 ]] \
+  && ok "review comment dedupe: the marker guard run twice on the same head posts one comment" \
+  || note "review comment dedupe: PR #$PR1 has $(jq -r '.comments | length' "$H/gh/prs/$PR1.json") comment(s) after $POST_CALLS 'pr comment' call(s)"
+
+# --- run state (#61 S1): state.json / events.jsonl / status.json / lock -------
+jq -e '.map==3 and .base=="integration/x" and (.runner_version|type=="string") and (.active_seconds|type=="number")
+       and .issues["1"].state=="merged" and .issues["2"].state=="merged"
+       and (.issues["1"].pr|type=="number") and (.issues["1"].head|type=="string")' "$RUNDIR/state.json" >/dev/null \
+  && ok "state.json: run identity and both issues recorded merged, with their pr and head" \
+  || note "state.json: $(cat "$RUNDIR/state.json" 2>/dev/null)"
+[[ -s "$RUNDIR/events.jsonl" ]] && jq -e . "$RUNDIR/events.jsonl" >/dev/null 2>&1 \
+  && [[ "$(jq -c 'select(.event=="merged")' "$RUNDIR/events.jsonl" 2>/dev/null | wc -l | tr -d ' ')" -eq 2 ]] \
+  && ok "events.jsonl: one valid JSON row per transition, both merges recorded" \
+  || note "events.jsonl: $(tr '\n' '|' < "$RUNDIR/events.jsonl" 2>/dev/null)"
+jq -e '.state=="done" and .merged_count==2 and .parked_count==0 and (.cost_usd|type=="number") and (.elapsed_s|type=="number")' \
+  "$RUNDIR/status.json" >/dev/null \
+  && ok "status.json: final run headline (state, merged/parked counts, cost, elapsed)" \
+  || note "status.json: $(cat "$RUNDIR/status.json" 2>/dev/null)"
+[[ ! -f "$RUNDIR/lock" ]] && ok "lock file is removed on exit" || note "lock file left behind: $(cat "$RUNDIR/lock")"
+USAGE_OUT="$(bash "$REPORT_ABS" "$RUNDIR" 2>&1)"; USAGE_RC=$?
+[[ "$USAGE_RC" -eq 0 && "$USAGE_OUT" == *"## Per run"* ]] \
+  && ok "run-<id>.jsonl stays in loop.sh's schema: /usage-report's aggregation reads it without error" \
+  || note "usage-report: rc=$USAGE_RC, out: $(head -3 <<<"$USAGE_OUT" | tr '\n' '|')"
 
 # --- guardrails (ADR-0007), over every command the runner ran ----------------
 if grep -E '(^| )push( |$)' "$H/git.calls" | grep -qE -- '(--force|--force-with-lease|(^| )-f( |$)|(^| )-[a-zA-Z]*f[a-zA-Z]*( |$))'; then
@@ -1556,6 +1861,7 @@ RC="$(cat "$CX/rc")"
 CX_RUNDIR="$(ls -d "$CX"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
 [[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CX/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$CX/gh/prs/5.json")" == "MERGED" ]] \
   && grep -q '^- \[x\] C1 Fix red CI: build$' "$CX_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && grep -qF 'CI check `build` failed on PR #4.' "$CX_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
   && grep -qF 'Build failed at step 3' "$CX_RUNDIR/issues/1/ci-fail-1.log" \
   && [[ "$(cat "$CX_RUNDIR"/run-*.jsonl 2>/dev/null | jq -cs '[.[] | select(.phase=="ci" and .issue==1)] | map(.round) | sort')" == "[1,2]" ]] \
   && ok "CI: a red check's fix round can turn CI green — merged, plan shows C1 ticked, run log records both CI polls" \
@@ -1569,5 +1875,177 @@ RC="$(cat "$CT/rc")"
   && jq -r '.comments[-1].body' "$CT/gh/issues/1.json" | grep -qF 'CI still pending after 1s on PR #4' \
   && ok "CI: still pending after --ci-timeout parks the issue" \
   || note "ci timeout: exit $RC"
+
+# --- STOP file present before the run's first issue (#61 S1) ------------------
+RC="$(cat "$WORK/stopfile/rc")"
+SF="$WORK/stopfile"
+SFRUNDIR="$(ls -d "$SF"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 6 ]] && [[ -n "$SFRUNDIR" && -f "${SFRUNDIR}STOP" ]] \
+  && [[ "$(jq -r .state "${SFRUNDIR}status.json" 2>/dev/null)" == "stopped" ]] \
+  && [[ ! -f "$SF/gh/prs/4.json" ]] && ! grep -q '^pr create' "$SF/gh/calls" 2>/dev/null \
+  && ok "a STOP file present before the run's first issue: exit 6, state 'stopped', no PR opened" \
+  || note "STOP file: exit $RC, status=$(cat "${SFRUNDIR}status.json" 2>/dev/null), prs=$(ls "$SF/gh/prs" 2>/dev/null | tr '\n' ' ')"
+
+# --- a global budget small enough to trip after the first issue (#61 S1) ------
+# #1's own inner run (plan+build+verify calls, ~$0.03) plus its review (~$0.02)
+# comes to ~$0.05, under the $0.06 cap, so #1 merges; #2's own inner run pushes
+# the total past it, so the run stops before #2 finishes — the merge #1
+# already made is not undone.
+RC="$(cat "$WORK/budget/rc")"
+BD="$WORK/budget"
+BDRUNDIR="$(ls -d "$BD"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 4 ]] && [[ "$(jq -r .state "${BDRUNDIR}status.json" 2>/dev/null)" == "budget_exhausted" ]] \
+  && [[ "$(jq -r .state "$BD/gh/prs/4.json" 2>/dev/null)" == "MERGED" ]] \
+  && [[ ! -f "$BD/gh/prs/5.json" ]] \
+  && [[ "$(jq -r '.issues["2"].state // "none"' "${BDRUNDIR}state.json" 2>/dev/null)" != "merged" ]] \
+  && ok "a global budget cap small enough to trip after the first issue: exit 4, #1 merged, #2 left unfinished (resumable)" \
+  || note "budget cap: exit $RC, status=$(cat "${BDRUNDIR}status.json" 2>/dev/null), issues=$(jq -c .issues "${BDRUNDIR}state.json" 2>/dev/null)"
+jq -e '(.issues["1"].issue_budget_usd // 10) < 10 and (.issues["2"].issue_budget_usd // 10) < 10' "${BDRUNDIR}state.json" >/dev/null 2>&1 \
+  && ok "clipped per-issue caps are recorded on state.json: less than the default --issue-budget-usd (10)" \
+  || note "clipped caps: issues=$(jq -c .issues "${BDRUNDIR}state.json" 2>/dev/null)"
+
+# --- #61 S3: --resume after the runner is killed right after a PR opens -------
+RC1="$(cat "$WORK/killresume/rc1")"
+RC="$(cat "$WORK/killresume/rc")"
+KR="$WORK/killresume"
+[[ "$RC1" -ge 128 ]] \
+  && ok "kill+resume: the first attempt is killed right after PR #4 opens (terminated by signal)" \
+  || note "kill+resume: first attempt exited $RC1 (expected a signal kill)"
+[[ "$RC" -eq 0 ]] \
+  && ok "kill+resume: --resume finishes the run (exit 0)" \
+  || note "kill+resume: --resume exited $RC — $(tail -3 "$KR/err" | tr '\n' '|')"
+[[ "$(jq -r .state "$KR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$KR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "kill+resume: both issues' PRs end up merged" \
+  || note "kill+resume: PR states #4=$(jq -r .state "$KR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$KR/gh/prs/5.json" 2>/dev/null)"
+[[ "$(jq -r '.comments | length' "$KR/gh/prs/4.json" 2>/dev/null)" -eq 1 ]] \
+  && [[ "$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)" -eq 2 ]] \
+  && ok "kill+resume: the issue resumed at pr-open gets exactly one PR and one review comment, not two" \
+  || note "kill+resume: PR #4 comments=$(jq -r '.comments|length' "$KR/gh/prs/4.json" 2>/dev/null), pr-create calls=$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)"
+
+# --- #61 S3: --resume after a global budget cap ---------------------------------
+RC1="$(cat "$WORK/budgetresume/rc1")"
+RC="$(cat "$WORK/budgetresume/rc")"
+BR="$WORK/budgetresume"
+[[ "$RC1" -eq 4 ]] \
+  && ok "budget+resume: a small global budget trips after the first issue (exit 4)" \
+  || note "budget+resume: first attempt exited $RC1"
+[[ "$RC" -eq 0 ]] \
+  && ok "budget+resume: --resume with a larger --budget-usd finishes the run (exit 0)" \
+  || note "budget+resume: --resume exited $RC — $(tail -3 "$BR/err" | tr '\n' '|')"
+[[ "$(jq -r .state "$BR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$BR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "budget+resume: both issues end up merged" \
+  || note "budget+resume: PR states #4=$(jq -r .state "$BR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$BR/gh/prs/5.json" 2>/dev/null)"
+
+# --- #61 S3: --resume after a STOP file -----------------------------------------
+RC1="$(cat "$WORK/stopresume/rc1")"
+RC="$(cat "$WORK/stopresume/rc")"
+SR="$WORK/stopresume"
+[[ "$RC1" -eq 6 ]] \
+  && ok "stop+resume: a STOP file present before the first issue stops the run (exit 6)" \
+  || note "stop+resume: first attempt exited $RC1"
+[[ "$RC" -eq 0 ]] \
+  && ok "stop+resume: --resume after a STOP finishes the run (exit 0)" \
+  || note "stop+resume: --resume exited $RC — $(tail -3 "$SR/err" | tr '\n' '|')"
+[[ "$(jq -r .state "$SR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$SR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "stop+resume: both issues end up merged" \
+  || note "stop+resume: PR states #4=$(jq -r .state "$SR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$SR/gh/prs/5.json" 2>/dev/null)"
+
+# --- #61 S3: --resume refuses a live lock, removes a stale one ------------------
+RC="$(cat "$WORK/locklive/rc")"
+LL="$WORK/locklive"
+[[ "$RC" -eq 1 ]] && grep -q 'refusing to resume a live run' "$LL/err" \
+  && ok "resume: a lock whose pid is still alive is refused, not removed" \
+  || note "live lock: exit $RC — $(tail -3 "$LL/err" | tr '\n' '|')"
+
+RC="$(cat "$WORK/lockstale/rc")"
+LS="$WORK/lockstale"
+[[ "$RC" -eq 0 ]] \
+  && ok "resume: a stale lock (dead pid) is removed and the run proceeds (exit 0)" \
+  || note "stale lock: exit $RC — $(tail -3 "$LS/err" | tr '\n' '|')"
+grep -q 'removing a stale lock' "$LS/err" \
+  && ok "resume: the stale-lock removal is logged" \
+  || note "stale lock: no removal message: $(tail -3 "$LS/err" | tr '\n' '|')"
+grep -q "plugin version changed since run fakerun-stale started (0.0.0-test -> $REAL_PLUGIN_VERSION)" "$LS/err" \
+  && ok "resume: a plugin.json version different from the one state.json recorded is warned about, not refused" \
+  || note "version warning: $(grep -o 'plugin version changed.*' "$LS/err" | head -1)"
+
+# --- #61 S3: --retry '#N' on a parked issue starts a fresh inner run ------------
+RC1="$(cat "$WORK/retry/rc1")"
+RC="$(cat "$WORK/retry/rc")"
+RT="$WORK/retry"
+# parked_one checks issue #1's *current* state, which --retry has since moved
+# on from (needs-human removed, Map line ticked) — this checks the historical
+# park comment instead, which --retry never removes.
+[[ "$RC1" -eq 2 ]] \
+  && jq -r '[.comments[].body] | join("\n")' "$RT/gh/issues/1.json" | grep -q '^\*\*Parked by `/deliver`\*\*' \
+  && ok "retry: the first attempt stalls on #1, parks it, still delivers independent #4 (exit 2)" \
+  || note "retry: first attempt exited $RC1"
+[[ "$RC" -eq 0 ]] \
+  && ok "retry: --resume --retry '#1' finishes the run (exit 0)" \
+  || note "retry: --resume --retry exited $RC — $(tail -3 "$RT/err" | tr '\n' '|')"
+MAPB_RT="$(jq -r .body "$RT/gh/issues/3.json")"
+[[ "$MAPB_RT" == *"- [x] #1 "* && "$MAPB_RT" == *"- [x] #2 "* && "$MAPB_RT" == *"- [x] #4 "* ]] \
+  && [[ "$(jq -r '[.labels[].name] | index("needs-human")' "$RT/gh/issues/1.json")" == "null" ]] \
+  && ok "retry: #1 is delivered on a fresh branch, #2 (after #1) follows, needs-human is gone" \
+  || note "retry: map=$(printf '%s' "$MAPB_RT" | grep '#' | tr '\n' '|') labels=$(jq -c '[.labels[].name]' "$RT/gh/issues/1.json")"
+RTRUNDIR="$(ls -d "$RT"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+grep -q '"issue":1,"event":"retry"' "${RTRUNDIR}events.jsonl" 2>/dev/null \
+  && ok "retry: the retry transition for #1 is recorded in events.jsonl" \
+  || note "retry: events.jsonl missing a retry row for #1: $(tr '\n' '|' < "${RTRUNDIR}events.jsonl" 2>/dev/null)"
+
+# --- #61 review: a STOP mid-fix-round, then --resume, finishes that round ------
+SF="$WORK/stopfix"
+RC1="$(cat "$SF/rc1")"; RC="$(cat "$SF/rc")"
+SFRUNDIR="$(ls -d "$SF"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC1" -eq 6 && "$(jq -r '.issues["1"].fix // empty' "$SF/state1.json" 2>/dev/null)" == "review" ]] \
+  && [[ "$RC" -eq 0 ]] \
+  && [[ "$(jq -r .state "$SF/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$SF/gh/prs/5.json")" == "MERGED" ]] \
+  && [[ "$(cat "${SFRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && [[ "$(grep -c '^- \[.\] R1\.1' "${SFRUNDIR}issues/1/IMPLEMENTATION_PLAN.md")" -eq 1 ]] \
+  && [[ "$(jq -r '[.comments[].body | select(contains("deliver:review issue=1 "))] | length' "$SF/gh/prs/4.json")" -eq 2 ]] \
+  && ok "resume: a STOP mid-review-fix-round (state fix=review) is finished on --resume — one round spent, R1.1 once, round 2 approves, merged" \
+  || note "stop mid-fix: rc1=$RC1 fix=$(jq -r '.issues["1"].fix // "-"' "$SF/state1.json" 2>/dev/null) rc=$RC rounds=$(cat "${SFRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) — $(tail -3 "$SF/err" | tr '\n' '|')"
+
+SC="$WORK/stopci"
+RC1="$(cat "$SC/rc1")"; RC="$(cat "$SC/rc")"
+[[ "$RC1" -eq 6 && "$RC" -eq 0 ]] \
+  && [[ "$(jq -r .state "$SC/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(wc -l < "$SC/review.log" 2>/dev/null)" -eq 2 ]] \
+  && grep -q -- '--resume continuing at: ci' "$SC/err" \
+  && ok "resume: a STOP during the CI wait resumes at CI — the approved head is not reviewed again (2 reviews for 2 issues)" \
+  || note "stop in CI: rc1=$RC1 rc=$RC reviews=$(wc -l < "$SC/review.log" 2>/dev/null) — $(tail -3 "$SC/err" | tr '\n' '|')"
+
+SX="$WORK/stopcifix"
+RC1="$(cat "$SX/rc1")"; RC="$(cat "$SX/rc")"
+SXRUNDIR="$(ls -d "$SX"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC1" -eq 6 && "$(jq -r '.issues["1"].fix // empty' "$SX/state1.json" 2>/dev/null)" == "ci" ]] \
+  && [[ "$RC" -eq 0 && "$(jq -r .state "$SX/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(cat "${SXRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && [[ "$(grep -c '^- \[.\] C1 Fix red CI: build$' "${SXRUNDIR}issues/1/IMPLEMENTATION_PLAN.md")" -eq 1 ]] \
+  && grep -q -- '--resume continuing at: ci-fix' "$SX/err" \
+  && [[ "$(wc -l < "$SX/review.log" 2>/dev/null)" -eq 1 ]] \
+  && ok "resume: a STOP mid-CI-fix-round (state fix=ci) is finished on --resume — one round, C1 once, no second review of #1, merged" \
+  || note "stop mid-CI-fix: rc1=$RC1 fix=$(jq -r '.issues["1"].fix // "-"' "$SX/state1.json" 2>/dev/null) rc=$RC rounds=$(cat "${SXRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) reviews=$(wc -l < "$SX/review.log" 2>/dev/null) — $(tail -3 "$SX/err" | tr '\n' '|')"
+
+SR2="$WORK/stopcired"
+RC1="$(cat "$SR2/rc1")"; RC="$(cat "$SR2/rc")"
+SR2RUNDIR="$(ls -d "$SR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC1" -eq 6 && "$RC" -eq 2 ]] \
+  && [[ "$(cat "${SR2RUNDIR}issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && ! grep -q 'C2 Fix red CI' "${SR2RUNDIR}issues/1/IMPLEMENTATION_PLAN.md" \
+  && jq -r '.comments[-1].body' "$SR2/gh/issues/1.json" | grep -qF 'CI failed again on PR #4 after its fix round: build' \
+  && ok "resume: CI red again after the fix round parks on --resume too — no second CI round on the new head" \
+  || note "stop in 2nd CI wait: rc1=$RC1 rc=$RC rounds=$(cat "${SR2RUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) — $(tail -3 "$SR2/err" | tr '\n' '|')"
+
+# --- #61 review I1: --retry refuses an issue that is not parked -----------------
+RC="$(cat "$WORK/retrynotparked/rc")"
+RN="$WORK/retrynotparked"
+[[ "$(cat "$RN/rc1")" -ge 128 && "$RC" -eq 1 ]] \
+  && grep -qE "records #1 as '[a-z-]+', not parked" "$RN/err" \
+  && [[ "$(jq -r .state "$RN/gh/prs/4.json" 2>/dev/null)" == "OPEN" ]] \
+  && ! grep -q '^pr close' "$RN/gh/calls" \
+  && [[ -n "$(git -C "$RN/remote.git" rev-parse --verify -q "refs/heads/$(jq -r .headRefName "$RN/gh/prs/4.json")")" ]] \
+  && ok "retry: --retry on an in-flight (pr-open) issue is refused — PR stays open, branch kept" \
+  || note "retry not parked: rc1=$(cat "$RN/rc1") rc=$RC — $(tail -2 "$RN/err" | tr '\n' '|'), PR #4=$(jq -r .state "$RN/gh/prs/4.json" 2>/dev/null)"
 
 finish
