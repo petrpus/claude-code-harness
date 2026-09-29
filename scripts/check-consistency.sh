@@ -283,6 +283,16 @@ for f in $DOC_FLAGS; do
     || note "SKILL.md documents $f, which deliver.sh does not accept"
 done
 
+# ---------------------------------------------------------------------------
+section "harness-doctor names the deliver readiness checks"
+HD="skills/harness-doctor/SKILL.md"
+for pat in 'command -v tmux' 'setsid nohup' 'command -v jq' 'gh auth status' 'gh label list' 'git check-ignore -q tmp/'; do
+  grep -qF -- "$pat" "$HD" && ok "harness-doctor names '$pat'" || note "harness-doctor does not name '$pat'"
+done
+for l in map prd ready-for-agent needs-human needs-triage; do
+  grep -qF -- "\`$l\`" "$HD" && ok "harness-doctor names label $l" || note "harness-doctor does not name label $l"
+done
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
