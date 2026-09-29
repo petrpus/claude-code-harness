@@ -42,7 +42,10 @@ has since been reviewed, merged and had its branch deleted by hand.
    (`ROUNDS_USED`) not spent again — instead of re-reviewing an unfixed head
    or dropping the plan item. Otherwise the review resumes at its recorded
    `round` with the previous round's findings inlined, or, once
-   `approved_head` is the PR's head, skips straight to the CI wait. A local
+   `approved_head` is the PR's head, skips straight to the CI wait. A
+   CI fix round that finished sets `ci_fixed`: red CI after it parks on a
+   resumed run exactly as on an uninterrupted one (ADR-0010's one CI round),
+   instead of the new head's budget key buying a second round. A local
    branch ahead of origin with no fix pending is re-verified and pushed
    first; one that diverged stops the run for a human.
 6. `--retry '#N'` discards only an attempt this run recorded as `parked`.

@@ -210,7 +210,7 @@ each `claude -p` in its own process group, so the signal never reaches the
 call, and the runner waits for it. Instead, drop a `STOP` file at
 `tmp/deliver/<run-id>/STOP` (e.g. `touch tmp/deliver/*/STOP`) — it is checked
 between phases (before a branch, after a build, before a PR, before a
-review, before a merge) and passed to every `loop.sh` call as `--stop-file`,
+review, on every poll of the CI wait, before a merge) and passed to every `loop.sh` call as `--stop-file`,
 so a build already in flight stops the same way. The run ends with exit
 **6**, state `stopped`, the in-flight issue left non-terminal — resumable.
 

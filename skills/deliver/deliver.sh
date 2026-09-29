@@ -47,7 +47,7 @@
 # runner's own model calls, loop.sh's schema, so /usage-report reads it) and
 # a lock file holding this process's pid, removed on exit. A STOP file at
 # tmp/deliver/<run-id>/STOP is checked between phases (before a branch, after
-# a build, before a PR, before a review, before a merge) and passed to every
+# a build, before a PR, before a review, during the CI wait, before a merge) and passed to every
 # loop.sh call as --stop-file, so a build stopped mid-run stops the same way.
 # --budget-usd / --max-minutes cap the whole run (every inner run's cost and
 # this run's active time, summed — see state.sh); each issue's own
@@ -338,7 +338,7 @@ stop_run() {
 # check_caps <phase-label> — the STOP file, then the global budget, then the
 # global time cap, in that order; the first one that trips ends the run via
 # stop_run (never returns). Called between phases (before a branch, after a
-# build, before a PR, before a review, before a merge) so an issue never
+# build, before a PR, before a review, during the CI wait, before a merge) so an issue never
 # starts a phase the run cannot afford to let finish.
 check_caps() {
   local phase="$1"
@@ -783,6 +783,9 @@ ci_wait() {
         return 0
       fi
     fi
+    # A STOP (or a global cap) should not have to outwait a long CI run; the
+    # issue stays at ci-wait, which --resume re-enters (#61).
+    check_caps "during the CI wait (#$n)"
     if [[ "$elapsed" -ge "$CI_TIMEOUT_SECONDS" ]]; then
       deliver_logline ci "$n" "$round" timeout
       PARK_REASON="CI still pending after ${CI_TIMEOUT_SECONDS}s on PR #$pr"
@@ -853,7 +856,7 @@ ci_fix_prepare() {
   local check logf plan="$dir/IMPLEMENTATION_PLAN.md" fence
   check="$(jq -r '.[0].name // "CI"' <<<"$CI_FAILED_JSON")"
   state_issue_update "$RUN_DIR" "$n" \
-    "$(jq -cn --argjson r "$round" --arg h "$(git rev-parse HEAD)" '{state:"fixing", fix:"ci", ci_round:$r, fix_base:$h}')"
+    "$(jq -cn --argjson r "$round" --arg h "$(git rev-parse HEAD)" '{state:"fixing", fix:"ci", ci_round:$r, fix_base:$h, fix_check:null, fix_log:null}')"
   logf="$(ci_failed_log_fetch "$dir")"
   fence="$(md_tilde_fence < "$logf")"
   grep -qE "^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]+C$round([[:space:]]|$)" "$plan" 2>/dev/null || {
@@ -1288,7 +1291,15 @@ deliver_issue() {
     state_issue_update "$RUN_DIR" "$n" '{"state":"ci-wait"}'
     ci_wait "$n" "$pr" "$dir" 1; ci_rc=$?
   fi
-  if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
+  if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" && "$phase" != "ci-fix" ]] \
+     && [[ "$(jq -r --arg n "$n" '.issues[$n].ci_fixed // false' "$RUN_DIR/state.json" 2>/dev/null)" == "true" ]]; then
+    # One CI fix round per issue (ADR-0010): red again after it parks, even
+    # when a --resume is what brought the run back to this CI wait — the new
+    # head's budget key would otherwise buy a second round an uninterrupted
+    # run never gets.
+    PARK_REASON="CI failed again on PR #$pr after its fix round: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON")"
+    PARK_LOG="$(ci_failed_log_fetch "$dir")"
+  elif [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
     if [[ "$phase" == "ci-fix" ]] || ci_round="$(round_budget_use "$dir" "ci@$head_sha")"; then
       [[ "$phase" == "ci-fix" ]] || ci_fix_prepare "$n" "$pr" "$dir" "$ci_round"
       ci_fix_build "$n" "$pr" "$dir"; fix_rc=$?
@@ -1297,7 +1308,7 @@ deliver_issue() {
            # A CI fix head is not reviewed again (ADR-0010); recording it as
            # approved keeps a --resume from the next CI wait or the merge
            # from reviewing it after all.
-           state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$head_sha" '{state:"ci-wait", fix:null, fix_base:null, head:$h, approved_head:$h}')"
+           state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$head_sha" '{state:"ci-wait", fix:null, fix_base:null, fix_check:null, fix_log:null, ci_fixed:true, head:$h, approved_head:$h}')"
            ci_wait "$n" "$pr" "$dir" "$(( ci_round + 1 ))"; ci_rc=$?
            if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
              PARK_REASON="CI failed again on PR #$pr after fix round $ci_round: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON")"

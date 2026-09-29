@@ -410,12 +410,16 @@ if [[ -n "${FAKE_GH_TOUCH_STOP:-}" ]]; then
   rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
   [[ -n "$rd" ]] && : > "${rd}STOP"
 fi
-# Same, but only on the first call whose argv starts with $FAKE_GH_STOP_ON
-# (e.g. "pr checks": a STOP that lands during the CI wait).
+# Same, but only on the Nth (default: first) call whose argv starts with
+# $FAKE_GH_STOP_ON (e.g. "pr checks": a STOP that lands during a CI wait).
 if [[ -n "${FAKE_GH_STOP_ON:-}" && "$*" == "$FAKE_GH_STOP_ON"* && ! -f "$S/.stopped-on" ]]; then
-  touch "$S/.stopped-on"
-  rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
-  [[ -n "$rd" ]] && : > "${rd}STOP"
+  stop_seen="$(( $(cat "$S/.stop-on-count" 2>/dev/null || echo 0) + 1 ))"
+  echo "$stop_seen" > "$S/.stop-on-count"
+  if [[ "$stop_seen" -ge "${FAKE_GH_STOP_ON_NTH:-1}" ]]; then
+    touch "$S/.stopped-on"
+    rd="$(ls -d tmp/deliver/*/ 2>/dev/null | head -1)"
+    [[ -n "$rd" ]] && : > "${rd}STOP"
+  fi
 fi
 # #61 S3: simulate the runner being killed right after a PR exists — SIGKILL
 # the deliver.sh pid (from the run's lock file) the moment a PR is on disk
@@ -1092,6 +1096,23 @@ job_stopcifixresume() {
   run_deliver stopcifix STUB_REVIEW_LOG="$WORK/stopcifix/review.log" -- --resume --issue-max-iterations 2
   echo $? > "$WORK/stopcifix/rc"
 }
+job_stopciredresume() {
+  # Red → CI fix round → the second CI wait is interrupted (STOP on the 2nd
+  # poll, still pending) → --resume finds CI red again: one CI fix round per
+  # issue, so it parks — it must not spend a second round on the new head.
+  new_fixture stopcired
+  mkdir -p "$WORK/stopcired/gh/ci" "$WORK/stopcired/gh/runs"
+  printf '%s\n%s\n%s\n' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/557/job/1"}]' \
+    '[{"name":"build","state":"IN_PROGRESS","bucket":"pending","link":"https://github.com/o/r/actions/runs/557/job/1"}]' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/557/job/1"}]' \
+    > "$WORK/stopcired/gh/ci/4"
+  printf 'Error: still red\n' > "$WORK/stopcired/gh/runs/557.log"
+  run_deliver stopcired FAKE_GH_STOP_ON="pr checks" FAKE_GH_STOP_ON_NTH=2 -- --issue-max-iterations 2
+  echo $? > "$WORK/stopcired/rc1"
+  run_deliver stopcired -- --resume --issue-max-iterations 2
+  echo $? > "$WORK/stopcired/rc"
+}
 job_retrynotparked() {
   # --retry on an issue the run left in flight (PR open, not parked) must be
   # refused, and must not close the PR or delete the branch (#61 review I1).
@@ -1254,6 +1275,7 @@ bg job_retrynotparked
 bg job_stopfixresume
 bg job_stopciresume
 bg job_stopcifixresume
+bg job_stopciredresume
 bg job_refusedonce
 bg job_squash
 bg job_baseadv_clean
@@ -2004,6 +2026,16 @@ SXRUNDIR="$(ls -d "$SX"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && [[ "$(wc -l < "$SX/review.log" 2>/dev/null)" -eq 1 ]] \
   && ok "resume: a STOP mid-CI-fix-round (state fix=ci) is finished on --resume — one round, C1 once, no second review of #1, merged" \
   || note "stop mid-CI-fix: rc1=$RC1 fix=$(jq -r '.issues["1"].fix // "-"' "$SX/state1.json" 2>/dev/null) rc=$RC rounds=$(cat "${SXRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) reviews=$(wc -l < "$SX/review.log" 2>/dev/null) — $(tail -3 "$SX/err" | tr '\n' '|')"
+
+SR2="$WORK/stopcired"
+RC1="$(cat "$SR2/rc1")"; RC="$(cat "$SR2/rc")"
+SR2RUNDIR="$(ls -d "$SR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC1" -eq 6 && "$RC" -eq 2 ]] \
+  && [[ "$(cat "${SR2RUNDIR}issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && ! grep -q 'C2 Fix red CI' "${SR2RUNDIR}issues/1/IMPLEMENTATION_PLAN.md" \
+  && jq -r '.comments[-1].body' "$SR2/gh/issues/1.json" | grep -qF 'CI failed again on PR #4 after its fix round: build' \
+  && ok "resume: CI red again after the fix round parks on --resume too — no second CI round on the new head" \
+  || note "stop in 2nd CI wait: rc1=$RC1 rc=$RC rounds=$(cat "${SR2RUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) — $(tail -3 "$SR2/err" | tr '\n' '|')"
 
 # --- #61 review I1: --retry refuses an issue that is not parked -----------------
 RC="$(cat "$WORK/retrynotparked/rc")"
