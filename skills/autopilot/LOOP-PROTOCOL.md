@@ -266,7 +266,7 @@ was a BUILD that ran out of `--max-turns` (`last_turn_limit` in
 `slices.json`, set by that iteration's `turn_limit`), rung 2 stays on
 `--build-model`: the item is too large for one call, not too hard for the
 model, and a stronger model hits the same cap. The runner logs a
-`{"phase":"escalation","verdict":"skipped-turn-limit"}` row and appends a
+`{"phase":"escalation","model":"-","verdict":"skipped-turn-limit"}` row and appends a
 FEEDBACK note telling BUILD to continue the checkpointed work; the rest of
 the ladder is unchanged, so a third failure still parks the slice and the
 park/replan rungs split it. Any later failure that is not a turn limit clears

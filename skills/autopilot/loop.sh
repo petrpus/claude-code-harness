@@ -994,7 +994,8 @@ while :; do
         # same cap and only costs more; the retry continues the checkpointed
         # work instead, and the ladder's park/replan splits the item.
         log_err "slice $SELECTED_ID: last failure was a turn limit — not escalating to $ESCALATE_MODEL."
-        logline "escalation" "$ESCALATE_MODEL" 0 0 0 0 0 "skipped-turn-limit"
+        # model "-": no call ran, so no model spent anything on this row.
+        logline "escalation" "-" 0 0 0 0 0 "skipped-turn-limit"
         append_feedback "turn-limit" "Not escalated to $ESCALATE_MODEL: this item's last attempt ran out of turns (--max-turns $MAX_TURNS), which a stronger model would hit too. Continue the partial work already committed; keep this attempt small enough to finish."
       else
         BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
@@ -1296,10 +1297,11 @@ while :; do
   fi
 
   if [[ -n "$SELECTED_ID" ]]; then
-    # S4A: the per-slice ladder. Rung 1 (fails once) and what would be rung 2
-    # (fails twice — escalation lands in S4B; until then it is just another
-    # retry) both fall through to "try the same slice again next iteration,"
-    # which needs no code here. Rung 3 parks the slice once its OWN failure
+    # S4A: the per-slice ladder. Rung 1 (fails once) and rung 2 (fails twice)
+    # both fall through to "try the same slice again next iteration," which
+    # needs no code here — rung 2's model escalation (S4B, skipped after a
+    # turn limit, #101) is decided before BUILD, above. The turn-limit flag
+    # recorded here is what that decision reads. Rung 3 parks the slice once its OWN failure
     # count reaches 3, regardless of which gate fingerprint each of the three
     # failures carried — a slice flailing across three different gates is
     # exactly as stuck as one failing the same gate three times.

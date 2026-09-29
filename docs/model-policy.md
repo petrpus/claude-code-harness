@@ -12,7 +12,7 @@ skeptical cheap model run many times than by one expensive pass.
 | **cheap** | `haiku` | Verification, adversarial gates, mechanical/greppable checks, lint triage, log parsing, secret-scans, classification. High volume, low judgement. |
 | **mid** | `sonnet` | Implementation, code review, refactoring, most day-to-day agent work. The default working tier. |
 | **top** | `opus` | Planning, architecture, decomposition (PRD → plan), domain modeling, grilling, resolving genuinely hard trade-offs. Low volume, high judgement. |
-| **escalation** | `--escalate-model` (default `opus`) | Rung 2 of autopilot's stuck ladder (S4B) — a slice's *next* BUILD attempt only, after it has failed twice on `--build-model`; the slice returns to `--build-model` once it ticks. `none` disables escalation outright. Never applied to the verifier — the cheap adversarial tier is the point. |
+| **escalation** | `--escalate-model` (default `opus`) | Rung 2 of autopilot's stuck ladder (S4B) — a slice's *next* BUILD attempt only, after it has failed twice on `--build-model`; the slice returns to `--build-model` once it ticks. Not after a turn limit: a slice whose last failure ran out of `--max-turns` stays on `--build-model`, since a stronger model hits the same cap (#101). `none` disables escalation outright. Never applied to the verifier — the cheap adversarial tier is the point. |
 
 `fable` is available as a fast planning-tier model where latency matters more
 than depth; treat it as an alternative top-tier for planning, not for
