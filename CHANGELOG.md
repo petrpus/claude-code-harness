@@ -4,6 +4,30 @@ All notable changes to claude-code-harness. Semver via git tags.
 
 ## [Unreleased]
 
+### Added
+
+- `/deliver`: run state, resume, stop and global caps (#61). Every run writes
+  `tmp/deliver/<run-id>/state.json` (atomic; the resume truth — map, base,
+  runner version, active time, per-issue state/branch/PR/round/head),
+  `events.jsonl` (one row per issue-state transition), `status.json` (the
+  run's current headline) and a `lock` (pid, removed on exit); `run-<run-id>.jsonl`
+  stays in `loop.sh`'s schema so `/usage-report` reads it. A `STOP` file at
+  `tmp/deliver/<run-id>/STOP` is checked between phases and passed to every
+  `loop.sh` call as `--stop-file`, ending the run with exit 6 (`stopped`).
+  `--budget-usd` / `--max-minutes` cap the whole run (summing every inner
+  `loop.sh` run's cost and this run's accumulated active time, which survives
+  a resume); tripping one ends the run with exit 4 or 3. Each issue's own
+  `--issue-budget-usd` / `--issue-max-minutes` is clipped to what the global
+  cap has left. `--resume` picks the newest run for the map, clears a stale
+  lock (refusing a live one), re-copies the runner (warning on a plugin
+  version change) and reconciles every non-terminal issue against GitHub —
+  GitHub wins (`docs/adr/0012-*.md`) — before continuing the graph walk
+  exactly where that issue's own state left it. `--retry '#N'` (with
+  `--resume`) discards a parked issue's recorded branch/PR and gives it a
+  fresh inner run. `forge_pr_comment_has_marker` / `forge_issue_comment_has_marker`
+  / `forge_pr_for_branch` (`skills/deliver/forge.sh`) make review, park and
+  merged-issue comments idempotent across a resume.
+
 ### Changed
 
 - `scripts/test-deliver.sh`: independent end-to-end fixtures now run in
