@@ -114,6 +114,13 @@ case "$prompt" in
     emit '"planned"'
     ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    # #96: a BUILD that runs out of --max-turns — claude -p exits 1 with an
+    # error_max_turns reply, having done part of the work and ticked nothing.
+    if [[ -n "${STUB_BUILD_MAX_TURNS:-}" ]]; then
+      mkdir -p src && echo "half done" >> src/partial.txt
+      printf '{"type":"result","subtype":"error_max_turns","num_turns":81,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+      exit 1
+    fi
     # --stop-file: simulate a caller requesting a stop while BUILD is busy.
     # The runner must finish this iteration and stop at the next boundary.
     [[ -n "${STUB_TOUCH_AFTER_BUILD:-}" ]] && touch "$STUB_TOUCH_AFTER_BUILD"
@@ -1617,6 +1624,31 @@ GATE37="$(cat "$R37"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(
 [[ "$GATE37" == "secret" ]] \
   && ok "a secret the verify command wrote into a non-ignored file fails the secret gate" \
   || note "verify-written secret: gate_failed='$GATE37'"
+
+# --- 38. A BUILD that runs out of --max-turns is named as such (#96) ---------
+R38="$WORK/r38"; new_repo "$R38"
+( cd "$R38" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_BUILD_MAX_TURNS=1 \
+    STUB_CALL_LOG="$WORK/r38.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 --max-turns 42 \
+    >"$WORK/r38.out" 2>"$WORK/r38.err" )
+BUILD38="$(cat "$R38"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs '[.[] | select(.phase=="build")][0].verdict' 2>/dev/null)"
+ITER38="$(cat "$R38"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rcs '[.[] | select(.phase=="iteration")][0] | [.turn_limit, .gate_failed] | join(" ")' 2>/dev/null)"
+grep -q -- '--max-turns 42' "$WORK/r38.calls" \
+  && ok "--max-turns reaches claude -p" \
+  || note "--max-turns 42 not in the calls: $(grep -oE -- '--max-turns [0-9]+' "$WORK/r38.calls" | sort -u | tr '\n' ' ')"
+[[ "$BUILD38" == "turn-limit" && "$ITER38" == "true turn-limit" ]] \
+  && grep -q 'BUILD ran out of turns (--max-turns 42)' "$R38/tmp/autopilot/FEEDBACK.md" \
+  && ok "an error_max_turns BUILD reply is logged as turn-limit (call row, iteration row, FEEDBACK)" \
+  || note "turn limit: build verdict='$BUILD38', iteration='$ITER38', FEEDBACK='$(head -c 300 "$R38/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+R39="$WORK/r39"; new_repo "$R39"
+( cd "$R39" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_BUILD_MAX_TURNS=1 \
+    bash "$LOOP_ABS" --verify-cmd false --max-iterations 1 --max-minutes 30 --budget-usd 5 --max-turns 42 \
+    >"$WORK/r39.out" 2>"$WORK/r39.err" )
+ITER39="$(cat "$R39"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rcs '[.[] | select(.phase=="iteration")][0] | [.turn_limit, .gate_failed] | join(" ")' 2>/dev/null)"
+[[ "$ITER39" == "true verify_cmd" ]] && grep -q 'BUILD also ran out of turns' "$R39/tmp/autopilot/FEEDBACK.md" \
+  && ok "a turn-limited BUILD whose work fails verify keeps gate_failed=verify_cmd, turn_limit:true, and FEEDBACK names the turn limit" \
+  || note "turn limit + red verify: iteration='$ITER39', FEEDBACK='$(head -c 300 "$R39/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
 
 # --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and

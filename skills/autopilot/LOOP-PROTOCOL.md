@@ -118,7 +118,9 @@ loop:
   then, gates green:
     STATUS: done          → checkpoint, exit 0
     more boxes ticked     → checkpoint "progress", continue (NOT a failure)
-    nothing moved         → no-progress failure
+    nothing moved         → no-progress failure (turn-limit when BUILD's call
+                            ended on --max-turns: its partial work is
+                            checkpointed and FEEDBACK says to continue it)
   any gate red            → FEEDBACK.md, reset sentinel, checkpoint WIP, maybe replan
 ```
 
@@ -485,11 +487,17 @@ run, in addition to (not instead of) the per-call rows above:
 ```json
 {"ts":"…","run_id":"…","iter":3,"phase":"iteration","model":"-",
  "verdict":"done|unmeasured|progressed|fail","slice_id":"S3A","ticked_delta":1,
- "gate_failed":"verify_cmd|secret|verify_agent|holdout|plan_dag|no_verdict|none",
+ "gate_failed":"verify_cmd|stage|secret|verify_agent|holdout|plan_dag|no_verdict|no-progress|turn-limit|none",
  "wall_s":180,"cost_usd":0.42,"files_changed":4,"verify_s":12,"dag_width":2,
- "parked_count":0,"escalated":false,"repo_map":true}
+ "parked_count":0,"escalated":false,"repo_map":true,"turn_limit":false}
 ```
 
+`turn_limit` is true when that iteration's BUILD call ended on `--max-turns`
+(its reply's `subtype` is `error_max_turns`, #96); the call's own row then
+carries `"verdict":"turn-limit"`. It is the authoritative flag:
+`gate_failed` reads `turn-limit` only when every gate passed and nothing was
+ticked — a turn-limited BUILD whose half-done work fails verify keeps
+`verify_cmd`, with the turn limit named in FEEDBACK.
 `slice_id` is the id `select_next_slice()` assigned that iteration (S1B), or
 `""` on an unannotated plan. `gate_failed` mirrors the fingerprint the stuck
 ladder tracked for that iteration, or `"none"` when every gate passed —

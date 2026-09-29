@@ -367,11 +367,11 @@ log_iteration() {
      --arg gate_failed "${4:-none}" --argjson wall_s "${5:-0}" --argjson cost_usd "${6:-0}" \
      --argjson files_changed "${7:-0}" --argjson verify_s "${8:-0}" --argjson dag_width "${9:-0}" \
      --argjson parked_count "${10:-0}" --argjson escalated "${11:-false}" \
-     --argjson repo_map "${12:-false}" \
+     --argjson repo_map "${12:-false}" --argjson turn_limit "${BUILD_TURN_LIMIT:-false}" \
      '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:"iteration",model:"-",verdict:$verdict,
        slice_id:$slice_id,ticked_delta:$ticked_delta,gate_failed:$gate_failed,wall_s:$wall_s,
        cost_usd:$cost_usd,files_changed:$files_changed,verify_s:$verify_s,dag_width:$dag_width,
-       parked_count:$parked_count,escalated:$escalated,repo_map:$repo_map}' \
+       parked_count:$parked_count,escalated:$escalated,repo_map:$repo_map,turn_limit:$turn_limit}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -451,8 +451,12 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
   TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${AGENT_LAST_COST:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
   # S3A: num_turns and the cache fields are absent from a plain "ok"/dry-run
   # stub result; agent_run reads them as 0 — never a hard requirement on shape.
+  # A call that ran out of --max-turns is named as such (#96): otherwise it
+  # reads like any other failed call (exit 1, empty reply).
+  local call_verdict=""
+  [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]] && call_verdict="turn-limit"
   logline "$phase" "$model" "$AGENT_LAST_DURATION" "${AGENT_LAST_COST:-0}" \
-    "${AGENT_LAST_IN_TOKENS:-0}" "${AGENT_LAST_OUT_TOKENS:-0}" "$rc" "" 0 \
+    "${AGENT_LAST_IN_TOKENS:-0}" "${AGENT_LAST_OUT_TOKENS:-0}" "$rc" "$call_verdict" 0 \
     "${AGENT_LAST_TURNS:-0}" "${AGENT_LAST_CACHE_READ:-0}" "${AGENT_LAST_CACHE_CREATION:-0}"
   return "$rc"
 }
@@ -495,6 +499,7 @@ holdout_notice_once() {
 #    decision 6 / PRD § S4). Reset to 0 whenever the run makes real progress,
 #    so a later, unrelated slice getting stuck still gets its own one replan.
 LAST_FP=""; REPEAT=0
+BUILD_TURN_LIMIT=false   # set per iteration, right after BUILD (#96)
 PARK_REPLAN_DONE=0
 
 # Progress is measured from the plan's checkboxes, not claimed by the model.
@@ -997,6 +1002,11 @@ while :; do
   ITER_BASE_SHA="$(git rev-parse HEAD)"
   BUILD_COST_START="$TOTAL_COST"
   run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
+  # #96: a BUILD that ran out of --max-turns left its work half done in the
+  # working tree — recorded on the iteration row and in FEEDBACK below, so
+  # the next attempt continues it instead of starting the item over.
+  BUILD_TURN_LIMIT=false
+  [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]] && BUILD_TURN_LIMIT=true
 
   # Stage the whole iteration now, before any gate runs — GATE b (verify)
   # reads the working tree either way, but GATE c (secret scan) and GATE d
@@ -1235,6 +1245,10 @@ while :; do
       "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
+    # Progress, but BUILD still ran out of turns (#96): whatever it had
+    # started past the ticked item is in this checkpoint, unticked — say so.
+    [[ "$BUILD_TURN_LIMIT" == "true" ]] && append_feedback "turn-limit" \
+      "BUILD ran out of turns (--max-turns $MAX_TURNS) after ticking an item; any further work it had started is in this iteration's checkpoint commit — continue it rather than redo it."
     LAST_FP=""; REPEAT=0; PARK_REPLAN_DONE=0
     continue
   fi
@@ -1242,9 +1256,16 @@ while :; do
   # Gates green but nothing moved: that is the real no-progress signal, and it
   # is what the stuck detector should be counting.
   if [[ -z "$FAIL_REASON" ]]; then
-    FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
-    FP="no-progress"
+    if [[ "$BUILD_TURN_LIMIT" == "true" ]]; then
+      FAIL_REASON="BUILD ran out of turns (--max-turns $MAX_TURNS) before finishing${SELECTED_ID:+ plan item $SELECTED_ID}: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked. Its partial work is kept in this iteration's WIP checkpoint commit — continue from it, do not start the item over."
+      FP="turn-limit"
+    else
+      FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
+      FP="no-progress"
+    fi
     GATE_FAILED="$FP"
+  elif [[ "$BUILD_TURN_LIMIT" == "true" ]]; then
+    FAIL_REASON="$FAIL_REASON (BUILD also ran out of turns — --max-turns $MAX_TURNS — so this may be unfinished work, not a wrong one; continue it)"
   fi
 
   # FAILURE — feed back, reset sentinel, checkpoint WIP, then rung 1/3/4/5 of

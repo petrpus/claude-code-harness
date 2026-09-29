@@ -37,7 +37,7 @@
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
-#              [--max-fix-rounds 2]
+#              [--max-fix-rounds 2] [--max-turns 200]
 #              [--budget-usd <n>] [--max-minutes <n>]
 #              [--resume [--retry '#N']]
 #
@@ -107,6 +107,8 @@ CI_POLL_SECONDS=30
 CI_TIMEOUT_SECONDS=1800
 CI_GRACE_SECONDS=120
 MAX_FIX_ROUNDS=2
+MAX_TURNS=200          # per model call in every loop.sh run (#96): loop.sh's
+                       # own default (80) is sized for smaller plan items
 BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
@@ -132,6 +134,7 @@ while [[ $# -gt 0 ]]; do
     --ci-timeout)           CI_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --ci-grace-seconds)     CI_GRACE_SECONDS="$2"; shift 2 ;;
     --max-fix-rounds)       MAX_FIX_ROUNDS="$2"; shift 2 ;;
+    --max-turns)            MAX_TURNS="$2"; shift 2 ;;
     --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
     --resume)               RESUME=1; shift ;;
@@ -147,6 +150,7 @@ done
 [[ "$CI_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-timeout takes whole seconds"
 [[ "$CI_GRACE_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-grace-seconds takes whole seconds"
 [[ "$MAX_FIX_ROUNDS" =~ ^[0-9]+$ ]] || die "--max-fix-rounds takes a whole number (0: no fix rounds)"
+[[ "$MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || die "--max-turns takes a positive whole number"
 [[ -z "$BUDGET_USD" || "$BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--budget-usd takes a non-negative number"
 [[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
 [[ -z "$RETRY_ISSUE" || "$RETRY_ISSUE" =~ ^[0-9]+$ ]] || die "--retry takes an issue number ('#N' or N)"
@@ -946,7 +950,7 @@ run_autopilot() {
   # pipe, and a run log behind `| tee` then stayed empty for half an hour.
   bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
     --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$issue_minutes_eff" \
-    --budget-usd "$issue_budget_eff" --stop-file "$RUN_DIR/STOP" \
+    --budget-usd "$issue_budget_eff" --stop-file "$RUN_DIR/STOP" --max-turns "$MAX_TURNS" \
     ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} "$@" \
     2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
   loop_rc=$?

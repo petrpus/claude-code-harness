@@ -698,6 +698,7 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
       echo "helper=[$(git config --get-all credential.helper | tail -1)]" >> "$STUB_FORGE_PROBE"
       echo "token=${GH_TOKEN-<unset>}" >> "$STUB_FORGE_PROBE"
     fi
+    [[ -n "${STUB_TURNS_LOG:-}" ]] && { grep -oE -- '--max-turns [0-9]+' <<<"$*" >> "$STUB_TURNS_LOG" || true; }
     if [[ -n "${STUB_BUILD_LOG:-}" ]]; then
       prev=""; for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && printf '%s\n' "$a" >> "$STUB_BUILD_LOG"; prev="$a"; done
     fi
@@ -1113,6 +1114,18 @@ job_stopciredresume() {
   run_deliver stopcired -- --resume --issue-max-iterations 2
   echo $? > "$WORK/stopcired/rc"
 }
+job_maxturns() {
+  # #96: every loop.sh run gets --max-turns, 200 unless given.
+  new_fixture maxturns
+  run_deliver maxturns STUB_TURNS_LOG="$WORK/maxturns/turns.log"
+  echo $? > "$WORK/maxturns/rc"
+  new_fixture maxturns50
+  run_deliver maxturns50 STUB_TURNS_LOG="$WORK/maxturns50/turns.log" -- --max-turns 50
+  echo $? > "$WORK/maxturns50/rc"
+  new_fixture maxturnsbad
+  run_deliver maxturnsbad -- --max-turns 0
+  echo $? > "$WORK/maxturnsbad/rc"
+}
 job_retrynotparked() {
   # --retry on an issue the run left in flight (PR open, not parked) must be
   # refused, and must not close the PR or delete the branch (#61 review I1).
@@ -1272,6 +1285,7 @@ bg job_locklive
 bg job_lockstale
 bg job_retry
 bg job_retrynotparked
+bg job_maxturns
 bg job_stopfixresume
 bg job_stopciresume
 bg job_stopcifixresume
@@ -2036,6 +2050,17 @@ SR2RUNDIR="$(ls -d "$SR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && jq -r '.comments[-1].body' "$SR2/gh/issues/1.json" | grep -qF 'CI failed again on PR #4 after its fix round: build' \
   && ok "resume: CI red again after the fix round parks on --resume too — no second CI round on the new head" \
   || note "stop in 2nd CI wait: rc1=$RC1 rc=$RC rounds=$(cat "${SR2RUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) — $(tail -3 "$SR2/err" | tr '\n' '|')"
+
+# --- #96: --max-turns reaches every BUILD call ---------------------------------
+[[ "$(cat "$WORK/maxturns/rc")" -eq 0 && -s "$WORK/maxturns/turns.log" ]] \
+  && [[ "$(sort -u "$WORK/maxturns/turns.log")" == "--max-turns 200" ]] \
+  && [[ "$(cat "$WORK/maxturns50/rc")" -eq 0 && "$(sort -u "$WORK/maxturns50/turns.log")" == "--max-turns 50" ]] \
+  && ok "--max-turns reaches every BUILD call (default 200 for /deliver, --max-turns 50 honoured)" \
+  || note "max-turns: default=$(sort -u "$WORK/maxturns/turns.log" 2>/dev/null | tr '\n' ' ') custom=$(sort -u "$WORK/maxturns50/turns.log" 2>/dev/null | tr '\n' ' ')"
+[[ "$(cat "$WORK/maxturnsbad/rc")" -eq 1 ]] && grep -q -- '--max-turns takes a positive whole number' "$WORK/maxturnsbad/err" \
+  && [[ ! -s "$WORK/maxturnsbad/gh/calls" ]] \
+  && ok "--max-turns 0 is refused before any forge call" \
+  || note "--max-turns 0: exit $(cat "$WORK/maxturnsbad/rc")"
 
 # --- #61 review I1: --retry refuses an issue that is not parked -----------------
 RC="$(cat "$WORK/retrynotparked/rc")"

@@ -65,15 +65,24 @@ issue's fault: it ends the run with exit 1, where it is.
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
      [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120] \
      [--max-fix-rounds 2] [--budget-usd <n>] [--max-minutes <n>] \
-     [--resume [--retry '#N']]
+     [--max-turns 200] [--resume [--retry '#N']]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
    script) unless `--verify-cmd` is given. The `--issue-*` caps and
    `--extra-allowed-tools` (appended to autopilot BUILD's allowlist — e.g.
    `'Bash(bash scripts/test-deliver.sh),Bash(jq:*)'` for a shell project) are
-   passed to each issue's `loop.sh` run. The check fails closed (ADR-0007:
-   no model phase holds a forge operation): a `Bash(...)` rule is accepted
+   passed to each issue's `loop.sh` run, and so is `--max-turns` (turns per
+   `claude -p` call, default **200** here against `loop.sh`'s own 80: a
+   /deliver plan item is a third of an issue and BUILD runs its covering
+   tests itself, so it routinely needs 70+ turns; #96). A BUILD that still
+   runs out is logged as `turn-limit` and told to continue its partial work.
+   `--max-turns` applies to the `loop.sh` calls only; the independent
+   review keeps agent.sh's default of 80, since it reads a diff and runs no
+   tests.
+
+   The `--extra-allowed-tools` check fails closed (ADR-0007: no model phase
+   holds a forge operation): a `Bash(...)` rule is accepted
    only as a **plain command** — words of `[A-Za-z0-9._/+=:@%,-]`, optionally
    ending in `:*` or ` *` — whose program (by basename, any letter case) is
    not a forge CLI (`gh`, `gh-*`, `git`, `hub`, `glab`, `lab`), not a program
