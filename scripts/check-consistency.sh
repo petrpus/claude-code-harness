@@ -263,6 +263,26 @@ grep -qiE 'without .?gh|no .?gh|skip.*label' "$HI" \
   && ok "harness-init degrades gracefully without gh/remote" \
   || note "harness-init label step lacks a graceful-degradation note"
 
+# ---------------------------------------------------------------------------
+section "deliver.sh flags <-> skills/deliver/SKILL.md"
+DS="skills/deliver/deliver.sh"; DD="skills/deliver/SKILL.md"
+# Every --flag in deliver.sh's argument case must appear in SKILL.md ...
+RUNNER_FLAGS="$(awk '/^[[:space:]]*case "\$1" in/{c=1;next} c&&/^[[:space:]]*esac/{c=0} c' "$DS" \
+  | grep -oE '^[[:space:]]*(-[a-z],?\|?)?--[a-z][a-z-]*' | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+[[ -n "$RUNNER_FLAGS" ]] && ok "deliver.sh: found $(echo "$RUNNER_FLAGS" | wc -l | tr -d ' ') argument flags" \
+  || note "deliver.sh: could not extract argument flags"
+for f in $RUNNER_FLAGS; do
+  [[ "$f" == "--help" ]] && continue
+  grep -qE -- "${f}([^a-z-]|\$)" "$DD" && ok "SKILL.md mentions $f" || note "SKILL.md does not mention deliver.sh flag $f"
+done
+# ... and a flag in a SKILL.md deliver.sh command block must be one the runner accepts.
+DOC_FLAGS="$(awk '/^[[:space:]]*```/{if(b&&blk~/deliver\.sh/)printf "%s",blk; b=!b; blk=""; next} b{blk=blk $0 "\n"}' "$DD" \
+  | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+for f in $DOC_FLAGS; do
+  echo "$RUNNER_FLAGS" | grep -qx -- "$f" && ok "SKILL.md's $f is accepted by deliver.sh" \
+    || note "SKILL.md documents $f, which deliver.sh does not accept"
+done
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
