@@ -645,6 +645,7 @@ case "$prompt" in
       inl=no; [[ "$prompt" == *"### Diff"* && "$prompt" == *"+++ b/work/issue-"* ]] && inl=yes
       printf '%s\t%s\t%s\t%s\t%s\n' "$(pwd)" "$tools" "$dis" "$perm" "$inl" >> "$STUB_REVIEW_LOG"
     fi
+    [[ -n "${STUB_REVIEW_TURNS_LOG:-}" ]] && { grep -oE -- '--max-turns [0-9]+' <<<"$*" >> "$STUB_REVIEW_TURNS_LOG" || true; }
     if [[ -n "${STUB_REVIEW_PROMPT_DIR:-}" ]]; then
       mkdir -p "$STUB_REVIEW_PROMPT_DIR"
       printf '%s' "$prompt" > "$STUB_REVIEW_PROMPT_DIR/$(date +%s%N)-$$-$RANDOM.txt"
@@ -1190,6 +1191,18 @@ job_maxturns() {
   run_deliver maxturnsbad -- --max-turns 0
   echo $? > "$WORK/maxturnsbad/rc"
 }
+job_reviewturns() {
+  # #102: the independent review has its own turn cap, --review-max-turns (80).
+  new_fixture revturns
+  run_deliver revturns STUB_REVIEW_TURNS_LOG="$WORK/revturns/turns.log"
+  echo $? > "$WORK/revturns/rc"
+  new_fixture revturns123
+  run_deliver revturns123 STUB_REVIEW_TURNS_LOG="$WORK/revturns123/turns.log" -- --review-max-turns 123
+  echo $? > "$WORK/revturns123/rc"
+  new_fixture revturnsbad
+  run_deliver revturnsbad -- --review-max-turns abc
+  echo $? > "$WORK/revturnsbad/rc"
+}
 job_retrynotparked() {
   # --retry on an issue the run left in flight (PR open, not parked) must be
   # refused, and must not close the PR or delete the branch (#61 review I1).
@@ -1357,6 +1370,7 @@ bg job_lockstale
 bg job_retry
 bg job_retrynotparked
 bg job_maxturns
+bg job_reviewturns
 bg job_stopfixresume
 bg job_stopciresume
 bg job_stopcifixresume
@@ -2207,6 +2221,16 @@ SR2RUNDIR="$(ls -d "$SR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && [[ ! -s "$WORK/maxturnsbad/gh/calls" ]] \
   && ok "--max-turns 0 is refused before any forge call" \
   || note "--max-turns 0: exit $(cat "$WORK/maxturnsbad/rc")"
+
+# --- #102: --review-max-turns reaches the independent review's claude -p -------
+[[ "$(cat "$WORK/revturns/rc")" -eq 0 && -s "$WORK/revturns/turns.log" ]] \
+  && [[ "$(sort -u "$WORK/revturns/turns.log")" == "--max-turns 80" ]] \
+  && [[ "$(cat "$WORK/revturns123/rc")" -eq 0 && "$(sort -u "$WORK/revturns123/turns.log")" == "--max-turns 123" ]] \
+  && ok "--review-max-turns reaches the review call (default 80, --review-max-turns 123 honoured)" \
+  || note "review-max-turns: default=$(sort -u "$WORK/revturns/turns.log" 2>/dev/null | tr '\n' ' ') custom=$(sort -u "$WORK/revturns123/turns.log" 2>/dev/null | tr '\n' ' ')"
+[[ "$(cat "$WORK/revturnsbad/rc")" -eq 1 ]] && grep -q -- '--review-max-turns takes a positive whole number' "$WORK/revturnsbad/err" \
+  && ok "--review-max-turns abc is refused" \
+  || note "--review-max-turns abc: exit $(cat "$WORK/revturnsbad/rc")"
 
 # --- #61 review I1: --retry refuses an issue that is not parked -----------------
 RC="$(cat "$WORK/retrynotparked/rc")"

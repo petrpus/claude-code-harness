@@ -63,7 +63,7 @@
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
-#              [--max-fix-rounds 2] [--max-turns 200]
+#              [--max-fix-rounds 2] [--max-turns 200] [--review-max-turns 80]
 #              [--budget-usd <n>] [--max-minutes <n>]
 #              [--resume [--retry '#N']] [--allow-main | --create-integration]
 #              [--plan-only [--json]] | --status | --stop
@@ -144,6 +144,8 @@ CI_GRACE_SECONDS=120
 MAX_FIX_ROUNDS=2
 MAX_TURNS=200          # per model call in every loop.sh run (#96): loop.sh's
                        # own default (80) is sized for smaller plan items
+REVIEW_MAX_TURNS=80    # per model call in the independent review (#102): a review
+                       # reads a diff and runs no tests, so it does not inherit MAX_TURNS
 BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
@@ -176,6 +178,7 @@ while [[ $# -gt 0 ]]; do
     --ci-grace-seconds)     CI_GRACE_SECONDS="$2"; shift 2 ;;
     --max-fix-rounds)       MAX_FIX_ROUNDS="$2"; shift 2 ;;
     --max-turns)            MAX_TURNS="$2"; shift 2 ;;
+    --review-max-turns)     REVIEW_MAX_TURNS="$2"; shift 2 ;;
     --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
     --resume)               RESUME=1; shift ;;
@@ -198,6 +201,7 @@ done
 [[ "$CI_GRACE_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-grace-seconds takes whole seconds"
 [[ "$MAX_FIX_ROUNDS" =~ ^[0-9]+$ ]] || die "--max-fix-rounds takes a whole number (0: no fix rounds)"
 [[ "$MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || die "--max-turns takes a positive whole number"
+[[ "$REVIEW_MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || die "--review-max-turns takes a positive whole number"
 [[ -z "$BUDGET_USD" || "$BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--budget-usd takes a non-negative number"
 [[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
 [[ -z "$RETRY_ISSUE" || "$RETRY_ISSUE" =~ ^[0-9]+$ ]] || die "--retry takes an issue number ('#N' or N)"

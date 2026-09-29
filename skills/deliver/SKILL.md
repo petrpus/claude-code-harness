@@ -134,7 +134,7 @@ Monitor as above.
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
      [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120] \
      [--max-fix-rounds 2] [--budget-usd <n>] [--max-minutes <n>] \
-     [--max-turns 200] [--resume [--retry '#N']]
+     [--max-turns 200] [--review-max-turns 80] [--resume [--retry '#N']]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -147,8 +147,8 @@ Monitor as above.
    tests itself, so it routinely needs 70+ turns; #96). A BUILD that still
    runs out is logged as `turn-limit` and told to continue its partial work.
    `--max-turns` applies to the `loop.sh` calls only; the independent
-   review keeps agent.sh's default of 80, since it reads a diff and runs no
-   tests.
+   review has its own cap, `--review-max-turns` (default **80**), since it
+   reads a diff and runs no tests (#102).
 
    The `--extra-allowed-tools` check fails closed (ADR-0007: no model phase
    holds a forge operation): a `Bash(...)` rule is accepted
