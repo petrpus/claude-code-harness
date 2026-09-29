@@ -89,6 +89,16 @@ chain that means top to bottom.
 
 Do NOT close or modify any parent issue.
 
+### 6. Publish the Map
+
+When the breakdown has more than one issue, publish a **Map** — one issue
+labelled `map` (never `ready-for-agent`) that `/deliver` consumes. Follow
+`skills/deliver/MAP-FORMAT.md`: the `<!-- deliver:map v1 -->` marker, a
+`## Delivery` checklist with one `- [ ] #<N> <conventional-commit title>
+(after: #A, #B)` line per issue mirroring its `## Blocked by` edges, then
+optional `## Notes`. Publish it last, so every issue number exists. Report the
+Map's number to the user.
+
 <issue-template>
 
 ## Parent

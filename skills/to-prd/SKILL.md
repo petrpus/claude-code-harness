@@ -15,7 +15,7 @@ Tracker: GitHub Issues via the `gh` CLI; triage labels come from the `triage` sk
 
 Check with the user that these seams match their expectations, and which modules they want tests written for.
 
-3. Write the PRD using the template below, then publish it to the project issue tracker. Apply the `ready-for-agent` triage label - no need for additional triage.
+3. Write the PRD using the template below, then publish it to the project issue tracker. Apply the `prd` label — a PRD is a spec, not an agent-grabbable task, so it does not get `ready-for-agent`.
 
 <prd-template>
 

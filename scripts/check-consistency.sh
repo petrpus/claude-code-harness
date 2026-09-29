@@ -208,6 +208,61 @@ else
   ok "no src=/<link/@import/url(http) in docs/*.html"
 fi
 
+# ---------------------------------------------------------------------------
+section "Map format + front-half alignment (ADR-0008)"
+MAPF="skills/deliver/MAP-FORMAT.md"
+[[ -f "$MAPF" ]] && ok "$MAPF exists" || note "$MAPF is missing"
+for s in to-issues start-feature; do
+  grep -q 'MAP-FORMAT\.md' "skills/$s/SKILL.md" \
+    && ok "$s references MAP-FORMAT.md" || note "skills/$s/SKILL.md does not reference MAP-FORMAT.md"
+done
+grep -q '`prd`' skills/to-prd/SKILL.md \
+  && ok "to-prd labels the PRD prd" || note "to-prd does not apply the prd label"
+grep -q 'ready-for-agent' skills/start-feature/SKILL.md && grep -q '`prd`' skills/start-feature/SKILL.md \
+  && ok "start-feature uses prd / ready-for-agent" || note "start-feature lacks prd / ready-for-agent labels"
+grep -qi 'blocked by' skills/start-feature/SKILL.md \
+  && ok "start-feature uses a Blocked-by DAG" || note "start-feature lacks Blocked-by wording"
+grep -qiE 'no "?waits on' skills/start-feature/SKILL.md \
+  && note "start-feature still says 'no waits on #X'" || ok "start-feature has no 'no waits on' wording"
+grep -qF '/deliver #<map>' skills/start-feature/SKILL.md \
+  && ok "start-feature ends with /deliver #<map>" || note "start-feature does not point to /deliver #<map>"
+grep -q '/deliver' skills/next/SKILL.md \
+  && ok "next points to /deliver" || note "next does not point to /deliver"
+grep -E '^\| to-issues \|' docs/pocock-sync-log.md | grep -q 'Map-publishing' \
+  && ok "sync-log records the to-issues Map-publishing patch" || note "sync-log to-issues row lacks the Map-publishing local patch"
+grep -E '^\| to-prd \|' docs/pocock-sync-log.md | grep -q '`prd` label' \
+  && ok "sync-log records the to-prd prd-label patch" || note "sync-log to-prd row lacks the \`prd\` label local patch"
+
+# ---------------------------------------------------------------------------
+section "implement-issue follows the /deliver contract"
+II="skills/implement-issue/SKILL.md"
+ii_has() { grep -qE -- "$1" "$II" && ok "implement-issue: $2" || note "implement-issue lacks: $2"; }
+ii_has 'ready-for-agent' 'label ready-for-agent'
+ii_has '`--base`.*default branch|default branch.*`--base`|--base=<[^>]*>.*default branch' '--base defaults to the repo default branch'
+ii_has '[Vv]erify on the base' 'verify on the base'
+ii_has '[Cc]ommit before (the )?review|commit .*before .*review' 'commit before review'
+ii_has '--base=<base> --head=<branch>|--head=<' 'reviewer given --base / --head'
+ii_has 'git rev-parse --abbrev-ref HEAD' 'branch assertion around the review'
+ii_has 'last-verify-status' 'verify-status assertion around the review'
+ii_has 'gh pr create --base' 'gh pr create --base'
+ii_has 'needs-triage' 'out-of-scope findings filed as needs-triage issues'
+grep -q 'setup-matt-pocock-skills' CLAUDE.md && grep -qi 'known upstream mismatch' CLAUDE.md \
+  && ok "CLAUDE.md lists triage's /setup-matt-pocock-skills known upstream mismatch" \
+  || note "CLAUDE.md lacks the triage /setup-matt-pocock-skills known-mismatch note"
+
+# ---------------------------------------------------------------------------
+section "harness-init bootstraps the workflow labels"
+HI="skills/harness-init/SKILL.md"
+for l in map prd ready-for-agent needs-human needs-triage; do
+  grep -qE -- "gh label create $l( |\$)" "$HI" \
+    && ok "harness-init creates label $l" || note "harness-init does not create label $l"
+done
+grep -q -- '--force' "$HI" && ok "harness-init label creation is idempotent (--force)" \
+  || note "harness-init label creation is not idempotent (--force)"
+grep -qiE 'without .?gh|no .?gh|skip.*label' "$HI" \
+  && ok "harness-init degrades gracefully without gh/remote" \
+  || note "harness-init label step lacks a graceful-degradation note"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
