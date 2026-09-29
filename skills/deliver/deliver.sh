@@ -36,7 +36,25 @@
 # issue, `Closes #<map>` only when every Delivery line is ticked, parked /
 # skipped / closed-externally / follow-up issues listed, and a line asking for
 # a merge commit rather than a squash. No final PR when nothing was delivered.
-# Recorded as .final_pr in state.json. Not built yet: the launcher.
+# Recorded as .final_pr in state.json.
+#
+# --plan-only (#65) is the read-only pre-flight the /deliver skill runs before
+# it launches anything: no run dir, no branch switch, no label or issue edit,
+# no fetch. It checks gh (auth + version), jq, tmux (a warning: without it
+# the skill falls back to `setsid nohup`), a clean tree, a non-default base
+# (or --allow-main), the base in sync with origin, the verify command green,
+# tmp/ gitignored, the Map parsing, its after: edges acyclic and closed (an
+# after: naming an issue outside the Map is refused), the five labels
+# present (a warning: a real run creates them) and branch protection on the
+# base (a warning). It prints the run plan — issues in delivery order, ticked
+# ones as skipped, the caps, a cost estimate of ~$6-8 per remaining issue —
+# and exits non-zero when a hard check fails. --json prints the same as one
+# object: {ok, checks:[{name,status,detail}], issues:[], skipped:[], caps,
+# estimate_usd:{low,high}}. A real run creates the five labels
+# (map, prd, ready-for-agent, needs-human, needs-triage) before it walks the
+# graph.
+# --status prints the newest run's status.json for --map (read-only); --stop
+# touches that run's STOP file, which the run honours between phases.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
@@ -48,6 +66,7 @@
 #              [--max-fix-rounds 2] [--max-turns 200]
 #              [--budget-usd <n>] [--max-minutes <n>]
 #              [--resume [--retry '#N']] [--allow-main | --create-integration]
+#              [--plan-only [--json]] | --status | --stop
 #
 # Run it from a clean checkout of the integration branch, in sync with origin.
 # main/master is refused unless --allow-main (docs/adr/0013-*.md): per-issue
@@ -131,6 +150,10 @@ RESUME=0
 ALLOW_MAIN=0           # --allow-main: deliver straight into main/master (ADR-0013)
 CREATE_INTEGRATION=0   # --create-integration: cut integration/<map-slug> off origin/<default>
 RETRY_ISSUE=""         # set by --retry '#N'; only meaningful with --resume
+PLAN_ONLY=0            # --plan-only: read-only pre-flight + run plan, then exit (#65)
+JSON_OUT=0             # --json: the run plan as one JSON object (with --plan-only)
+DO_STATUS=0            # --status: print the newest run's status.json
+DO_STOP=0              # --stop: touch the newest run's STOP file
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -159,7 +182,11 @@ while [[ $# -gt 0 ]]; do
     --allow-main)           ALLOW_MAIN=1; shift ;;
     --create-integration)   CREATE_INTEGRATION=1; shift ;;
     --retry)                RETRY_ISSUE="${2#\#}"; shift 2 ;;
-    -h|--help)              sed -n '2,90p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --plan-only)            PLAN_ONLY=1; shift ;;
+    --json)                 JSON_OUT=1; shift ;;
+    --status)               DO_STATUS=1; shift ;;
+    --stop)                 DO_STOP=1; shift ;;
+    -h|--help)              sed -n '2,110p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -177,6 +204,10 @@ done
 [[ -z "$RETRY_ISSUE" || "$RESUME" -eq 1 ]] || die "--retry only makes sense with --resume"
 [[ "$CREATE_INTEGRATION" -eq 0 || "$RESUME" -eq 0 ]] || die "--create-integration starts a new run; it cannot be combined with --resume"
 [[ "$CREATE_INTEGRATION" -eq 0 || "$ALLOW_MAIN" -eq 0 ]] || die "--create-integration and --allow-main contradict each other (one delivers into a new integration branch, the other into main)"
+[[ "$JSON_OUT" -eq 0 || "$PLAN_ONLY" -eq 1 ]] || die "--json goes with --plan-only"
+[[ "$(( PLAN_ONLY + DO_STATUS + DO_STOP ))" -le 1 ]] || die "--plan-only, --status and --stop are separate commands"
+[[ "$(( PLAN_ONLY + DO_STATUS + DO_STOP ))" -eq 0 || ( "$RESUME" -eq 0 && "$CREATE_INTEGRATION" -eq 0 ) ]] \
+  || die "--plan-only / --status / --stop cannot be combined with --resume or --create-integration"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
@@ -202,6 +233,209 @@ REVIEW_AGENT="$PLUGIN_ROOT/agents/code-reviewer.md"
 if [[ -n "$EXTRA_ALLOWED_TOOLS" ]]; then
   GRANT_PROBLEMS="$(forge_grant_violations "$EXTRA_ALLOWED_TOOLS")" \
     || die "--extra-allowed-tools refused (ADR-0007): $(printf '%s' "$GRANT_PROBLEMS" | tr '\n' ';')"
+fi
+
+# ---------------------------------------------------------------------------
+# --status / --stop (#65): talk to the newest run for --map. Read-only /
+# one touch; neither needs the forge.
+# ---------------------------------------------------------------------------
+if [[ "$DO_STATUS" -eq 1 || "$DO_STOP" -eq 1 ]]; then
+  command -v jq  >/dev/null 2>&1 || die "'jq' is required"
+  command -v git >/dev/null 2>&1 || die "'git' is required"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repo"
+  cd "$(git rev-parse --show-toplevel)" || die "cannot cd to repo root"
+  CTL_RUN=""
+  shopt -s nullglob
+  for _cand in tmp/deliver/*/; do
+    _cand="${_cand%/}"
+    [[ -f "$_cand/state.json" ]] || continue
+    [[ "$(jq -r '.map // empty' "$_cand/state.json" 2>/dev/null)" == "$MAP" ]] && CTL_RUN="$_cand"
+  done
+  shopt -u nullglob
+  [[ -n "$CTL_RUN" ]] || die "no run found for map #$MAP under tmp/deliver/"
+  if [[ "$DO_STATUS" -eq 1 ]]; then
+    [[ -f "$CTL_RUN/status.json" ]] || die "run ${CTL_RUN#tmp/deliver/} has no status.json yet"
+    jq -c --arg run "${CTL_RUN#tmp/deliver/}" '. + {run_id:$run}' "$CTL_RUN/status.json" || die "cannot read $CTL_RUN/status.json"
+    exit 0
+  fi
+  : > "$CTL_RUN/STOP" || die "cannot write $CTL_RUN/STOP"
+  CTL_PID="$(cat "$CTL_RUN/lock" 2>/dev/null || true)"
+  if [[ -n "$CTL_PID" ]] && kill -0 "$CTL_PID" 2>/dev/null; then
+    log "STOP written for run ${CTL_RUN#tmp/deliver/} (pid $CTL_PID); it stops at its next phase boundary."
+  else
+    log "STOP written for run ${CTL_RUN#tmp/deliver/}, but no live runner holds its lock; --resume clears it."
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --plan-only (#65): every pre-flight check, then the run plan — and not one
+# write: no run dir, no branch switch, no fetch, no label or issue edit. A
+# check that fails does not stop the others; the plan is only "ok" when no
+# hard check failed. Runs before the hard preconditions below (which die on
+# the first problem) so a missing tool is a reported check, not a crash.
+# ---------------------------------------------------------------------------
+if [[ "$PLAN_ONLY" -eq 1 ]]; then
+  PF_NAMES=(); PF_STATUS=(); PF_DETAIL=(); PF_FAILED=0
+  pf() { # <name> <ok|warn|fail> <detail>
+    PF_NAMES+=("$1"); PF_STATUS+=("$2"); PF_DETAIL+=("$3")
+    [[ "$2" == "fail" ]] && PF_FAILED=1
+    return 0
+  }
+  pf_emit_checks() { # the checks as a JSON array, or nothing without jq
+    local i
+    for (( i=0; i<${#PF_NAMES[@]}; i++ )); do
+      jq -cn --arg n "${PF_NAMES[$i]}" --arg s "${PF_STATUS[$i]}" --arg d "${PF_DETAIL[$i]}" '{name:$n,status:$s,detail:$d}'
+    done | jq -cs .
+  }
+  pf_finish_nojq() { # without jq there is no JSON to build; say so and stop
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+      printf '{"ok":false,"checks":[{"name":"jq","status":"fail","detail":"jq not found on PATH"}],"issues":[],"skipped":[]}\n'
+    else
+      echo "pre-flight: FAIL jq — not found on PATH (install jq)"
+    fi
+    exit 1
+  }
+
+  command -v jq >/dev/null 2>&1 || pf_finish_nojq
+  pf jq ok "$(jq --version 2>/dev/null)"
+
+  if command -v tmux >/dev/null 2>&1; then pf tmux ok "$(tmux -V 2>/dev/null)"
+  else pf tmux warn "tmux not found — the run will be launched with setsid nohup instead"; fi
+
+  GH_OK=0
+  if PF_GH_MSG="$(forge_preflight)"; then GH_OK=1; pf gh ok "$(forge_gh_version)"
+  else pf gh fail "$PF_GH_MSG"; fi
+
+  if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    pf git fail "not inside a git repo"
+    BASE=""
+  else
+    cd "$(git rev-parse --show-toplevel)" || die "cannot cd to repo root"
+    BASE="$(git branch --show-current 2>/dev/null || true)"
+    case "$BASE" in
+      "")          pf base-branch fail "detached HEAD — check out the integration branch first" ;;
+      main|master) if [[ "$ALLOW_MAIN" -eq 1 ]]; then pf base-branch ok "delivering straight into '$BASE' (--allow-main; no final PR)"
+                   else pf base-branch fail "'$BASE' is the default branch — check out an integration branch, or pass --allow-main"; fi ;;
+      *)           pf base-branch ok "$BASE" ;;
+    esac
+    if [[ -z "$(git status --porcelain 2>/dev/null)" ]]; then pf clean-tree ok "working tree is clean"
+    else pf clean-tree fail "working tree is dirty — commit or stash first"; fi
+    if git check-ignore -q tmp/deliver/.probe 2>/dev/null; then pf tmp-ignored ok "tmp/ is gitignored"
+    else pf tmp-ignored fail "tmp/ is not gitignored — run state would be committed into issue branches"; fi
+    if [[ -n "$BASE" ]]; then
+      # ls-remote, not fetch: a fetch would move refs.
+      PF_REMOTE_OID="$(git ls-remote origin "refs/heads/$BASE" 2>/dev/null | cut -f1)"
+      if [[ -z "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not on origin — push it first"
+      elif [[ "$(git rev-parse HEAD)" != "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not in sync with origin/$BASE — pull or push first"
+      else pf base-synced ok "HEAD is origin/$BASE"; fi
+    fi
+    if [[ -z "$VERIFY_CMD" && -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
+      if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
+    fi
+    if [[ -z "$VERIFY_CMD" ]]; then pf verify fail "no verify command found and --verify-cmd not given"
+    elif bash -c "$VERIFY_CMD" >/dev/null 2>&1; then pf verify ok "'$VERIFY_CMD' is green on '${BASE:-HEAD}'"
+    else pf verify fail "'$VERIFY_CMD' fails on '${BASE:-HEAD}'"; fi
+  fi
+
+  PF_ISSUES="[]"; PF_SKIPPED="[]"; PF_REMAINING=0
+  if [[ "$GH_OK" -eq 1 ]]; then
+    PF_TMP="$(mktemp -d)"
+    trap 'rm -rf "$PF_TMP"' EXIT
+    if ! forge_issue_body "$MAP" "$PF_TMP/map.md"; then
+      pf map fail "cannot read map #$MAP"
+    else
+      map_extract_delivery "$PF_TMP/map.md" > "$PF_TMP/plan.md"
+      if [[ ! -s "$PF_TMP/plan.md" ]]; then
+        pf map fail "map #$MAP has no '## Delivery' lines"
+      else
+        PF_PROBLEMS="$(map_validate "$PF_TMP/plan.md")"; PF_VALID=$?
+        PF_STRUCT="$(printf '%s\n' "$PF_PROBLEMS" | grep -v "is not in the Map's Delivery section" | grep -v '^$' || true)"
+        PF_EXT="$(printf '%s\n' "$PF_PROBLEMS" | grep "is not in the Map's Delivery section" || true)"
+        if [[ -n "$PF_STRUCT" ]]; then pf map fail "map #$MAP is invalid: $(printf '%s' "$PF_STRUCT" | tr '\n' ';')"
+        else pf map ok "map #$MAP parses"; fi
+        if [[ -n "$PF_EXT" ]]; then pf external-refs fail "$(printf '%s' "$PF_EXT" | tr '\n' ';')"
+        else pf external-refs ok "every after: names an issue in the Map"; fi
+        if [[ "$PF_VALID" -eq 0 ]]; then
+          select_next_slice "$PF_TMP/plan.md" >/dev/null; PF_SEL=$?
+          if [[ "$PF_SEL" -eq 2 ]]; then pf dag fail "the after: edges contain a cycle: ${PLAN_CYCLE_CHAIN:-?}"
+          else pf dag ok "the after: edges are acyclic"; fi
+          if [[ "$PF_SEL" -ne 2 ]]; then
+            # Delivery order: repeatedly take the first unticked issue whose
+            # blockers are all ticked or already placed.
+            plan_load "$PF_TMP/plan.md"
+            declare -A PF_PLACED=()
+            PF_ORDER=(); PF_LEFT=0
+            for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
+              if [[ "${PLAN_ROW_TICKED[$i]}" == "1" ]]; then
+                PF_SKIPPED="$(jq -c --arg id "${PLAN_IDS[$i]}" --arg t "$(map_line_title "${PLAN_ROW_RAW[$i]}")" \
+                  '. + [{id:$id, number:($id|ltrimstr("#")|tonumber), title:$t}]' <<<"$PF_SKIPPED")"
+                PF_PLACED["${PLAN_IDS[$i]}"]=1
+              else PF_LEFT=$((PF_LEFT+1)); fi
+            done
+            while [[ "${#PF_ORDER[@]}" -lt "$PF_LEFT" ]]; do
+              PF_PROGRESS=0
+              for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
+                id="${PLAN_IDS[$i]}"
+                [[ "${PLAN_ROW_TICKED[$i]}" == "1" || -n "${PF_PLACED[$id]:-}" ]] && continue
+                pf_ready=1
+                for b in ${PLAN_ROW_AFTER[$i]}; do [[ -n "${PF_PLACED[$b]:-}" ]] || { pf_ready=0; break; }; done
+                [[ "$pf_ready" -eq 1 ]] || continue
+                PF_PLACED["$id"]=1; PF_ORDER+=("$i"); PF_PROGRESS=1; break
+              done
+              [[ "$PF_PROGRESS" -eq 1 ]] || break
+            done
+            for i in "${PF_ORDER[@]}"; do
+              PF_ISSUES="$(jq -c --arg id "${PLAN_IDS[$i]}" --arg t "$(map_line_title "${PLAN_ROW_RAW[$i]}")" --arg a "${PLAN_ROW_AFTER[$i]}" \
+                '. + [{id:$id, number:($id|ltrimstr("#")|tonumber), title:$t, after:($a|split(" ")|map(select(length>0)))}]' <<<"$PF_ISSUES")"
+            done
+            PF_REMAINING="${#PF_ORDER[@]}"
+          fi
+        fi
+      fi
+    fi
+    PF_HAVE_LABELS="$(forge_label_list 2>/dev/null)" && PF_LABELS_READ=1 || PF_LABELS_READ=0
+    if [[ "$PF_LABELS_READ" -eq 1 ]]; then
+      PF_MISSING=()
+      for l in map prd ready-for-agent needs-human needs-triage; do
+        grep -qxF "$l" <<<"$PF_HAVE_LABELS" || PF_MISSING+=("$l")
+      done
+      if [[ ${#PF_MISSING[@]} -eq 0 ]]; then pf labels ok "map, prd, ready-for-agent, needs-human, needs-triage all exist"
+      else pf labels warn "missing: ${PF_MISSING[*]} — the run creates them at start"; fi
+    else pf labels warn "could not list the repo's labels — the run creates missing ones at start"; fi
+    if [[ -n "$BASE" ]]; then
+      if forge_branch_protected "$BASE"; then pf branch-protection warn "'$BASE' has branch protection — required reviews would park every merge"
+      else pf branch-protection ok "'$BASE' has no protection rules"; fi
+    fi
+  fi
+
+  PF_CAPS="$(jq -cn --argjson iter "$ISSUE_MAX_ITERATIONS" --argjson min "$ISSUE_MAX_MINUTES" --argjson usd "$ISSUE_BUDGET_USD" \
+      --argjson fix "$MAX_FIX_ROUNDS" --arg b "$BUDGET_USD" --arg m "$MAX_MINUTES" \
+      '{issue_max_iterations:$iter, issue_max_minutes:$min, issue_budget_usd:$usd, max_fix_rounds:$fix,
+        budget_usd:(if $b=="" then null else ($b|tonumber) end), max_minutes:(if $m=="" then null else ($m|tonumber) end)}')"
+  PF_EST="$(jq -cn --argjson n "$PF_REMAINING" '{low:($n*6), high:($n*8)}')"
+  PF_OK=true; [[ "$PF_FAILED" -eq 0 ]] || PF_OK=false
+  if [[ "$JSON_OUT" -eq 1 ]]; then
+    jq -cn --argjson ok "$PF_OK" --argjson checks "$(pf_emit_checks)" --argjson issues "$PF_ISSUES" \
+       --argjson skipped "$PF_SKIPPED" --argjson caps "$PF_CAPS" --argjson est "$PF_EST" --argjson map "$MAP" --arg base "${BASE:-}" \
+       '{ok:$ok, map:$map, base:$base, checks:$checks, issues:$issues, skipped:$skipped, caps:$caps, estimate_usd:$est}'
+  else
+    echo "Pre-flight for map #$MAP:"
+    for (( i=0; i<${#PF_NAMES[@]}; i++ )); do
+      printf '  %-4s %-18s %s\n' "$(case "${PF_STATUS[$i]}" in ok) echo ok;; warn) echo WARN;; *) echo FAIL;; esac)" "${PF_NAMES[$i]}" "${PF_DETAIL[$i]}"
+    done
+    echo "Run plan (base: ${BASE:-?}):"
+    jq -r '.[] | "  \(.id) \(.title)" + (if (.after|length)>0 then " (after: \(.after|join(" ")))" else "" end)' <<<"$PF_ISSUES"
+    if [[ "$PF_SKIPPED" != "[]" ]]; then
+      echo "Skipped (already ticked):"
+      jq -r '.[] | "  \(.id) \(.title)"' <<<"$PF_SKIPPED"
+    fi
+    echo "Caps per issue: $(jq -r '"\(.issue_max_iterations) iterations, \(.issue_max_minutes) min, $\(.issue_budget_usd), \(.max_fix_rounds) fix rounds"' <<<"$PF_CAPS")"
+    echo "Whole run: $(jq -r '"budget \(if .budget_usd==null then "uncapped" else "$\(.budget_usd)" end), time \(if .max_minutes==null then "uncapped" else "\(.max_minutes) min" end)"' <<<"$PF_CAPS")"
+    echo "Estimated cost: $(jq -r '"$\(.low)-\(.high)"' <<<"$PF_EST") (~\$6-8 per remaining issue)"
+    [[ "$PF_FAILED" -eq 0 ]] && echo "Result: ok" || echo "Result: FAILED — fix the checks above"
+  fi
+  [[ "$PF_FAILED" -eq 0 ]]; exit $?
 fi
 
 # ---------------------------------------------------------------------------
@@ -480,6 +714,10 @@ refresh_map || die "cannot read map #$MAP"
 PROBLEMS="$(map_validate "$MAP_PLAN")" || die "map #$MAP is invalid: $(printf '%s' "$PROBLEMS" | tr '\n' ';')"
 select_next_slice "$MAP_PLAN" >/dev/null; rc=$?
 [[ "$rc" -eq 2 ]] && die "map #$MAP has a dependency cycle in its after: edges"
+
+# Label bootstrap (#65): the five labels the run and its parks/follow-ups
+# rely on exist before the first issue starts. Existing ones are untouched.
+forge_labels_bootstrap
 
 # tick_map <number> — tick the issue's Delivery line on the forge. Re-read,
 # change one line, write, read back; retried because a human editing the Map

@@ -486,6 +486,13 @@ case "$cmd" in
     elif l="$(arg --remove-label "$@")"; then
       jq --arg l "$l" '.labels = ((.labels // []) | map(select(.name != $l)))' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
     else exit 64; fi ;;
+  "label list")
+    cat "$S/labels" 2>/dev/null; exit 0 ;;
+  "api repos/{owner}/{repo}/branches/"*"/protection")
+    # #65: branch protection is on for the branches listed in $S/protected.
+    br="${cmd#api repos/\{owner\}/\{repo\}/branches/}"; br="${br%/protection}"
+    grep -qx "$br" "$S/protected" 2>/dev/null && exit 0
+    echo "Branch not protected (HTTP 404)" >&2; exit 1 ;;
   "label create")
     grep -qx "$1" "$S/labels" 2>/dev/null && { echo "label already exists" >&2; exit 1; }
     echo "$1" >> "$S/labels" ;;
@@ -2211,5 +2218,120 @@ RN="$WORK/retrynotparked"
   && [[ -n "$(git -C "$RN/remote.git" rev-parse --verify -q "refs/heads/$(jq -r .headRefName "$RN/gh/prs/4.json")")" ]] \
   && ok "retry: --retry on an in-flight (pr-open) issue is refused — PR stays open, branch kept" \
   || note "retry not parked: rc1=$(cat "$RN/rc1") rc=$RC — $(tail -2 "$RN/err" | tr '\n' '|'), PR #4=$(jq -r .state "$RN/gh/prs/4.json" 2>/dev/null)"
+
+# ===========================================================================
+# #65 S1: --plan-only pre-flight, label bootstrap, --status / --stop
+# ===========================================================================
+echo "-- pre-flight, run plan, labels, --status / --stop"
+# pojq <name> <jq expr> — read the name's last output as JSON
+pojq() { jq -r "$2" "$WORK/$1/out" 2>/dev/null; }
+pocheck() { pojq "$1" ".checks[] | select(.name==\"$2\") | .status"; }
+
+new_fixture pf1
+run_deliver pf1 -- --plan-only --json; RC=$?
+PF1="$WORK/pf1"
+[[ "$RC" -eq 0 && "$(pojq pf1 .ok)" == "true" ]] \
+  && [[ "$(jq -c 'keys' "$PF1/out")" == '["base","caps","checks","estimate_usd","issues","map","ok","skipped"]' ]] \
+  && ok "plan-only --json: one object with ok, checks, issues, skipped, caps, estimate_usd (exit 0)" \
+  || note "plan-only --json: rc=$RC out=$(head -c 300 "$PF1/out")"
+[[ "$(pojq pf1 '[.issues[].id]|join(",")')" == "#1,#2" && "$(pojq pf1 '.issues[1].after|join(",")')" == "#1" ]] \
+  && ok "plan-only: issues in delivery order (#1 before #2 despite Map order), with their blockers" \
+  || note "plan-only order: $(pojq pf1 '[.issues[].id]|join(",")')"
+[[ "$(pojq pf1 '.estimate_usd|"\(.low)-\(.high)"')" == "12-16" && "$(pojq pf1 '.caps.issue_budget_usd')" == "10" && "$(pojq pf1 '.caps.budget_usd')" == "null" ]] \
+  && ok "plan-only: estimate \$6-8 per remaining issue; caps carry the per-issue limits and null global ones" \
+  || note "plan-only estimate/caps: $(pojq pf1 '.estimate_usd, .caps' | tr '\n' ' ')"
+MISSING_CHECKS=""
+for c in gh jq tmux base-branch clean-tree tmp-ignored base-synced verify map external-refs dag labels branch-protection; do
+  [[ -n "$(pocheck pf1 $c)" ]] || MISSING_CHECKS="$MISSING_CHECKS $c"
+done
+[[ -z "$MISSING_CHECKS" && "$(pocheck pf1 labels)" == "warn" && "$(pocheck pf1 verify)" == "ok" ]] \
+  && ok "plan-only: every PRD pre-flight check is reported; missing labels are a warning" \
+  || note "plan-only checks missing:$MISSING_CHECKS labels=$(pocheck pf1 labels)"
+[[ ! -e "$PF1/repo/tmp/deliver" ]] \
+  && ! grep -qE '^(label create|issue edit|issue comment|pr |issue create)' "$PF1/gh/calls" \
+  && ! grep -qE '^(switch|checkout|fetch|commit|push|merge)' "$PF1/git.calls" \
+  && [[ -z "$(git -C "$PF1/repo" status --porcelain)" && "$(git -C "$PF1/repo" branch --show-current)" == "integration/x" ]] \
+  && ok "plan-only writes nothing: no tmp/deliver, no label/issue/PR call, no git switch/fetch/push" \
+  || note "plan-only wrote something: $(ls "$PF1/repo/tmp" 2>&1 | head -2 | tr '\n' ' ') gh: $(grep -E '^(label|issue edit|pr )' "$PF1/gh/calls" | head -2 | tr '\n' '|')"
+run_deliver pf1 -- --plan-only; RC=$?
+grep -q 'Pre-flight for map #3' "$PF1/out" && grep -q '#1 feat(a): first feature' "$PF1/out" && grep -q 'Estimated cost: \$12-16' "$PF1/out" && [[ "$RC" -eq 0 ]] \
+  && ok "plan-only without --json prints the same plan as text" || note "plan-only text: rc=$RC $(head -5 "$PF1/out" | tr '\n' '|')"
+
+# a ticked issue is skipped, not planned or costed
+new_fixture pf2
+jq '.body |= sub("- \\[ \\] #1 "; "- [x] #1 ")' "$WORK/pf2/gh/issues/3.json" > "$WORK/pf2/x" && mv "$WORK/pf2/x" "$WORK/pf2/gh/issues/3.json"
+run_deliver pf2 -- --plan-only --json; RC=$?
+[[ "$RC" -eq 0 && "$(pojq pf2 '[.skipped[].id]|join(",")')" == "#1" && "$(pojq pf2 '[.issues[].id]|join(",")')" == "#2" && "$(pojq pf2 '.estimate_usd.low')" == "6" ]] \
+  && ok "plan-only: a ticked issue is listed as skipped and left out of the plan and the estimate" \
+  || note "plan-only ticked: rc=$RC $(head -c 300 "$WORK/pf2/out")"
+
+# each hard check failing: non-zero exit, that check 'fail', ok false, the others still reported
+pf_fails() { # <fixture> <check> <what> <rc>
+  [[ "$4" -ne 0 && "$(pojq "$1" .ok)" == "false" && "$(pocheck "$1" "$2")" == "fail" && "$(pojq "$1" '.checks|length')" -ge 5 ]] \
+    && ok "plan-only: $3 fails the '$2' check (exit $4, other checks still reported)" \
+    || note "plan-only $3: rc=$4 $2=$(pocheck "$1" "$2") out=$(head -c 200 "$WORK/$1/out")"
+}
+new_fixture pfdirty; echo junk > "$WORK/pfdirty/repo/untracked.txt"
+run_deliver pfdirty -- --plan-only --json; pf_fails pfdirty clean-tree "a dirty tree" $?
+new_fixture pfign; : > "$WORK/pfign/repo/.gitignore"
+git -C "$WORK/pfign/repo" commit -q -am "drop ignore" && git -C "$WORK/pfign/repo" push -q origin integration/x 2>/dev/null
+run_deliver pfign -- --plan-only --json; pf_fails pfign tmp-ignored "tmp/ not gitignored" $?
+new_fixture pfcycle
+jq '.body |= sub("- \\[ \\] #1 feat\\(a\\): first feature"; "- [ ] #1 feat(a): first feature (after: #2)")' "$WORK/pfcycle/gh/issues/3.json" > "$WORK/pfcycle/x" \
+  && mv "$WORK/pfcycle/x" "$WORK/pfcycle/gh/issues/3.json"
+run_deliver pfcycle -- --plan-only --json; pf_fails pfcycle dag "a dependency cycle" $?
+new_fixture pfext
+jq '.body |= sub("- \\[ \\] #1 feat\\(a\\): first feature"; "- [ ] #1 feat(a): first feature (after: #9)")' "$WORK/pfext/gh/issues/3.json" > "$WORK/pfext/x" \
+  && mv "$WORK/pfext/x" "$WORK/pfext/gh/issues/3.json"
+jq -n '{number:9,title:"Elsewhere",url:"https://github.com/o/r/issues/9",state:"OPEN",labels:[],comments:[],body:"x"}' > "$WORK/pfext/gh/issues/9.json"
+run_deliver pfext -- --plan-only --json; pf_fails pfext external-refs "an open external after: ref" $?
+new_fixture pfunauth
+run_deliver pfunauth FAKE_GH_UNAUTH=1 -- --plan-only --json; pf_fails pfunauth gh "an unauthenticated gh" $?
+new_fixture pfnojq; path_without "$WORK/pfnojq/bin" jq; ln -sf "$BIN/gh" "$WORK/pfnojq/bin/gh"
+( cd "$WORK/pfnojq/repo" && env PATH="$WORK/pfnojq/bin" FAKE_GH_DIR="$WORK/pfnojq/gh" XDG_STATE_HOME="$WORK/pfnojq/state" \
+    "$(command -v bash)" "$DELIVER_ABS" --map 3 --verify-cmd true --plan-only --json >"$WORK/pfnojq/out" 2>"$WORK/pfnojq/err" ); RC=$?
+[[ "$RC" -ne 0 && "$(grep -c '"ok":false' "$WORK/pfnojq/out")" -eq 1 && "$(grep -c jq "$WORK/pfnojq/out")" -ge 1 ]] \
+  && ok "plan-only: a missing jq is a reported failure (exit $RC), not a crash" \
+  || note "plan-only without jq: rc=$RC out=$(head -c 200 "$WORK/pfnojq/out")"
+new_fixture pfnotmux; path_without "$WORK/pfnotmux/bin" tmux; ln -sf "$BIN/gh" "$WORK/pfnotmux/bin/gh"
+( cd "$WORK/pfnotmux/repo" && env PATH="$WORK/pfnotmux/bin" FAKE_GH_DIR="$WORK/pfnotmux/gh" XDG_STATE_HOME="$WORK/pfnotmux/state" \
+    "$(command -v bash)" "$DELIVER_ABS" --map 3 --verify-cmd true --plan-only --json >"$WORK/pfnotmux/out" 2>"$WORK/pfnotmux/err" ); RC=$?
+[[ "$RC" -eq 0 && "$(pocheck pfnotmux tmux)" == "warn" && "$(pojq pfnotmux '.checks[]|select(.name=="tmux")|.detail')" == *"setsid nohup"* ]] \
+  && ok "plan-only: no tmux is a warning naming the setsid nohup fallback (exit 0)" \
+  || note "plan-only without tmux: rc=$RC tmux=$(pocheck pfnotmux tmux) failed: $(pojq pfnotmux '[.checks[]|select(.status=="fail")|"\(.name): \(.detail)"]|join("; ")') gh=$(readlink "$WORK/pfnotmux/bin/gh") $(head -c 200 "$WORK/pfnotmux/err")"
+new_fixture pfprot; echo integration/x > "$WORK/pfprot/gh/protected"
+run_deliver pfprot -- --plan-only --json; RC=$?
+[[ "$RC" -eq 0 && "$(pocheck pfprot branch-protection)" == "warn" ]] \
+  && ok "plan-only: branch protection on the base is a warning, not a failure" || note "plan-only protection: rc=$RC $(pocheck pfprot branch-protection)"
+new_fixture pfmain; git -C "$WORK/pfmain/repo" switch -q main
+run_deliver pfmain -- --plan-only --json; pf_fails pfmain base-branch "the default branch as base" $?
+run_deliver pfmain -- --plan-only --json --allow-main; RC=$?
+[[ "$RC" -eq 0 && "$(pocheck pfmain base-branch)" == "ok" ]] \
+  && ok "plan-only: --allow-main accepts main as the base" || note "plan-only --allow-main: rc=$RC"
+
+# a real run creates the five labels before its first issue starts
+HL="$WORK/happy"
+LBL_MISSING=""
+for l in map prd ready-for-agent needs-human needs-triage; do grep -q "^label create $l " "$HL/gh/calls" || LBL_MISSING="$LBL_MISSING $l"; done
+FIRST_LABEL="$(grep -n '^label create' "$HL/gh/calls" | head -1 | cut -d: -f1)"
+FIRST_PR="$(grep -n '^pr create' "$HL/gh/calls" | head -1 | cut -d: -f1)"
+[[ -z "$LBL_MISSING" && -n "$FIRST_LABEL" && "$FIRST_LABEL" -lt "$FIRST_PR" ]] \
+  && ok "a real run creates map, prd, ready-for-agent, needs-human, needs-triage before the first PR" \
+  || note "label bootstrap: missing:$LBL_MISSING first label call at $FIRST_LABEL, first pr create at $FIRST_PR"
+
+# --status / --stop act on the newest run for --map
+run_deliver happy -- --status; RC=$?
+[[ "$RC" -eq 0 && "$(jq -r .state "$HL/out")" == "done" && "$(jq -r .merged_count "$HL/out")" == "2" ]] \
+  && ok "--status prints the newest run's status.json (state done, 2 merged)" \
+  || note "--status: rc=$RC out=$(head -c 200 "$HL/out")"
+HL_RUNDIR="$(ls -d "$HL"/repo/tmp/deliver/*/ | tail -1)"
+run_deliver happy -- --stop; RC=$?
+[[ "$RC" -eq 0 && -e "${HL_RUNDIR}STOP" ]] \
+  && ok "--stop touches the newest run's STOP file" || note "--stop: rc=$RC STOP=$(ls "$HL_RUNDIR" | tr '\n' ' ')"
+new_fixture pfnorun
+run_deliver pfnorun -- --status; RC1=$?
+run_deliver pfnorun -- --stop; RC2=$?
+[[ "$RC1" -ne 0 && "$RC2" -ne 0 && ! -e "$WORK/pfnorun/repo/tmp/deliver" ]] \
+  && ok "--status / --stop with no run for the map fail and create nothing" || note "no-run status/stop: rc=$RC1/$RC2"
 
 finish
