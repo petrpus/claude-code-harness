@@ -139,6 +139,16 @@ map_title_is_conventional "feat(deliver): tracer bullet" && map_title_is_convent
   && [[ "$(map_branch_name 3 'fix: ???')" == "fix/3-issue" ]] \
   && ok "branch name: <type>/<N>-<slug>" \
   || note "branch name: '$(map_branch_name 12 'feat(deliver): Park failing issues, skip dependents!')'"
+[[ "$(map_branch_name 56 'fix: resume fidelity and verify command detection')" == "fix/56-resume-fidelity-and-verify-command" ]] \
+  && ok "branch name: cut at a word boundary" \
+  || note "branch word cut: '$(map_branch_name 56 'fix: resume fidelity and verify command detection')'"
+if locale -a 2>/dev/null | grep -qix 'cs_CZ\.utf-\?8'; then
+  [[ "$(LC_ALL=cs_CZ.UTF-8 map_branch_name 7 'feat: architecture branch option')" == "feat/7-architecture-branch-option" ]] \
+    && ok "branch name: locale-safe under cs_CZ.UTF-8" \
+    || note "branch name under cs_CZ: '$(LC_ALL=cs_CZ.UTF-8 map_branch_name 7 'feat: architecture branch option')'"
+else
+  echo "  (skipped: cs_CZ.UTF-8 locale not installed)"
+fi
 
 printf -- '- [ ] #1 feat: a\n- [ ] #1 feat: again\n- [ ] #2 feat: b (after: #9)\n- [ ] #3 feat: c (after: S1)\n' > "$WORK/bad.plan"
 PROBLEMS="$(map_validate "$WORK/bad.plan")"; VRC=$?
