@@ -34,6 +34,19 @@ implementation.
   that fits; pin the model explicitly so a fanned-out fleet doesn't inherit an
   expensive main-session model.
 
+## Under `/deliver`
+
+`/deliver` (`skills/deliver/deliver.sh`) applies the same tiers per issue:
+
+- **Review on sonnet.** The independent review of each issue PR runs
+  `agents/code-reviewer.md` on `--review-model` (default `sonnet`), in a
+  throwaway worktree, cold — it never inherits the main session's model.
+- **Per-issue PLAN on opus.** Each issue's inner autopilot run does its own PLAN
+  pass at autopilot's default `--plan-model opus`. **Cost note:** that is one
+  opus planning call per issue, so a Map of N issues pays it N times, on top of
+  BUILD, the haiku verifier and the review. Bound it with `--issue-budget-usd`
+  and the run-wide caps.
+
 ## The rule of thumb
 
 > Plan once with the smartest model. Build with a competent one. Verify often

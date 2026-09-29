@@ -293,6 +293,23 @@ for l in map prd ready-for-agent needs-human needs-triage; do
   grep -qF -- "\`$l\`" "$HD" && ok "harness-doctor names label $l" || note "harness-doctor does not name label $l"
 done
 
+# ---------------------------------------------------------------------------
+section "architecture docs describe the two-level model"
+AR="docs/architecture.md"
+for pat in 'agent.sh' 'ADR-0007' '/deliver'; do
+  grep -qF -- "$pat" "$AR" && ok "architecture.md mentions $pat" || note "architecture.md does not mention $pat"
+done
+# The Stop gate is not wired into loop.sh — SKILL.md must offer it as a manual
+# option, not describe the runner registering/removing the hook.
+if grep -qE 'autopilot MAY register|MUST remove that' skills/autopilot/SKILL.md; then
+  note "autopilot SKILL.md still presents the Stop gate as implemented"
+else
+  ok "autopilot SKILL.md no longer presents the Stop gate as implemented"
+fi
+grep -qi 'manual' <(sed -n '/Stop gate/,$p' skills/autopilot/SKILL.md) \
+  && ok "autopilot SKILL.md Stop gate paragraph is a manual option" \
+  || note "autopilot SKILL.md Stop gate paragraph does not say it is manual"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
