@@ -58,6 +58,12 @@ When vendoring, copy the **whole skill dir** including resource files (e.g.
 with our conventions below. We deliberately **skip** `setup-matt-pocock-skills` —
 its bootstrapped conventions are baked into the skills and documented here instead.
 
+### Known upstream mismatch
+
+Vendored `triage` still tells the reader to run `/setup-matt-pocock-skills`,
+which we skip on purpose (above). This dangling reference is a known upstream
+mismatch; leave it as vendored and do not "fix" it locally.
+
 ## Conventions the skills assume (for consumer projects)
 
 - **Issue tracker**: GitHub Issues via the `gh` CLI (not GitHub MCP). Skills like

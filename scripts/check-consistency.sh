@@ -233,6 +233,23 @@ grep -E '^\| to-issues \|' docs/pocock-sync-log.md | grep -q 'Map-publishing' \
 grep -E '^\| to-prd \|' docs/pocock-sync-log.md | grep -q '`prd` label' \
   && ok "sync-log records the to-prd prd-label patch" || note "sync-log to-prd row lacks the \`prd\` label local patch"
 
+# ---------------------------------------------------------------------------
+section "implement-issue follows the /deliver contract"
+II="skills/implement-issue/SKILL.md"
+ii_has() { grep -qE -- "$1" "$II" && ok "implement-issue: $2" || note "implement-issue lacks: $2"; }
+ii_has 'ready-for-agent' 'label ready-for-agent'
+ii_has '`--base`.*default branch|default branch.*`--base`|--base=<[^>]*>.*default branch' '--base defaults to the repo default branch'
+ii_has '[Vv]erify on the base' 'verify on the base'
+ii_has '[Cc]ommit before (the )?review|commit .*before .*review' 'commit before review'
+ii_has '--base=<base> --head=<branch>|--head=<' 'reviewer given --base / --head'
+ii_has 'git rev-parse --abbrev-ref HEAD' 'branch assertion around the review'
+ii_has 'last-verify-status' 'verify-status assertion around the review'
+ii_has 'gh pr create --base' 'gh pr create --base'
+ii_has 'needs-triage' 'out-of-scope findings filed as needs-triage issues'
+grep -q 'setup-matt-pocock-skills' CLAUDE.md && grep -qi 'known upstream mismatch' CLAUDE.md \
+  && ok "CLAUDE.md lists triage's /setup-matt-pocock-skills known upstream mismatch" \
+  || note "CLAUDE.md lacks the triage /setup-matt-pocock-skills known-mismatch note"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
