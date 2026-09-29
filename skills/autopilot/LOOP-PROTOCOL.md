@@ -210,7 +210,8 @@ runner-owned — written and read only by `loop.sh`, never named in any prompt:
 
 ```json
 {"plan_sig": "<cksum of the ordered unticked slice ids>",
- "slices": {"S2": {"fails": 3, "escalated": false, "parked": true}}}
+ "slices": {"S2": {"fails": 3, "escalated": false, "parked": true,
+                    "last_turn_limit": false}}}
 ```
 
 Every iteration reconciles this against the CURRENT plan before selecting: an
