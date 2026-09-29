@@ -130,6 +130,11 @@ map_title_is_conventional "feat(deliver): tracer bullet" && map_title_is_convent
   && [[ "$(map_pr_title '' 'Write the Guide' 'documentation')" == "docs: write the Guide" ]] \
   && ok "PR title: Map title if conventional, else <type from labels>: <title>" \
   || note "PR title derivation is wrong"
+[[ "$(map_integration_slug 'Map: Deliver -- the /deliver skill!')" == "map-deliver-the-deliver-skill" ]] \
+  && [[ "$(map_integration_slug '  ***  ')" == "" ]] \
+  && [[ "$(map_integration_slug 'A very long map title that keeps going and going forever')" == "a-very-long-map-title-that-keeps-going-a" ]] \
+  && ok "map_integration_slug: lowercase, dashes, trimmed, bounded" \
+  || note "integration slug: '$(map_integration_slug 'Map: Deliver -- the /deliver skill!')'"
 [[ "$(map_branch_name 12 'feat(deliver): Park failing issues, skip dependents!')" == "feat/12-park-failing-issues-skip-dependents" ]] \
   && [[ "$(map_branch_name 3 'fix: ???')" == "fix/3-issue" ]] \
   && ok "branch name: <type>/<N>-<slug>" \
@@ -912,6 +917,41 @@ job_allowmain() {
   run_deliver allowmain -- --allow-main
   echo $? > "$WORK/allowmain/rc"
 }
+job_createint() {
+  new_fixture createint
+  git -C "$WORK/createint/repo" switch -q main
+  run_deliver createint -- --create-integration
+  echo $? > "$WORK/createint/rc"
+}
+job_createintexists() {
+  new_fixture createintexists
+  git -C "$WORK/createintexists/repo" switch -q main
+  git -C "$WORK/createintexists/repo" branch integration/map-test
+  run_deliver createintexists -- --create-integration
+  echo $? > "$WORK/createintexists/rc"
+}
+job_createintremote() {
+  new_fixture createintremote
+  git -C "$WORK/createintremote/repo" switch -q main
+  git -C "$WORK/createintremote/repo" push -q origin main:integration/map-test
+  run_deliver createintremote -- --create-integration
+  echo $? > "$WORK/createintremote/rc"
+}
+job_createintdirty() {
+  new_fixture createintdirty
+  git -C "$WORK/createintdirty/repo" switch -q main
+  echo junk > "$WORK/createintdirty/repo/untracked.txt"
+  run_deliver createintdirty -- --create-integration
+  echo $? > "$WORK/createintdirty/rc"
+}
+job_createintcombo() {
+  new_fixture createintcombo
+  git -C "$WORK/createintcombo/repo" switch -q main
+  run_deliver createintcombo -- --create-integration --allow-main
+  echo $? > "$WORK/createintcombo/rc"
+  run_deliver createintcombo -- --create-integration --resume
+  echo $? > "$WORK/createintcombo/rc2"
+}
 job_dirty() {
   new_fixture dirty
   echo junk > "$WORK/dirty/repo/untracked.txt"
@@ -1268,6 +1308,11 @@ bg job_paceall
 bg job_pacebad
 bg job_onmain
 bg job_allowmain
+bg job_createint
+bg job_createintexists
+bg job_createintremote
+bg job_createintdirty
+bg job_createintcombo
 bg job_dirty
 bg job_nomap
 bg job_behind
@@ -1583,6 +1628,34 @@ AM="$WORK/allowmain"
 jq -e '.allow_main == true and .base == "main" and (.final_pr // null) == null' "$AM"/repo/tmp/deliver/*/state.json >/dev/null \
   && ok "--allow-main: recorded in state.json (a --resume on main will not re-refuse)" \
   || note "--allow-main: state.json is $(cat "$AM"/repo/tmp/deliver/*/state.json | tr '\n' ' ')"
+
+# --create-integration (#62): branch cut off origin/main, pushed with -u, run
+# delivers into it, the final PR targets main.
+CI="$WORK/createint"
+[[ "$(cat "$CI/rc")" -eq 0 ]] \
+  && grep -qx 'switch -q -c integration/map-test origin/main' "$CI/git.calls" \
+  && grep -qx 'push -q -u origin integration/map-test' "$CI/git.calls" \
+  && [[ "$(jq -r .baseRefName "$CI/gh/prs/4.json")" == "integration/map-test" \
+     && "$(jq -r .baseRefName "$CI/gh/prs/5.json")" == "integration/map-test" ]] \
+  && [[ "$(jq -r '.baseRefName + ">" + .headRefName' "$CI/gh/prs/6.json")" == "main>integration/map-test" ]] \
+  && jq -e '.base == "integration/map-test"' "$CI"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--create-integration: switch -c off origin/main + push -u, per-issue PRs target the new branch, final PR targets main" \
+  || note "--create-integration: rc=$(cat "$CI/rc") git: $(grep -E '^(switch|push)' "$CI/git.calls" | tr '\n' '|') err: $(tail -3 "$CI/err" | tr '\n' '|')"
+for c in createintexists createintremote createintdirty; do
+  RC="$(cat "$WORK/$c/rc")"
+  [[ "$RC" -eq 1 ]] && ! grep -qs '^pr create' "$WORK/$c/gh/calls" && ! grep -q '^switch -q -c' "$WORK/$c/git.calls" \
+    && case "$c" in
+         createintexists) grep -q "already exists locally" "$WORK/$c/err" ;;
+         createintremote) grep -q "already exists on origin" "$WORK/$c/err" ;;
+         *) grep -q "working tree is dirty" "$WORK/$c/err" ;;
+       esac \
+    && ok "--create-integration refuses ($c): exit 1, no branch created, no PR" \
+    || note "--create-integration $c: exit $RC err: $(tail -1 "$WORK/$c/err")"
+done
+[[ "$(cat "$WORK/createintcombo/rc")" -eq 1 && "$(cat "$WORK/createintcombo/rc2")" -eq 1 ]] \
+  && ! grep -q '^switch -q -c' "$WORK/createintcombo/git.calls" 2>/dev/null \
+  && ok "--create-integration refuses --allow-main and --resume" \
+  || note "--create-integration combos: rc=$(cat "$WORK/createintcombo/rc") rc2=$(cat "$WORK/createintcombo/rc2")"
 
 RC="$(cat "$WORK/dirty/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "working tree is dirty" "$WORK/dirty/err" && [[ ! -s "$WORK/dirty/gh/calls" ]] \

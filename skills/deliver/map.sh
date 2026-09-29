@@ -184,3 +184,12 @@ map_add_follow_up() {
     ' "$body"
   fi
 }
+
+# map_integration_slug <map title>  — the <map-slug> of integration/<map-slug>
+# (#62): lowercase, runs of non-alphanumerics become one dash, trimmed, at most
+# 40 characters (cut, then re-trimmed). Empty when nothing usable is left.
+map_integration_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-40 | sed -E 's/-+$//'
+  echo
+}

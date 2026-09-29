@@ -47,12 +47,18 @@
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
 #              [--max-fix-rounds 2] [--max-turns 200]
 #              [--budget-usd <n>] [--max-minutes <n>]
-#              [--resume [--retry '#N']] [--allow-main]
+#              [--resume [--retry '#N']] [--allow-main | --create-integration]
 #
 # Run it from a clean checkout of the integration branch, in sync with origin.
 # main/master is refused unless --allow-main (docs/adr/0013-*.md): per-issue
 # PRs then target that branch directly and no final PR is opened; the flag is
-# recorded in state.json, so --resume on main does not refuse again. State lives under tmp/deliver/<run-id>/: state.json
+# recorded in state.json, so --resume on main does not refuse again.
+# --create-integration (#62) makes the integration branch first: from a clean
+# checkout it derives integration/<map-slug> from the Map's title, runs
+# `git switch -c integration/<map-slug> origin/<default>` and pushes it with
+# `git push -u`, then delivers into it (final PR targets the default branch).
+# It refuses when that branch already exists locally or on origin, and cannot
+# be combined with --resume or --allow-main. State lives under tmp/deliver/<run-id>/: state.json
 # (resume truth), events.jsonl, status.json, run-<run-id>.jsonl (this
 # runner's own model calls, loop.sh's schema, so /usage-report reads it) and
 # a lock file holding this process's pid, removed on exit. A STOP file at
@@ -123,6 +129,7 @@ BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
 ALLOW_MAIN=0           # --allow-main: deliver straight into main/master (ADR-0013)
+CREATE_INTEGRATION=0   # --create-integration: cut integration/<map-slug> off origin/<default>
 RETRY_ISSUE=""         # set by --retry '#N'; only meaningful with --resume
 
 log()     { echo "deliver: $*" >&2; }
@@ -150,6 +157,7 @@ while [[ $# -gt 0 ]]; do
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
     --resume)               RESUME=1; shift ;;
     --allow-main)           ALLOW_MAIN=1; shift ;;
+    --create-integration)   CREATE_INTEGRATION=1; shift ;;
     --retry)                RETRY_ISSUE="${2#\#}"; shift 2 ;;
     -h|--help)              sed -n '2,90p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
@@ -167,6 +175,8 @@ done
 [[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
 [[ -z "$RETRY_ISSUE" || "$RETRY_ISSUE" =~ ^[0-9]+$ ]] || die "--retry takes an issue number ('#N' or N)"
 [[ -z "$RETRY_ISSUE" || "$RESUME" -eq 1 ]] || die "--retry only makes sense with --resume"
+[[ "$CREATE_INTEGRATION" -eq 0 || "$RESUME" -eq 0 ]] || die "--create-integration starts a new run; it cannot be combined with --resume"
+[[ "$CREATE_INTEGRATION" -eq 0 || "$ALLOW_MAIN" -eq 0 ]] || die "--create-integration and --allow-main contradict each other (one delivers into a new integration branch, the other into main)"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
@@ -240,6 +250,25 @@ if [[ "$RESUME" -eq 1 ]]; then
     log "run $RESUME_RUN_ID: switching the checkout back to '$RESUME_BASE' (was on '${RESUME_CUR_BRANCH:-<detached>}')"
     git switch -q "$RESUME_BASE" || die "--resume: cannot switch to '$RESUME_BASE'"
   fi
+fi
+
+# --create-integration (#62): cut and push the integration branch, then carry
+# on as if the user had checked it out. Skipped in the private-copy re-exec,
+# which starts on the branch this created.
+if [[ "$CREATE_INTEGRATION" -eq 1 && "${DELIVER_SNAPSHOT:-0}" != "1" ]]; then
+  [[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "working tree is dirty. Commit or stash first."
+  MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
+  CI_MAP_JSON="$(forge_issue_json "$MAP")" || die "--create-integration: cannot read map #$MAP"
+  CI_SLUG="$(map_integration_slug "$(jq -r '.title // ""' <<<"$CI_MAP_JSON")")"
+  [[ -n "$CI_SLUG" ]] || die "--create-integration: cannot derive a branch name from map #$MAP's title"
+  CI_BRANCH="integration/$CI_SLUG"
+  CI_DEFAULT="$(forge_default_branch)" || die "--create-integration: cannot read the default branch"
+  git fetch -q origin || die "git fetch origin failed"
+  git rev-parse --verify -q "refs/heads/$CI_BRANCH" >/dev/null && die "--create-integration: '$CI_BRANCH' already exists locally"
+  git rev-parse --verify -q "refs/remotes/origin/$CI_BRANCH" >/dev/null && die "--create-integration: '$CI_BRANCH' already exists on origin"
+  git rev-parse --verify -q "origin/$CI_DEFAULT" >/dev/null || die "--create-integration: 'origin/$CI_DEFAULT' not found"
+  forge_create_integration "$CI_BRANCH" "$CI_DEFAULT" || die "--create-integration: could not create and push '$CI_BRANCH'"
+  log "created and pushed $CI_BRANCH from origin/$CI_DEFAULT"
 fi
 
 BASE="$(git branch --show-current 2>/dev/null || true)"
