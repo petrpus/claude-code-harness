@@ -31,7 +31,9 @@
 #   Results (globals, set by every call, dry runs included):
 #     AGENT_LAST_RC, AGENT_LAST_JSON, AGENT_LAST_RESULT, AGENT_LAST_COST,
 #     AGENT_LAST_DURATION, AGENT_LAST_IN_TOKENS, AGENT_LAST_OUT_TOKENS,
-#     AGENT_LAST_TURNS, AGENT_LAST_CACHE_READ, AGENT_LAST_CACHE_CREATION
+#     AGENT_LAST_TURNS, AGENT_LAST_CACHE_READ, AGENT_LAST_CACHE_CREATION,
+#     AGENT_LAST_SUBTYPE (the reply's `subtype`: "success", or an error such
+#     as "error_max_turns" — the call ran out of --max-turns, #96)
 #
 #   Missing fields (a stub, a crashed call, a dry run) read as 0 / "" — the
 #   output shape is never a hard requirement. Needs jq and coreutils timeout.
@@ -150,11 +152,12 @@ agent_run() {
   fields="$(printf '%s' "$out" | jq -r '[
       (.total_cost_usd // 0), (.usage.input_tokens // 0), (.usage.output_tokens // 0),
       (.num_turns // 0), (.usage.cache_read_input_tokens // 0),
-      (.usage.cache_creation_input_tokens // 0)
+      (.usage.cache_creation_input_tokens // 0), (.subtype // "-")
     ] | map(tostring) | join("\t")' 2>/dev/null)" || fields=""
-  [[ -n "$fields" ]] || fields=$'0\t0\t0\t0\t0\t0'
+  [[ -n "$fields" ]] || fields=$'0\t0\t0\t0\t0\t0\t-'
   IFS=$'\t' read -r AGENT_LAST_COST AGENT_LAST_IN_TOKENS AGENT_LAST_OUT_TOKENS \
-    AGENT_LAST_TURNS AGENT_LAST_CACHE_READ AGENT_LAST_CACHE_CREATION <<<"$fields"
+    AGENT_LAST_TURNS AGENT_LAST_CACHE_READ AGENT_LAST_CACHE_CREATION AGENT_LAST_SUBTYPE <<<"$fields"
+  [[ "$AGENT_LAST_SUBTYPE" == "-" ]] && AGENT_LAST_SUBTYPE=""
   AGENT_LAST_RESULT="$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" || AGENT_LAST_RESULT=""
   if [[ -n "${AGENT_TRANSCRIPT_DIR:-}" ]] && mkdir -p "$AGENT_TRANSCRIPT_DIR" 2>/dev/null; then
     # Continue after the files already there: a resumed or reloaded run is a
