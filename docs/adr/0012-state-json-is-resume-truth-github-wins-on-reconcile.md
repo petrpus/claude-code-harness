@@ -35,6 +35,18 @@ has since been reviewed, merged and had its branch deleted by hand.
    friends, #61 S2) are what make re-entering a phase safe once GitHub has
    won: a resumed run re-does the *check*, not the *write*, so a review or a
    park/merge comment that already landed is never posted twice.
+5. An open PR is re-entered at the review round `state.json` recorded
+   (`round`), with the previous round's findings inlined as usual, so a
+   resume in the middle of #63's fix rounds neither restarts at round 1
+   nor skips one; the per-issue fix-round budget (`ROUNDS_USED`, ADR-0010)
+   lives in the issue's state dir and survives the resume with it. The
+   checked-out branch must match origin: a local copy ahead of it (a fix
+   round that committed but never pushed) is re-verified and pushed first,
+   one that diverged stops the run for a human.
+6. `--retry '#N'` discards only an attempt this run recorded as `parked`.
+   Anything else is work in flight or already settled, and closing its PR
+   and deleting its branch would throw live work away — `--retry` refuses
+   and a plain `--resume` continues it instead.
 
 ## Consequences
 

@@ -32,10 +32,39 @@ forge_issue_body() {
 forge_issue_set_body() { gh issue edit "$1" --body-file "$2" >/dev/null; }   # <number> <file>
 forge_issue_comment()  { gh issue comment "$1" --body-file "$2" >/dev/null; } # <number> <file>
 
+# forge_issue_search <query>  — the number of the first open or closed issue
+# whose title/body/comments match <query> (a finding-hash marker, #63), or
+# nothing when there is none. Both states: a follow-up already triaged and
+# closed must still dedupe against a recurring finding.
+forge_issue_search() {
+  gh issue list --search "$1" --state all --json number --jq '.[0].number // empty'
+}
+
+# forge_issue_create <title> <body_file> <label>  — a needs-triage follow-up
+# issue (#63); echoes its number. The label must already exist
+# (forge_label_ensure).
+forge_issue_create() {
+  local url
+  url="$(gh issue create --title "$1" --body-file "$2" --label "$3")" || return 1
+  url="$(printf '%s\n' "$url" | grep -oE '/issues/[0-9]+' | tail -1)"
+  [[ -n "$url" ]] || return 1
+  printf '%s\n' "${url##*/}"
+}
+
+# forge_pr_set_body <pr> <file>  — rewrite a PR's body (a fix round's updated
+# plan, #63). Never touches the title.
+forge_pr_set_body() { gh pr edit "$1" --body-file "$2" >/dev/null; }
+
 # forge_push_branch <branch>  — first push of a branch the runner created.
 # Never forced: a rejected push means someone else wrote the branch, and
 # that is a reason to stop, not to overwrite.
 forge_push_branch() { git push -q -u origin "$1"; }
+
+# forge_push_update <branch>  — a later push of a branch already on the
+# remote: final_verify folding in a moved integration branch, before or
+# after the PR exists. Plain `git push`, never forced — a rejected push
+# (someone else advanced the branch) stops the run rather than overwrite it.
+forge_push_update() { git push -q origin "$1"; }
 
 # forge_delete_remote_branch <branch>  — after its PR merged. Tolerates the
 # forge having deleted it already (repos with auto-delete of head branches).
@@ -59,8 +88,21 @@ forge_pr_create() {
 #   the branch after verify, the forge refuses instead of merging unverified
 #   code. The head branch is deleted separately (forge_delete_remote_branch)
 #   so gh never touches the local checkout.
+#   A repo whose branch protection forbids squash merges gets a plain merge
+#   instead (--merge), still pinned to the same head. Any other refusal is
+#   returned to the caller as is — deliver.sh retries once through
+#   final_verify, then parks (#60).
 forge_pr_merge() {
-  gh pr merge "$1" --squash --match-head-commit "$2" --subject "$3" --body-file "$4"
+  local pr="$1" sha="$2" subject="$3" bodyf="$4" out rc
+  out="$(gh pr merge "$pr" --squash --match-head-commit "$sha" --subject "$subject" --body-file "$bodyf" 2>&1)"
+  rc=$?
+  printf '%s\n' "$out"
+  if [[ "$rc" -ne 0 ]] && grep -qi 'squash.*not allowed' <<<"$out"; then
+    out="$(gh pr merge "$pr" --merge --match-head-commit "$sha" --subject "$subject" --body-file "$bodyf" 2>&1)"
+    rc=$?
+    printf '%s\n' "$out"
+  fi
+  return "$rc"
 }
 
 # forge_pr_comment <pr> <body_file>  — the review report. A comment, not a
@@ -119,6 +161,28 @@ forge_pr_for_branch() {
        | jq -r '[.[] | select(.state=="OPEN" or .state=="MERGED")][0].number // empty')"
   [[ -n "$n" ]] || return 1
   printf '%s\n' "$n"
+}
+
+# forge_pr_checks <pr>  — JSON array of {name,state,bucket,link} for every
+# check reported on the PR (ci_wait, #60). `gh pr checks` exits non-zero
+# whenever a check is pending or failing, and again when none has reported
+# yet at all — only the JSON on stdout matters here, so the exit code is not
+# checked; no checks reported prints nothing on stdout, normalised to "[]".
+forge_pr_checks() {
+  local out
+  out="$(gh pr checks "$1" --json name,state,bucket,link 2>/dev/null)"
+  [[ -n "$out" ]] && printf '%s\n' "$out" || echo "[]"
+  return 0
+}
+
+# forge_ci_failed_log <run_id> [lines]  — tail of a failed run's log
+# (`gh run view <id> --log-failed`), <lines> lines (default 200; ci_wait's
+# fix round, #60). Best-effort: a gh failure (rotated log, bad id) yields an
+# empty string rather than stopping the caller — losing the log tail is a
+# reason to hand the model less context, not to skip the fix round.
+forge_ci_failed_log() {
+  local run="$1" lines="${2:-200}"
+  gh run view "$run" --log-failed 2>/dev/null | tail -n "$lines"
 }
 
 # forge_grant_violations <allowed_tools_csv>

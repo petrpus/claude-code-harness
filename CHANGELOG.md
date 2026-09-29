@@ -21,7 +21,7 @@ All notable changes to claude-code-harness. Semver via git tags.
   cap has left. `--resume` picks the newest run for the map, clears a stale
   lock (refusing a live one), re-copies the runner (warning on a plugin
   version change) and reconciles every non-terminal issue against GitHub —
-  GitHub wins (`docs/adr/0010-*.md`) — before continuing the graph walk
+  GitHub wins (`docs/adr/0012-*.md`) — before continuing the graph walk
   exactly where that issue's own state left it. `--retry '#N'` (with
   `--resume`) discards a parked issue's recorded branch/PR and gives it a
   fresh inner run. `forge_pr_comment_has_marker` / `forge_issue_comment_has_marker`
