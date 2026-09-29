@@ -63,7 +63,7 @@
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
-#              [--max-fix-rounds 2] [--max-turns 200]
+#              [--max-fix-rounds 2] [--max-turns 200] [--review-max-turns 80]
 #              [--budget-usd <n>] [--max-minutes <n>]
 #              [--resume [--retry '#N']] [--allow-main | --create-integration]
 #              [--plan-only [--json]] | --status | --stop
@@ -144,6 +144,8 @@ CI_GRACE_SECONDS=120
 MAX_FIX_ROUNDS=2
 MAX_TURNS=200          # per model call in every loop.sh run (#96): loop.sh's
                        # own default (80) is sized for smaller plan items
+REVIEW_MAX_TURNS=80    # per model call in the independent review (#102): a review
+                       # reads a diff and runs no tests, so it does not inherit MAX_TURNS
 BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
@@ -176,6 +178,7 @@ while [[ $# -gt 0 ]]; do
     --ci-grace-seconds)     CI_GRACE_SECONDS="$2"; shift 2 ;;
     --max-fix-rounds)       MAX_FIX_ROUNDS="$2"; shift 2 ;;
     --max-turns)            MAX_TURNS="$2"; shift 2 ;;
+    --review-max-turns)     REVIEW_MAX_TURNS="$2"; shift 2 ;;
     --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
     --resume)               RESUME=1; shift ;;
@@ -198,6 +201,7 @@ done
 [[ "$CI_GRACE_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-grace-seconds takes whole seconds"
 [[ "$MAX_FIX_ROUNDS" =~ ^[0-9]+$ ]] || die "--max-fix-rounds takes a whole number (0: no fix rounds)"
 [[ "$MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || die "--max-turns takes a positive whole number"
+[[ "$REVIEW_MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || die "--review-max-turns takes a positive whole number"
 [[ -z "$BUDGET_USD" || "$BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--budget-usd takes a non-negative number"
 [[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
 [[ -z "$RETRY_ISSUE" || "$RETRY_ISSUE" =~ ^[0-9]+$ ]] || die "--retry takes an issue number ('#N' or N)"
@@ -934,27 +938,39 @@ run_status running
 #   <dir>/review-<round>.json exists (only written when a verdict parsed).
 review_issue() {
   local n="$1" pr="$2" base_sha="$3" head_sha="$4" dir="$5" round="$6" prev="${7:-[]}"
-  local attempt rc out verdict comment="$dir/review-$round.comment.md"
+  local attempt rc out verdict turn_limited comment="$dir/review-$round.comment.md"
   for attempt in 1 2; do
     out="$dir/review-$round"
     review_run "$n" "$round" "$BASE" "$base_sha" "$head_sha" "$dir/PROMPT.md" "$out" "$REVIEW_MODEL" "$prev"; rc=$?
     case "$rc" in
       0) deliver_logline review "$n" "$round" "$(jq -r '.verdict' "$out.json")"; break ;;
-      2) # A failed call (timeout, crash) and an off-contract reply both leave
-         # no verdict; the run log keeps them apart.
-         if [[ "${AGENT_LAST_RC:-0}" -ne 0 ]]; then
+      2) # A turn-limited reply, a failed call (timeout, crash) and an
+         # off-contract reply all leave no verdict; the run log keeps them apart.
+         turn_limited=false
+         if [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]]; then
+           turn_limited=true
+           deliver_logline review "$n" "$round" turn-limit
+         elif [[ "${AGENT_LAST_RC:-0}" -ne 0 ]]; then
            deliver_logline review "$n" "$round" call_failed
          else
            deliver_logline review "$n" "$round" no_verdict
          fi
          if [[ "$attempt" -eq 1 ]]; then
-           log "#$n: round $round — the reviewer returned no usable verdict — retrying once."
+           if $turn_limited; then
+             log "#$n: round $round — the reviewer ran out of turns (--review-max-turns $REVIEW_MAX_TURNS) — retrying once."
+           else
+             log "#$n: round $round — the reviewer returned no usable verdict — retrying once."
+           fi
            continue
          fi
          review_comment "$n" "$round" "$head_sha" "$out.md" "" > "$comment"
          forge_pr_comment_has_marker "$pr" "$(review_marker "$n" "$round" "$head_sha")" \
            || forge_pr_comment "$pr" "$comment" || true
-         PARK_REASON="round $round's reviewer returned no usable verdict twice (PR #$pr)"
+         if $turn_limited; then
+           PARK_REASON="round $round's reviewer ran out of turns twice (cap $REVIEW_MAX_TURNS; raise --review-max-turns) (PR #$pr)"
+         else
+           PARK_REASON="round $round's reviewer returned no usable verdict twice (PR #$pr)"
+         fi
          return 10 ;;
       3) deliver_logline review "$n" "$round" breach
          die "#$n: SAFETY BREACH — the checkout changed during round $round's review of PR #$pr: $(tr '\n' ' ' < "$out.breach"). Stopping the run; nothing further is pushed or merged." ;;

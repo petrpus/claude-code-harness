@@ -6,6 +6,11 @@ All notable changes to claude-code-harness. Semver via git tags.
 
 ### Added
 
+- `/deliver --review-max-turns <n>` (default 80): the independent review's
+  own turn cap, separate from `--max-turns` (#102).
+- `/deliver` names a turn-limited review reply `turn-limit` in the run log and
+  retry message, and the park reason says the reviewer ran out of turns
+  instead of "no usable verdict twice" (#102).
 - Map format and label alignment across the workflow skills (#64).
   `skills/deliver/MAP-FORMAT.md` documents the Map issue per ADR-0008;
   `to-issues` publishes a Map, `to-prd` labels the PRD `prd`, `start-feature`

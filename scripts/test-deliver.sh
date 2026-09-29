@@ -645,6 +645,7 @@ case "$prompt" in
       inl=no; [[ "$prompt" == *"### Diff"* && "$prompt" == *"+++ b/work/issue-"* ]] && inl=yes
       printf '%s\t%s\t%s\t%s\t%s\n' "$(pwd)" "$tools" "$dis" "$perm" "$inl" >> "$STUB_REVIEW_LOG"
     fi
+    [[ -n "${STUB_REVIEW_TURNS_LOG:-}" ]] && { grep -oE -- '--max-turns [0-9]+' <<<"$*" >> "$STUB_REVIEW_TURNS_LOG" || true; }
     if [[ -n "${STUB_REVIEW_PROMPT_DIR:-}" ]]; then
       mkdir -p "$STUB_REVIEW_PROMPT_DIR"
       printf '%s' "$prompt" > "$STUB_REVIEW_PROMPT_DIR/$(date +%s%N)-$$-$RANDOM.txt"
@@ -678,6 +679,10 @@ As required, the format example is:
 $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.ts","line":42,"note":"example","in_scope":true}]' "")" ;;
       wrong-head) r="$(review_json approve '[]' 0000000000000000000000000000000000000000)" ;;
     esac
+    if [[ "$mode" == "turnlimit" ]]; then
+      printf '{"type":"result","subtype":"error_max_turns","num_turns":81,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+      exit 0
+    fi
     printf '{"result":%s,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$(printf '%s' "$r" | jq -Rs .)"
     exit 0 ;;
   *"PLAN phase"*|*"autonomous run is stuck"*)
@@ -1044,6 +1049,7 @@ job_rvblockrounds1() {
 }
 job_rvoos()     { new_fixture rvoos;      run_deliver rvoos      STUB_REVIEW=outofscope;                                               echo $? > "$WORK/rvoos/rc"; }
 job_rvgarbage() { new_fixture rvgarbage;  run_deliver rvgarbage  STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log";      echo $? > "$WORK/rvgarbage/rc"; }
+job_rvturns()   { new_fixture rvturns;    run_deliver rvturns    STUB_REVIEW=turnlimit STUB_REVIEW_LOG="$WORK/rvturns/review.log";     echo $? > "$WORK/rvturns/rc"; }
 job_rvretry()   { new_fixture rvretry;    run_deliver rvretry    STUB_REVIEW=garbage-once STUB_REVIEW_STATE="$WORK/rvretry/review.state"; echo $? > "$WORK/rvretry/rc"; }
 job_rvmutate()  { new_fixture rvmutate;   run_deliver rvmutate   STUB_REVIEW=mutate;                                                    echo $? > "$WORK/rvmutate/rc"; }
 job_rvmutatevariant() { # <mutate-ref|mutate-tmp|mutate-hook>
@@ -1189,6 +1195,18 @@ job_maxturns() {
   new_fixture maxturnsbad
   run_deliver maxturnsbad -- --max-turns 0
   echo $? > "$WORK/maxturnsbad/rc"
+}
+job_reviewturns() {
+  # #102: the independent review has its own turn cap, --review-max-turns (80).
+  new_fixture revturns
+  run_deliver revturns STUB_REVIEW_TURNS_LOG="$WORK/revturns/turns.log"
+  echo $? > "$WORK/revturns/rc"
+  new_fixture revturns123
+  run_deliver revturns123 STUB_REVIEW_TURNS_LOG="$WORK/revturns123/turns.log" -- --review-max-turns 123
+  echo $? > "$WORK/revturns123/rc"
+  new_fixture revturnsbad
+  run_deliver revturnsbad -- --review-max-turns abc
+  echo $? > "$WORK/revturnsbad/rc"
 }
 job_retrynotparked() {
   # --retry on an issue the run left in flight (PR open, not parked) must be
@@ -1339,6 +1357,7 @@ bg job_rvblockrounds2
 bg job_rvblockrounds1
 bg job_rvoos
 bg job_rvgarbage
+bg job_rvturns
 bg job_rvretry
 bg job_rvmutate
 bg job_rvmutatevariant mutate-ref
@@ -1357,6 +1376,7 @@ bg job_lockstale
 bg job_retry
 bg job_retrynotparked
 bg job_maxturns
+bg job_reviewturns
 bg job_stopfixresume
 bg job_stopciresume
 bg job_stopcifixresume
@@ -1866,6 +1886,13 @@ RC="$(cat "$WORK/rvgarbage/rc")"
   && ok "review: no usable verdict is retried once, then parks the issue (fail closed)" \
   || note "review garbage: exit $RC, calls $(grep -c . "$WORK/rvgarbage/review.log" 2>/dev/null)"
 
+RC="$(cat "$WORK/rvturns/rc")"
+[[ "$RC" -eq 2 ]] && held rvturns && [[ "$(grep -c . "$WORK/rvturns/review.log")" -eq 2 ]] \
+  && [[ "$(cat "$WORK"/rvturns/repo/tmp/deliver/*/run-*.jsonl | jq -s '[.[] | select(.phase=="review") | .verdict] | join(",")')" == '"turn-limit,turn-limit"' ]] \
+  && jq -r '.comments[-1].body' "$WORK/rvturns/gh/issues/1.json" | grep -q 'ran out of turns' \
+  && ok "review: a turn-limited reply is logged as turn-limit (not no_verdict) and the park reason names the turn limit" \
+  || note "review turn-limit: exit $RC"
+
 RC="$(cat "$WORK/rvretry/rc")"
 [[ "$RC" -eq 0 ]] && [[ "$(cat "$WORK"/rvretry/repo/tmp/deliver/*/run-*.jsonl | jq -s '[.[] | select(.phase=="review") | .verdict] | join(",")')" == '"no_verdict,approve,approve"' ]] \
   && ok "review: one inconclusive reply then a real verdict proceeds (logged as no_verdict, approve)" \
@@ -2207,6 +2234,16 @@ SR2RUNDIR="$(ls -d "$SR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && [[ ! -s "$WORK/maxturnsbad/gh/calls" ]] \
   && ok "--max-turns 0 is refused before any forge call" \
   || note "--max-turns 0: exit $(cat "$WORK/maxturnsbad/rc")"
+
+# --- #102: --review-max-turns reaches the independent review's claude -p -------
+[[ "$(cat "$WORK/revturns/rc")" -eq 0 && -s "$WORK/revturns/turns.log" ]] \
+  && [[ "$(sort -u "$WORK/revturns/turns.log")" == "--max-turns 80" ]] \
+  && [[ "$(cat "$WORK/revturns123/rc")" -eq 0 && "$(sort -u "$WORK/revturns123/turns.log")" == "--max-turns 123" ]] \
+  && ok "--review-max-turns reaches the review call (default 80, --review-max-turns 123 honoured)" \
+  || note "review-max-turns: default=$(sort -u "$WORK/revturns/turns.log" 2>/dev/null | tr '\n' ' ') custom=$(sort -u "$WORK/revturns123/turns.log" 2>/dev/null | tr '\n' ' ')"
+[[ "$(cat "$WORK/revturnsbad/rc")" -eq 1 ]] && grep -q -- '--review-max-turns takes a positive whole number' "$WORK/revturnsbad/err" \
+  && ok "--review-max-turns abc is refused" \
+  || note "--review-max-turns abc: exit $(cat "$WORK/revturnsbad/rc")"
 
 # --- #61 review I1: --retry refuses an issue that is not parked -----------------
 RC="$(cat "$WORK/retrynotparked/rc")"

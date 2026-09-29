@@ -237,7 +237,7 @@ review_cleanup() {
 #   throwaway worktree could not be created.
 review_run() {
   local n="$1" round="$2" base="$3" base_sha="$4" head_sha="$5" charter="$6" out="$7" model="$8" prev="${9:-}"
-  local before after scratch prompt parsed saved_log="${AGENT_STDERR_LOG:-}" saved_dis="${AGENT_DISALLOWED_TOOLS:-}"
+  local before after scratch prompt parsed saved_log="${AGENT_STDERR_LOG:-}" saved_dis="${AGENT_DISALLOWED_TOOLS:-}" saved_turns="${AGENT_MAX_TURNS:-}"
   # Everything the call writes goes outside the checkout: the worktree under
   # a private scratch dir (not the literal `mktemp -d` of the PRD, so a
   # leftover is recognisable), claude's stderr beside it.
@@ -250,8 +250,10 @@ review_run() {
   fi
   AGENT_STDERR_LOG="$scratch/claude-stderr.log"
   AGENT_DISALLOWED_TOOLS="$REVIEW_DISALLOWED_TOOLS"
+  AGENT_MAX_TURNS="${REVIEW_MAX_TURNS:-80}"
   agent_run "review" "$model" "$REVIEW_ALLOWED_TOOLS" "$REVIEW_PERMISSION_MODE" "$prompt" "$REVIEW_WT"
   AGENT_STDERR_LOG="$saved_log"; AGENT_DISALLOWED_TOOLS="$saved_dis"
+  AGENT_MAX_TURNS="$saved_turns"
   review_cleanup
   after="$(review_snapshot)"
   # Only now write into the checkout: the report, and claude's stderr appended
