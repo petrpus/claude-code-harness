@@ -128,7 +128,9 @@ map_title_is_conventional "feat(deliver): tracer bullet" && map_title_is_convent
 [[ "$(map_pr_title 'feat(a): first feature' 'Ignored' '')" == "feat(a): first feature" ]] \
   && [[ "$(map_pr_title 'Second thing' 'Whatever' 'ready-for-agent,bug')" == "fix: second thing" ]] \
   && [[ "$(map_pr_title '' 'Write the Guide' 'documentation')" == "docs: write the Guide" ]] \
-  && ok "PR title: Map title if conventional, else <type from labels>: <title>" \
+  && [[ "$(map_pr_title 'fix(deliver): the independent review has no --max-turns and a turn-limited review is unnamed' 'x' '')" == "fix(deliver): the independent review has no --max-turns and a turn-limited review is" ]] \
+  && [[ "$(map_branch_name 102 "$(map_pr_title 'fix(deliver): the independent review has no --max-turns and a turn-limited review is unnamed' 'x' '')")" == fix/102-* ]] \
+  && ok "PR title: Map title if conventional, else <type from labels>: <title>; a long conventional title keeps its type, cut at a word (#111)" \
   || note "PR title derivation is wrong"
 [[ "$(map_integration_slug 'Map: Deliver -- the /deliver skill!')" == "map-deliver-the-deliver-skill" ]] \
   && [[ "$(map_integration_slug '  ***  ')" == "" ]] \
