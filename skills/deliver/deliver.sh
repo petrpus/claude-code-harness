@@ -28,7 +28,15 @@
 # per-issue budget (--max-fix-rounds); no rounds left, a second red CI, or
 # autopilot not finishing a fix parks instead. A failure of the machinery
 # itself (the forge unreachable, a dirty checkout, a review that touched the
-# checkout) ends the run instead. Not built yet: the launcher.
+# checkout) ends the run instead.
+#
+# At the end of a run — also a partial one — final_pr (#62) opens (or, when an
+# open one exists for this branch, rewrites the body of) the PR from the
+# integration branch into the repo's default branch: `Closes #N` per delivered
+# issue, `Closes #<map>` only when every Delivery line is ticked, parked /
+# skipped / closed-externally / follow-up issues listed, and a line asking for
+# a merge commit rather than a squash. No final PR when nothing was delivered.
+# Recorded as .final_pr in state.json. Not built yet: the launcher.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
@@ -39,10 +47,18 @@
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
 #              [--max-fix-rounds 2] [--max-turns 200]
 #              [--budget-usd <n>] [--max-minutes <n>]
-#              [--resume [--retry '#N']]
+#              [--resume [--retry '#N']] [--allow-main | --create-integration]
 #
-# Run it from a clean checkout of the integration branch (never main/master),
-# in sync with origin. State lives under tmp/deliver/<run-id>/: state.json
+# Run it from a clean checkout of the integration branch, in sync with origin.
+# main/master is refused unless --allow-main (docs/adr/0013-*.md): per-issue
+# PRs then target that branch directly and no final PR is opened; the flag is
+# recorded in state.json, so --resume on main does not refuse again.
+# --create-integration (#62) makes the integration branch first: from a clean
+# checkout it derives integration/<map-slug> from the Map's title, runs
+# `git switch -c integration/<map-slug> origin/<default>` and pushes it with
+# `git push -u`, then delivers into it (final PR targets the default branch).
+# It refuses when that branch already exists locally or on origin, and cannot
+# be combined with --resume or --allow-main. State lives under tmp/deliver/<run-id>/: state.json
 # (resume truth), events.jsonl, status.json, run-<run-id>.jsonl (this
 # runner's own model calls, loop.sh's schema, so /usage-report reads it) and
 # a lock file holding this process's pid, removed on exit. A STOP file at
@@ -112,6 +128,8 @@ MAX_TURNS=200          # per model call in every loop.sh run (#96): loop.sh's
 BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
+ALLOW_MAIN=0           # --allow-main: deliver straight into main/master (ADR-0013)
+CREATE_INTEGRATION=0   # --create-integration: cut integration/<map-slug> off origin/<default>
 RETRY_ISSUE=""         # set by --retry '#N'; only meaningful with --resume
 
 log()     { echo "deliver: $*" >&2; }
@@ -138,8 +156,10 @@ while [[ $# -gt 0 ]]; do
     --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
     --resume)               RESUME=1; shift ;;
+    --allow-main)           ALLOW_MAIN=1; shift ;;
+    --create-integration)   CREATE_INTEGRATION=1; shift ;;
     --retry)                RETRY_ISSUE="${2#\#}"; shift 2 ;;
-    -h|--help)              sed -n '2,82p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)              sed -n '2,90p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -155,6 +175,8 @@ done
 [[ -z "$MAX_MINUTES" || "$MAX_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "--max-minutes takes a whole number of minutes"
 [[ -z "$RETRY_ISSUE" || "$RETRY_ISSUE" =~ ^[0-9]+$ ]] || die "--retry takes an issue number ('#N' or N)"
 [[ -z "$RETRY_ISSUE" || "$RESUME" -eq 1 ]] || die "--retry only makes sense with --resume"
+[[ "$CREATE_INTEGRATION" -eq 0 || "$RESUME" -eq 0 ]] || die "--create-integration starts a new run; it cannot be combined with --resume"
+[[ "$CREATE_INTEGRATION" -eq 0 || "$ALLOW_MAIN" -eq 0 ]] || die "--create-integration and --allow-main contradict each other (one delivers into a new integration branch, the other into main)"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
@@ -220,6 +242,7 @@ if [[ "$RESUME" -eq 1 ]]; then
     rm -f "$RESUME_LOCK"
   fi
   RESUME_BASE="$(jq -r '.base' "$RESUME_STATE_JSON")"
+  [[ "$(jq -r '.allow_main // false' "$RESUME_STATE_JSON")" == "true" ]] && ALLOW_MAIN=1
   RESUME_CUR_BRANCH="$(git branch --show-current 2>/dev/null || true)"
   if [[ "$RESUME_CUR_BRANCH" != "$RESUME_BASE" ]]; then
     [[ -z "$(git status --porcelain 2>/dev/null)" ]] \
@@ -229,10 +252,30 @@ if [[ "$RESUME" -eq 1 ]]; then
   fi
 fi
 
+# --create-integration (#62): cut and push the integration branch, then carry
+# on as if the user had checked it out. Skipped in the private-copy re-exec,
+# which starts on the branch this created.
+if [[ "$CREATE_INTEGRATION" -eq 1 && "${DELIVER_SNAPSHOT:-0}" != "1" ]]; then
+  [[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "working tree is dirty. Commit or stash first."
+  MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
+  CI_MAP_JSON="$(forge_issue_json "$MAP")" || die "--create-integration: cannot read map #$MAP"
+  CI_SLUG="$(map_integration_slug "$(jq -r '.title // ""' <<<"$CI_MAP_JSON")")"
+  [[ -n "$CI_SLUG" ]] || die "--create-integration: cannot derive a branch name from map #$MAP's title"
+  CI_BRANCH="integration/$CI_SLUG"
+  CI_DEFAULT="$(forge_default_branch)" || die "--create-integration: cannot read the default branch"
+  git fetch -q origin || die "git fetch origin failed"
+  git rev-parse --verify -q "refs/heads/$CI_BRANCH" >/dev/null && die "--create-integration: '$CI_BRANCH' already exists locally"
+  git rev-parse --verify -q "refs/remotes/origin/$CI_BRANCH" >/dev/null && die "--create-integration: '$CI_BRANCH' already exists on origin"
+  git rev-parse --verify -q "origin/$CI_DEFAULT" >/dev/null || die "--create-integration: 'origin/$CI_DEFAULT' not found"
+  forge_create_integration "$CI_BRANCH" "$CI_DEFAULT" || die "--create-integration: could not create and push '$CI_BRANCH'"
+  log "created and pushed $CI_BRANCH from origin/$CI_DEFAULT"
+fi
+
 BASE="$(git branch --show-current 2>/dev/null || true)"
 case "$BASE" in
   "")          die "detached HEAD — check out the integration branch first." ;;
-  main|master) die "refusing to merge into '$BASE'. Check out an integration branch (ADR-0007)." ;;
+  main|master) [[ "$ALLOW_MAIN" -eq 1 ]] \
+                 || die "refusing to merge into '$BASE'. Check out an integration branch (ADR-0007), or pass --allow-main to deliver straight into it (ADR-0013)." ;;
 esac
 [[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "working tree is dirty. Commit or stash first."
 git check-ignore -q tmp/deliver/.probe 2>/dev/null \
@@ -316,6 +359,7 @@ if [[ "$RESUME" -eq 1 && -f "$RUN_DIR/state.json" ]]; then
   state_event "$RUN_DIR" "" resumed "plugin version $RESUME_OLD_VERSION -> $RUNNER_VERSION"
 else
   state_init "$RUN_DIR" "$MAP" "$BASE" "$RUN_ID" "$RUNNER_VERSION"
+  [[ "$ALLOW_MAIN" -eq 1 ]] && state_set_allow_main "$RUN_DIR"
 fi
 
 # active_seconds_now — this run's persisted active time plus this process's
@@ -1440,6 +1484,71 @@ park_issue() {
   run_status running
 }
 
+# final_pr — the integration → default PR (#62): created, or its body rewritten
+# when an open one for this head already exists (a --resume, a second run).
+# Closes every issue delivered so far (this run's merges plus Delivery lines
+# already ticked on the Map) and the Map itself only once every line is
+# ticked; parked, skipped, closed-externally and follow-up issues are listed,
+# never closed. Needs PLAN_* loaded from the fresh Map (finish does that).
+# Nothing to close, or $BASE being the default branch: no PR. A forge failure
+# here is logged, not fatal — the issues are already merged.
+final_pr() {
+  local i id title default pr verb body="$RUN_DIR/final-pr-body.md" f fn ft ticked_n=0
+  local -a closes=() parked_l=() skipped_l=() closed_l=()
+  default="$(forge_default_branch 2>/dev/null)" || default=""
+  if [[ -z "$default" ]]; then log "final PR: cannot read the default branch — not opened."; return 0; fi
+  if [[ "$BASE" == "$default" ]]; then log "final PR: '$BASE' is the default branch — none to open."; return 0; fi
+  for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
+    id="${PLAN_IDS[$i]}"
+    title="$(map_line_title "${PLAN_ROW_RAW[$i]}")"
+    if [[ "${PLAN_ROW_TICKED[$i]}" == "1" || " ${MERGED[*]:-} " == *" ${id#\#} "* ]]; then
+      closes+=("$id"); ticked_n=$(( ticked_n + 1 ))
+    elif [[ " ${PARKED[*]:-} " == *" $id "* ]]; then parked_l+=("$id $title")
+    elif [[ " ${CLOSED[*]:-} " == *" $id "* ]]; then closed_l+=("$id $title")
+    else skipped_l+=("$id $title")
+    fi
+  done
+  if [[ "$ticked_n" -eq 0 ]]; then log "final PR: nothing delivered — none opened."; return 0; fi
+  {
+    echo "Delivers map #$MAP: \`$BASE\` → \`$default\`, built by \`/deliver\` run \`$RUN_ID\`."
+    echo
+    for id in "${closes[@]}"; do echo "Closes $id"; done
+    [[ "$ticked_n" -eq "${#PLAN_IDS[@]}" ]] && echo "Closes #$MAP"
+    echo
+    echo "**Merge this PR with a merge commit, not a squash** — each delivered issue is already one commit on \`$BASE\`, and a squash would fold them into one."
+    if [[ ${#parked_l[@]} -gt 0 ]]; then
+      echo; echo "## Parked (needs a human)"
+      for id in "${parked_l[@]}"; do echo "- $id"; done
+    fi
+    if [[ ${#skipped_l[@]} -gt 0 ]]; then
+      echo; echo "## Skipped (blocked by a parked issue)"
+      for id in "${skipped_l[@]}"; do echo "- $id"; done
+    fi
+    if [[ ${#closed_l[@]} -gt 0 ]]; then
+      echo; echo "## Closed externally"
+      for id in "${closed_l[@]}"; do echo "- $id"; done
+    fi
+    if compgen -G "$RUN_DIR/issues/*/follow-ups.pr.list" >/dev/null; then
+      echo; echo "## Follow-up issues (out of scope, needs-triage)"
+      for f in "$RUN_DIR"/issues/*/follow-ups.pr.list; do
+        while IFS=$'\t' read -r fn ft; do [[ -n "$fn" ]] && echo "- #$fn — $ft"; done < "$f"
+      done
+    fi
+  } > "$body"
+  title="deliver: map #$MAP into $default"
+  if pr="$(forge_pr_for_branch "$BASE")" && [[ "$(forge_pr_state "$pr")" == "OPEN" ]]; then
+    forge_pr_set_body "$pr" "$body" || { log "final PR: could not update PR #$pr (continuing)"; return 0; }
+    verb=updated
+  else
+    pr="$(forge_pr_create "$default" "$BASE" "$title" "$body")" \
+      || { log "final PR: could not open $BASE → $default (continuing)"; return 0; }
+    verb=created
+  fi
+  state_set_final_pr "$RUN_DIR" "$pr" "$default" "$BASE"
+  state_event "$RUN_DIR" "" final-pr "$verb #$pr ($BASE -> $default)"
+  log "final PR #$pr $verb: $BASE → $default — merge it with a merge commit."
+}
+
 # finish — report what this run did and exit 0 (everything merged) or 2.
 finish() {
   local i skipped=()
@@ -1450,6 +1559,7 @@ finish() {
     [[ " ${CLOSED[*]:-} " == *" ${PLAN_IDS[$i]} "* ]] && continue
     skipped+=("${PLAN_IDS[$i]}")
   done
+  final_pr
   log "map #$MAP: ${#MERGED[@]} merged this run${PARKED[*]:+, parked: ${PARKED[*]}}${CLOSED[*]:+, closed-externally: ${CLOSED[*]}}${skipped[*]:+, skipped (blocked by a parked issue): ${skipped[*]}}."
   CUR_ISSUE=""
   state_set_active_seconds "$RUN_DIR" "$(active_seconds_now)"

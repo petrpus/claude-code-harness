@@ -22,7 +22,22 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 > independent review (#59), parking (#58), final-verify's base-moved
 > handling and merge retry, the CI wait with its fix round (#60), bounded
 > review fix rounds with follow-up issues (#63), and run state / resume /
-> stop / global caps (#61). Not yet: the tmux launcher.
+> stop / global caps (#61), and the final integration → default PR (#62,
+> below). Not yet: the tmux launcher.
+
+## The final PR
+
+When a run ends (done or partial) the runner opens the PR from the
+integration branch into the repo's default branch — or, if an open one
+already exists for that branch (a `--resume`, a second run), rewrites its
+body. The body has one `Closes #N` per delivered issue (this run's merges plus
+Delivery lines already ticked), `Closes #<map>` only when every Delivery line
+is ticked, separate lists of parked, skipped (blocked by a parked issue),
+closed-externally and follow-up issues, and a request to **merge with a merge
+commit, not a squash**, so the per-issue commits survive. The human merges it.
+No final PR when nothing was delivered or the base is itself the default
+branch. It is recorded as `final_pr` in `state.json`, in `events.jsonl` and in
+the log; the body is kept at `tmp/deliver/<run-id>/final-pr-body.md`.
 
 ## When an issue does not make it
 
@@ -54,12 +69,19 @@ issue's fault: it ends the run with exit 1, where it is.
 
 ## How to run (terminal)
 
-1. Be on a clean **integration branch** (never `main`/`master`), in sync with
-   `origin`, with `tmp/` gitignored.
+1. Be on a clean **integration branch** (`main`/`master` is refused unless you
+   pass `--allow-main` — per-issue PRs then merge straight into it and no final
+   PR is opened, ADR-0013; the flag is kept in `state.json` for `--resume`), in
+   sync with `origin`, with `tmp/` gitignored. No integration branch yet? Run
+   from a clean checkout with `--create-integration`: the runner derives
+   `integration/<map-slug>` from the Map's title, does `git switch -c` off
+   `origin/<default>` and `git push -u`, then delivers into it (the final PR
+   targets the default branch). It refuses if that branch already exists
+   locally or on origin, and cannot be combined with `--resume` or `--allow-main`.
 2. Run the runner from the **installed plugin copy**:
 
    ```bash
-   <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
+   <plugin>/skills/deliver/deliver.sh --map <N> [--allow-main | --create-integration] [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
      [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \

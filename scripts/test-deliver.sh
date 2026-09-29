@@ -130,6 +130,11 @@ map_title_is_conventional "feat(deliver): tracer bullet" && map_title_is_convent
   && [[ "$(map_pr_title '' 'Write the Guide' 'documentation')" == "docs: write the Guide" ]] \
   && ok "PR title: Map title if conventional, else <type from labels>: <title>" \
   || note "PR title derivation is wrong"
+[[ "$(map_integration_slug 'Map: Deliver -- the /deliver skill!')" == "map-deliver-the-deliver-skill" ]] \
+  && [[ "$(map_integration_slug '  ***  ')" == "" ]] \
+  && [[ "$(map_integration_slug 'A very long map title that keeps going and going forever')" == "a-very-long-map-title-that-keeps-going-a" ]] \
+  && ok "map_integration_slug: lowercase, dashes, trimmed, bounded" \
+  || note "integration slug: '$(map_integration_slug 'Map: Deliver -- the /deliver skill!')'"
 [[ "$(map_branch_name 12 'feat(deliver): Park failing issues, skip dependents!')" == "feat/12-park-failing-issues-skip-dependents" ]] \
   && [[ "$(map_branch_name 3 'fix: ???')" == "fix/3-issue" ]] \
   && ok "branch name: <type>/<N>-<slug>" \
@@ -464,6 +469,10 @@ fi
 cmd="${1:-} ${2:-}"; shift 2 2>/dev/null || true
 case "$cmd" in
   "auth status") [[ -n "${FAKE_GH_UNAUTH:-}" ]] && exit 1; exit 0 ;;
+  "repo view")
+    # forge_default_branch (#62): the fake repo's default branch is main.
+    if jqexpr="$(arg --jq "$@")"; then echo '{"defaultBranchRef":{"name":"main"}}' | jq -r "$jqexpr"
+    else echo '{"defaultBranchRef":{"name":"main"}}'; fi ;;
   "issue view")
     f="$S/issues/$1.json"; [[ -f "$f" ]] || { echo "no issue $1" >&2; exit 1; }
     cat "$f" ;;
@@ -846,6 +855,13 @@ job_happy() {
   run_deliver happy STUB_REVIEW_LOG="$WORK/happy/review.log"
   echo $? > "$WORK/happy/rc"
 }
+job_finalresume() {
+  new_fixture finalresume
+  run_deliver finalresume
+  echo $? > "$WORK/finalresume/rc1"
+  run_deliver finalresume -- --resume
+  echo $? > "$WORK/finalresume/rc"
+}
 job_extra() {
   new_fixture extra
   run_deliver extra STUB_BUILD_LOG="$WORK/extra/build.log" STUB_REVIEW_LOG="$WORK/extra/review.log" -- --extra-allowed-tools 'Bash(jq:*),Bash(bash scripts/x.sh)'
@@ -894,6 +910,47 @@ job_onmain() {
   git -C "$WORK/onmain/repo" switch -q main
   run_deliver onmain
   echo $? > "$WORK/onmain/rc"
+}
+job_allowmain() {
+  new_fixture allowmain
+  git -C "$WORK/allowmain/repo" switch -q main
+  run_deliver allowmain -- --allow-main
+  echo $? > "$WORK/allowmain/rc"
+}
+job_createint() {
+  new_fixture createint
+  git -C "$WORK/createint/repo" switch -q main
+  run_deliver createint -- --create-integration
+  echo $? > "$WORK/createint/rc"
+}
+job_createintexists() {
+  new_fixture createintexists
+  git -C "$WORK/createintexists/repo" switch -q main
+  git -C "$WORK/createintexists/repo" branch integration/map-test
+  run_deliver createintexists -- --create-integration
+  echo $? > "$WORK/createintexists/rc"
+}
+job_createintremote() {
+  new_fixture createintremote
+  git -C "$WORK/createintremote/repo" switch -q main
+  git -C "$WORK/createintremote/repo" push -q origin main:integration/map-test
+  run_deliver createintremote -- --create-integration
+  echo $? > "$WORK/createintremote/rc"
+}
+job_createintdirty() {
+  new_fixture createintdirty
+  git -C "$WORK/createintdirty/repo" switch -q main
+  echo junk > "$WORK/createintdirty/repo/untracked.txt"
+  run_deliver createintdirty -- --create-integration
+  echo $? > "$WORK/createintdirty/rc"
+}
+job_createintcombo() {
+  new_fixture createintcombo
+  git -C "$WORK/createintcombo/repo" switch -q main
+  run_deliver createintcombo -- --create-integration --allow-main
+  echo $? > "$WORK/createintcombo/rc"
+  run_deliver createintcombo -- --create-integration --resume
+  echo $? > "$WORK/createintcombo/rc2"
 }
 job_dirty() {
   new_fixture dirty
@@ -1240,6 +1297,7 @@ job_ci_timeout() {
 }
 
 bg job_happy
+bg job_finalresume
 bg job_extra
 for i in "${!EXTRABAD_VALUES[@]}"; do bg job_extrabad "$i" "${EXTRABAD_VALUES[$i]}"; done
 bg job_nocreds
@@ -1249,6 +1307,12 @@ bg job_pace
 bg job_paceall
 bg job_pacebad
 bg job_onmain
+bg job_allowmain
+bg job_createint
+bg job_createintexists
+bg job_createintremote
+bg job_createintdirty
+bg job_createintcombo
 bg job_dirty
 bg job_nomap
 bg job_behind
@@ -1360,6 +1424,31 @@ PHASES=",$(cat "$RUNDIR"issues/1/run-*.jsonl 2>/dev/null | jq -r '.phase' | sort
 [[ "$PHASES" == *",plan,"* && "$PHASES" == *",build,"* ]] \
   && ok "happy path: issue #1's own run log shows loop.sh actually ran a plan and a build phase" \
   || note "happy path: issue #1's run log phases were: $PHASES"
+
+# --- the final integration -> default PR (#62) --------------------------------
+FP="$H/gh/prs/6.json"
+[[ "$(jq -r .baseRefName "$FP" 2>/dev/null)" == "main" && "$(jq -r .headRefName "$FP" 2>/dev/null)" == "integration/x" ]] \
+  && ok "final PR: opened integration/x -> main after the last issue merged" \
+  || note "final PR: PR #6 base/head are $(jq -r '.baseRefName + "/" + .headRefName' "$FP" 2>/dev/null)"
+FPB="$(jq -r .body "$FP" 2>/dev/null)"
+grep -qx 'Closes #1' <<<"$FPB" && grep -qx 'Closes #2' <<<"$FPB" && grep -qx 'Closes #3' <<<"$FPB" \
+  && grep -qi 'merge commit, not a squash' <<<"$FPB" && ! grep -q '^## ' <<<"$FPB" \
+  && ok "final PR: body closes both issues and the Map (every line ticked), recommends a merge commit, lists nothing else" \
+  || note "final PR: body is: $(tr '\n' '|' <<<"$FPB")"
+FRD="$(ls -d "$H"/repo/tmp/deliver/*/ | head -1)"
+[[ "$(jq -r '.final_pr.number' "${FRD}state.json")" == "6" && "$(jq -r '.final_pr.base' "${FRD}state.json")" == "main" ]] \
+  && grep -q '"event":"final-pr"' "${FRD}events.jsonl" && grep -q 'final PR #6 created' "$H/err" && [[ -s "${FRD}final-pr-body.md" ]] \
+  && ok "final PR: recorded in state.json, events.jsonl, the log and final-pr-body.md" \
+  || note "final PR: state=$(jq -c .final_pr "${FRD}state.json")"
+
+# --resume of a finished run edits the existing final PR, never opens a second
+FR="$WORK/finalresume"
+[[ "$(cat "$FR/rc1")" -eq 0 && "$(cat "$FR/rc")" -eq 0 ]] \
+  && [[ "$(grep -c '^pr create.*--base main' "$FR/gh/calls")" -eq 1 && "$(grep -c '^pr edit 6 ' "$FR/gh/calls")" -eq 1 ]] \
+  && jq -r .body "$FR/gh/prs/6.json" | grep -qx 'Closes #3' && [[ ! -f "$FR/gh/prs/7.json" ]] \
+  && grep -q 'final PR #6 updated' "$FR/err" \
+  && ok "final PR: a --resume re-run updates PR #6 (one create, one edit)" \
+  || note "final PR resume: rc=$(cat "$FR/rc1")/$(cat "$FR/rc") creates=$(grep -c '^pr create.*--base main' "$FR/gh/calls") edits=$(grep -c '^pr edit 6 ' "$FR/gh/calls") — $(tail -2 "$FR/err" | tr '\n' '|')"
 
 # --- the review step on the happy path (#59) ---------------------------------
 for pr in 4 5; do
@@ -1522,8 +1611,51 @@ RC="$(cat "$WORK/pacebad/rc")"
 # --- refusals ------------------------------------------------------------------
 RC="$(cat "$WORK/onmain/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "refusing to merge into 'main'" "$WORK/onmain/err" && [[ ! -s "$WORK/onmain/gh/calls" ]] \
-  && ok "refuses main (exit 1) before any forge call" \
+  && grep -q -- "--allow-main" "$WORK/onmain/err" \
+  && ok "refuses main (exit 1) before any forge call, naming --allow-main" \
   || note "on main: exit $RC, gh calls: $(tr '\n' '|' < "$WORK/onmain/gh/calls" 2>/dev/null)"
+
+# --allow-main (ADR-0013): both issues merge straight into main, no final PR.
+AM="$WORK/allowmain"
+[[ "$(cat "$AM/rc")" -eq 0 ]] \
+  && [[ "$(jq -r .baseRefName "$AM/gh/prs/4.json")" == "main" && "$(jq -r .baseRefName "$AM/gh/prs/5.json")" == "main" ]] \
+  && [[ "$(jq -r .state "$AM/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$AM/gh/prs/5.json")" == "MERGED" ]] \
+  && [[ "$(grep -c '^pr create' "$AM/gh/calls")" -eq 2 ]] \
+  && ! grep -q '^pr create.*--head main' "$AM/gh/calls" \
+  && [[ ! -e "$AM/gh/prs/6.json" ]] \
+  && ok "--allow-main: both PRs target and merge into main; no PR has head main; no final PR" \
+  || note "--allow-main: rc=$(cat "$AM/rc") creates: $(grep '^pr create' "$AM/gh/calls" | tr '\n' '|') err: $(tail -3 "$AM/err" | tr '\n' '|')"
+jq -e '.allow_main == true and .base == "main" and (.final_pr // null) == null' "$AM"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--allow-main: recorded in state.json (a --resume on main will not re-refuse)" \
+  || note "--allow-main: state.json is $(cat "$AM"/repo/tmp/deliver/*/state.json | tr '\n' ' ')"
+
+# --create-integration (#62): branch cut off origin/main, pushed with -u, run
+# delivers into it, the final PR targets main.
+CI="$WORK/createint"
+[[ "$(cat "$CI/rc")" -eq 0 ]] \
+  && grep -qx 'switch -q -c integration/map-test origin/main' "$CI/git.calls" \
+  && grep -qx 'push -q -u origin integration/map-test' "$CI/git.calls" \
+  && [[ "$(jq -r .baseRefName "$CI/gh/prs/4.json")" == "integration/map-test" \
+     && "$(jq -r .baseRefName "$CI/gh/prs/5.json")" == "integration/map-test" ]] \
+  && [[ "$(jq -r '.baseRefName + ">" + .headRefName' "$CI/gh/prs/6.json")" == "main>integration/map-test" ]] \
+  && jq -e '.base == "integration/map-test"' "$CI"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--create-integration: switch -c off origin/main + push -u, per-issue PRs target the new branch, final PR targets main" \
+  || note "--create-integration: rc=$(cat "$CI/rc") git: $(grep -E '^(switch|push)' "$CI/git.calls" | tr '\n' '|') err: $(tail -3 "$CI/err" | tr '\n' '|')"
+for c in createintexists createintremote createintdirty; do
+  RC="$(cat "$WORK/$c/rc")"
+  [[ "$RC" -eq 1 ]] && ! grep -qs '^pr create' "$WORK/$c/gh/calls" && ! grep -q '^switch -q -c' "$WORK/$c/git.calls" \
+    && case "$c" in
+         createintexists) grep -q "already exists locally" "$WORK/$c/err" ;;
+         createintremote) grep -q "already exists on origin" "$WORK/$c/err" ;;
+         *) grep -q "working tree is dirty" "$WORK/$c/err" ;;
+       esac \
+    && ok "--create-integration refuses ($c): exit 1, no branch created, no PR" \
+    || note "--create-integration $c: exit $RC err: $(tail -1 "$WORK/$c/err")"
+done
+[[ "$(cat "$WORK/createintcombo/rc")" -eq 1 && "$(cat "$WORK/createintcombo/rc2")" -eq 1 ]] \
+  && ! grep -q '^switch -q -c' "$WORK/createintcombo/git.calls" 2>/dev/null \
+  && ok "--create-integration refuses --allow-main and --resume" \
+  || note "--create-integration combos: rc=$(cat "$WORK/createintcombo/rc") rc2=$(cat "$WORK/createintcombo/rc2")"
 
 RC="$(cat "$WORK/dirty/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "working tree is dirty" "$WORK/dirty/err" && [[ ! -s "$WORK/dirty/gh/calls" ]] \
@@ -1577,6 +1709,13 @@ MAPB="$(jq -r .body "$P/gh/issues/3.json")"
   && [[ "$(git -C "$P/remote.git" log --format=%s main..integration/x)" == "feat: independent thing (#5)" ]] \
   && ok "park: #2 (after #1) is skipped, independent #4 is still delivered — one commit on integration/x" \
   || note "park: map=$(printf '%s' "$MAPB" | grep '#' | tr '\n' '|') log=$(git -C "$P/remote.git" log --format=%s main..integration/x | tr '\n' '|')"
+PFB="$(jq -r .body "$P/gh/prs/6.json" 2>/dev/null)"
+[[ "$(jq -r '.baseRefName + ">" + .headRefName' "$P/gh/prs/6.json" 2>/dev/null)" == "main>integration/x" ]] \
+  && grep -qx 'Closes #4' <<<"$PFB" && ! grep -q 'Closes #[123]$' <<<"$PFB" \
+  && sed -n '/^## Parked/,/^## /p' <<<"$PFB" | grep -q '#1 ' \
+  && sed -n '/^## Skipped/,/^## /p' <<<"$PFB" | grep -q '#2 ' \
+  && ok "park: the final PR closes only #4 (no Closes of the Map), listing #1 as parked and #2 as skipped" \
+  || note "park: final PR body: $(tr '\n' '|' <<<"$PFB")"
 grep -q 'parked: #1' "$P/err" && grep -q 'skipped (blocked by a parked issue): #2' "$P/err" \
   && ok "park: the run's summary names what was parked and what was skipped" \
   || note "park: summary line missing: $(tail -1 "$P/err")"
@@ -1932,7 +2071,7 @@ KR="$WORK/killresume"
   && ok "kill+resume: both issues' PRs end up merged" \
   || note "kill+resume: PR states #4=$(jq -r .state "$KR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$KR/gh/prs/5.json" 2>/dev/null)"
 [[ "$(jq -r '.comments | length' "$KR/gh/prs/4.json" 2>/dev/null)" -eq 1 ]] \
-  && [[ "$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)" -eq 2 ]] \
+  && [[ "$(grep -c '^pr create.*--head \(feat\|fix\)/' "$KR/gh/calls" 2>/dev/null)" -eq 2 ]] \
   && ok "kill+resume: the issue resumed at pr-open gets exactly one PR and one review comment, not two" \
   || note "kill+resume: PR #4 comments=$(jq -r '.comments|length' "$KR/gh/prs/4.json" 2>/dev/null), pr-create calls=$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)"
 

@@ -51,6 +51,22 @@ forge_issue_create() {
   printf '%s\n' "${url##*/}"
 }
 
+# forge_default_branch  — the repo's default branch name (#62: the final PR's
+# base, and what the runner refuses to merge into).
+forge_default_branch() {
+  local b
+  b="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')" || return 1
+  [[ -n "$b" ]] || return 1
+  printf '%s\n' "$b"
+}
+
+# forge_create_integration <branch> <default>  — --create-integration (#62):
+# cut <branch> off origin/<default>, switch to it and push it with upstream.
+# Never forced; the caller has already checked the branch does not exist.
+forge_create_integration() {
+  git switch -q -c "$1" "origin/$2" && git push -q -u origin "$1"
+}
+
 # forge_pr_set_body <pr> <file>  — rewrite a PR's body (a fix round's updated
 # plan, #63). Never touches the title.
 forge_pr_set_body() { gh pr edit "$1" --body-file "$2" >/dev/null; }
