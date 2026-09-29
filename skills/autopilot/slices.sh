@@ -13,16 +13,19 @@
 #
 # Schema (docs/adr/0005-*.md decision 6 / PRD § S4):
 #   {"plan_sig": "<cksum of the ordered slice ids>",
-#    "slices": {"<id>": {"fails": <n>, "escalated": <bool>, "parked": <bool>}}}
+#    "slices": {"<id>": {"fails": <n>, "escalated": <bool>, "parked": <bool>,
+#                        "last_turn_limit": <bool>}}}
 # `plan_sig` is informational only — a human-readable signal that the file
 # was last reconciled against a particular id sequence. Reconciliation itself
 # never trusts it: every read walks the CURRENT plan's ids directly and
 # drops/zero-inits from that, so a human editing the plan mid-run can't desync
 # the state even on a read where plan_sig happens to be stale.
 #
-# Escalation (`escalated`) is written and read here but not yet acted on —
-# S4B wires `--escalate-model` against it. S4A's own ladder only drives
-# `fails` (rung 1 "retry") and `parked` (rung 3, at fails>=3).
+# `last_turn_limit` is true when the slice's most recent failure was a BUILD
+# turn limit (cleared by any later non-turn-limit failure; a record without
+# the field reads as false). loop.sh's rung 2 uses it to skip the model
+# escalation — a too-large item won't be fixed by a stronger model. `fails`
+# drives rung 1 "retry", `parked` rung 3 (at fails>=3).
 
 # slices_plan_sig <id...>
 #   cksum over the ids in the order given (plan file order). Never consulted
@@ -69,7 +72,7 @@ slices_reconcile() {
     (.slices // {}) as $old
     | { plan_sig: $sig,
         slices: (reduce ($ids[]) as $id
-                   ({}; . + { ($id): ($old[$id] // {fails:0, escalated:false, parked:false}) })) }
+                   ({}; . + { ($id): ($old[$id] // {fails:0, escalated:false, parked:false, last_turn_limit:false}) })) }
   ' 2>/dev/null || echo '{"plan_sig":"","slices":{}}'
 }
 
@@ -96,21 +99,28 @@ slices_get_fails() {
   printf '%s' "$1" | jq -r --arg id "$2" '(.slices[$id].fails // 0)' 2>/dev/null || echo 0
 }
 
-# slices_record_fail <json> <id> -> echoes json with that id's fails +1
+# slices_record_fail <json> <id> [turn_limit] -> echoes json with that id's
+#   fails +1 and last_turn_limit set to turn_limit (true/false, default false).
 #   (rung 1: every failure, whatever its gate fingerprint, counts toward the
 #   SAME slice's ladder — a slice flailing across three different gates is
 #   exactly as stuck as one failing the same gate three times, ADR-0005).
 slices_record_fail() {
-  printf '%s' "$1" | jq -c --arg id "$2" '
-    .slices[$id] //= {fails:0, escalated:false, parked:false}
+  printf '%s' "$1" | jq -c --arg id "$2" --arg tl "${3:-false}" '
+    .slices[$id] //= {fails:0, escalated:false, parked:false, last_turn_limit:false}
     | .slices[$id].fails += 1
+    | .slices[$id].last_turn_limit = ($tl == "true")
   ' 2>/dev/null || printf '%s' "$1"
+}
+
+# slices_get_last_turn_limit <json> <id> -> true/false; false if absent or corrupt.
+slices_get_last_turn_limit() {
+  printf '%s' "$1" | jq -r --arg id "$2" '(.slices[$id].last_turn_limit // false) | tostring' 2>/dev/null || echo false
 }
 
 # slices_park <json> <id> -> echoes json with that id's parked=true (rung 3).
 slices_park() {
   printf '%s' "$1" | jq -c --arg id "$2" '
-    .slices[$id] //= {fails:0, escalated:false, parked:false}
+    .slices[$id] //= {fails:0, escalated:false, parked:false, last_turn_limit:false}
     | .slices[$id].parked = true
   ' 2>/dev/null || printf '%s' "$1"
 }

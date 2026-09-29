@@ -112,7 +112,7 @@ blamed on the slice), and (e) holdout — Given/When/Then scenarios from an
 optional `HOLDOUT.md` (outside the worktree, never read by BUILD) inlined into
 the verifier prompt only. A slice that keeps failing climbs a five-rung stuck
 ladder tracked per-slice in `slices.json`: retry → escalate (`--escalate-model`,
-rung 2) → park (rung 3, a sibling runs instead) → one replan once everything
+rung 2; skipped when the last failure was a turn limit) → park (rung 3, a sibling runs instead) → one replan once everything
 unblocked is parked (rung 4, unparks everything) → abort on the next failure
 (rung 5). See `skills/autopilot/LOOP-PROTOCOL.md` and `docs/model-policy.md`.
 

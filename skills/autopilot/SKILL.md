@@ -138,7 +138,8 @@ from a generic semantic-verify failure (`verify_agent`), so stuck detection can
 tell them apart. Stuck detection is the five-rung ladder (S4A/S4B, `slices.sh`,
 `docs/adr/0005-*.md`): a slice retries on its 1st failure, runs its next BUILD
 on `--escalate-model` after its 2nd (back to `--build-model` once it ticks;
-`--escalate-model none` skips straight to another retry), is parked on its
+not when that failure was a turn limit — a stronger model hits the same
+`--max-turns` cap; `--escalate-model none` skips straight to another retry), is parked on its
 3rd (a sibling runs instead), and once every remaining slice is parked or
 blocked a single replan unparks everything — a second failure after that
 replan aborts. A plan with no real slice ids falls back to the pre-S4A rule

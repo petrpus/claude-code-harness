@@ -210,7 +210,8 @@ runner-owned — written and read only by `loop.sh`, never named in any prompt:
 
 ```json
 {"plan_sig": "<cksum of the ordered unticked slice ids>",
- "slices": {"S2": {"fails": 3, "escalated": false, "parked": true}}}
+ "slices": {"S2": {"fails": 3, "escalated": false, "parked": true,
+                    "last_turn_limit": false}}}
 ```
 
 Every iteration reconciles this against the CURRENT plan before selecting: an
@@ -259,6 +260,17 @@ instead of `--build-model`; the very next BUILD call for a *different* slice,
 or for this same slice once it ticks and `slices_retire()` drops its record,
 is back on `--build-model` — there is no separate "de-escalate" step, only
 the absence of a `fails >= 2` record to escalate against.
+
+**Except after a turn limit (#101).** When the slice's most recent failure
+was a BUILD that ran out of `--max-turns` (`last_turn_limit` in
+`slices.json`, set by that iteration's `turn_limit`), rung 2 stays on
+`--build-model`: the item is too large for one call, not too hard for the
+model, and a stronger model hits the same cap. The runner logs a
+`{"phase":"escalation","model":"-","verdict":"skipped-turn-limit"}` row and appends a
+FEEDBACK note telling BUILD to continue the checkpointed work; the rest of
+the ladder is unchanged, so a third failure still parks the slice and the
+park/replan rungs split it. Any later failure that is not a turn limit clears
+the flag, and escalation applies again as usual.
 
 Escalation is **never applied to the verifier** — `--verify-model` is
 untouched regardless of what BUILD ran on; the cheap adversarial tier is the

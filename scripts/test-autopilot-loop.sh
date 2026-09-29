@@ -118,6 +118,8 @@ case "$prompt" in
     # #96: a BUILD that runs out of --max-turns — claude -p exits 1 with an
     # error_max_turns reply, having done part of the work and ticked nothing.
     if [[ -n "${STUB_BUILD_MAX_TURNS:-}" ]]; then
+      # What this BUILD would read as FEEDBACK (it reads the file itself).
+      [[ -n "${STUB_FEEDBACK_LOG:-}" ]] && { echo "=== build"; cat "$(dirname "$plan")/FEEDBACK.md" 2>/dev/null; } >> "$STUB_FEEDBACK_LOG"
       mkdir -p src && echo "half done" >> src/partial.txt
       printf '{"type":"result","subtype":"error_max_turns","num_turns":81,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
       exit 1
@@ -1672,6 +1674,29 @@ ITER39="$(cat "$R39"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rcs '[.[] | sel
 [[ "$ITER39" == "true verify_cmd" ]] && grep -q 'BUILD also ran out of turns' "$R39/tmp/autopilot/FEEDBACK.md" \
   && ok "a turn-limited BUILD whose work fails verify keeps gate_failed=verify_cmd, turn_limit:true, and FEEDBACK names the turn limit" \
   || note "turn limit + red verify: iteration='$ITER39', FEEDBACK='$(head -c 300 "$R39/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 38b. A slice that keeps hitting the turn limit is not escalated (#101) ----
+# Same shape as test 20, but every BUILD ends on error_max_turns: rung 2 must
+# stay on --build-model (a stronger model hits the same cap), say why in the
+# run log and FEEDBACK, and leave the rest of the ladder (park) as it was.
+R38B="$WORK/r38b"; new_repo "$R38B"
+cat > "$R38B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] A — too large for one call (after: —)
+
+STATUS: in-progress
+EOF
+( cd "$R38B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_BUILD_MAX_TURNS=1 \
+    STUB_CALL_LOG="$WORK/r38b.calls" STUB_FEEDBACK_LOG="$WORK/r38b.feedback" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 3 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r38b.out" 2>"$WORK/r38b.err" )
+MODELS38B="$(cat "$R38B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="build") | .model' 2>/dev/null | tr '\n' ',')"
+SKIP38B="$(cat "$R38B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="escalation") | .verdict' 2>/dev/null | head -1)"
+[[ "$MODELS38B" == "sonnet,sonnet,sonnet," && "$SKIP38B" == "skipped-turn-limit" ]] \
+  && ! grep -q -- '--model opus' "$WORK/r38b.calls" \
+  && grep -q 'not escalating to opus' "$WORK/r38b.err" \
+  && awk '/^=== build/{n++} n==3' "$WORK/r38b.feedback" | grep -q 'Not escalated to opus' \
+  && ok "a slice whose last failure was a turn limit stays on --build-model (no opus call), and the skip is logged" \
+  || note "turn-limit escalation: models='$MODELS38B', escalation row='$SKIP38B', opus calls=$(grep -c -- '--model opus' "$WORK/r38b.calls" 2>/dev/null)"
 
 # --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and

@@ -697,6 +697,27 @@ if [[ -f skills/autopilot/slices.sh ]]; then
     && ok "slices_record_fail increments that id's counter (2 calls -> 2)" \
     || note "expected A to be at fails=2 after two record_fail calls, got '$FAILS_A'"
 
+  # -- last_turn_limit: set by a turn-limit failure, cleared by a later one --
+  [[ "$(slices_get_last_turn_limit "$STATE" A)" == "false" ]] \
+    && ok "last_turn_limit defaults to false (record_fail without the flag)" \
+    || note "expected last_turn_limit=false after plain record_fail"
+  STATE="$(slices_record_fail "$STATE" A true)"
+  [[ "$(slices_get_last_turn_limit "$STATE" A)" == "true" && "$(slices_get_fails "$STATE" A)" == "3" ]] \
+    && ok "slices_record_fail <id> true sets last_turn_limit and still counts the fail" \
+    || note "turn-limit record_fail: last_turn_limit='$(slices_get_last_turn_limit "$STATE" A)' fails='$(slices_get_fails "$STATE" A)'"
+  STATE="$(slices_record_fail "$STATE" A false)"
+  [[ "$(slices_get_last_turn_limit "$STATE" A)" == "false" ]] \
+    && ok "a later non-turn-limit failure clears last_turn_limit" \
+    || note "last_turn_limit should be cleared by a non-turn-limit failure"
+  OLD_SHAPE='{"plan_sig":"","slices":{"Z":{"fails":1,"escalated":false,"parked":false}}}'
+  [[ "$(slices_get_last_turn_limit "$OLD_SHAPE" Z)" == "false" \
+    && "$(slices_get_last_turn_limit "$OLD_SHAPE" nope)" == "false" \
+    && "$(slices_get_last_turn_limit 'not json' Z)" == "false" ]] \
+    && ok "an old-shape/absent/corrupt record reads last_turn_limit as false" \
+    || note "getter should read false for old-shape, unknown id and corrupt json"
+  STATE="$(slices_record_fail "$STATE" A false)"
+  STATE="$(printf '%s' "$STATE" | jq -c '.slices.A.fails = 2')"
+
   slices_write "$SLICES_TEST_FILE" "$STATE"
   STATE="$(slices_reconcile "$SLICES_TEST_FILE" A B)"
   FAILS_A="$(slices_get_fails "$STATE" A)"

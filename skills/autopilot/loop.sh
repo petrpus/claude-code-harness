@@ -991,8 +991,19 @@ while :; do
   if [[ -n "$SELECTED_ID" && "$ESCALATE_MODEL" != "none" ]]; then
     SLICE_FAILS_NOW="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
     if [[ "$SLICE_FAILS_NOW" -ge 2 ]]; then
-      BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
-      ESCALATED_THIS_ITER=true
+      if [[ "$(slices_get_last_turn_limit "$SLICES_STATE" "$SELECTED_ID")" == "true" ]]; then
+        # #101: the slice last failed on --max-turns — it is too large for
+        # one call, not too hard for the model. A stronger model hits the
+        # same cap and only costs more; the retry continues the checkpointed
+        # work instead, and the ladder's park/replan splits the item.
+        log_err "slice $SELECTED_ID: last failure was a turn limit — not escalating to $ESCALATE_MODEL."
+        # model "-": no call ran, so no model spent anything on this row.
+        logline "escalation" "-" 0 0 0 0 0 "skipped-turn-limit"
+        append_feedback "turn-limit" "Not escalated to $ESCALATE_MODEL: this item's last attempt ran out of turns (--max-turns $MAX_TURNS), which a stronger model would hit too. Continue the partial work already committed; keep this attempt small enough to finish."
+      else
+        BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
+        ESCALATED_THIS_ITER=true
+      fi
     fi
   fi
 
@@ -1289,14 +1300,15 @@ while :; do
   fi
 
   if [[ -n "$SELECTED_ID" ]]; then
-    # S4A: the per-slice ladder. Rung 1 (fails once) and what would be rung 2
-    # (fails twice — escalation lands in S4B; until then it is just another
-    # retry) both fall through to "try the same slice again next iteration,"
-    # which needs no code here. Rung 3 parks the slice once its OWN failure
+    # S4A: the per-slice ladder. Rung 1 (fails once) and rung 2 (fails twice)
+    # both fall through to "try the same slice again next iteration," which
+    # needs no code here — rung 2's model escalation (S4B, skipped after a
+    # turn limit, #101) is decided before BUILD, above. The turn-limit flag
+    # recorded here is what that decision reads. Rung 3 parks the slice once its OWN failure
     # count reaches 3, regardless of which gate fingerprint each of the three
     # failures carried — a slice flailing across three different gates is
     # exactly as stuck as one failing the same gate three times.
-    SLICES_STATE="$(slices_record_fail "$SLICES_STATE" "$SELECTED_ID")"
+    SLICES_STATE="$(slices_record_fail "$SLICES_STATE" "$SELECTED_ID" "$BUILD_TURN_LIMIT")"
     SLICE_FAILS="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
     if [[ "$SLICE_FAILS" -ge 3 ]]; then
       log_err "slice '$SELECTED_ID' failed ${SLICE_FAILS}× — parking it; the runner tries a sibling next."
