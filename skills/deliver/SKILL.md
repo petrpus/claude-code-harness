@@ -20,8 +20,9 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
 > independent review (#59), parking (#58), final-verify's base-moved
-> handling and merge retry, and the CI wait with its one fix round (#60).
-> Not yet: resume, the tmux launcher.
+> handling and merge retry, the CI wait with its fix round (#60), and bounded
+> review fix rounds with follow-up issues (#63). Not yet: resume, the tmux
+> launcher.
 
 ## When an issue does not make it
 
@@ -111,6 +112,60 @@ once, then holds the PR (fail closed). The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
 
+## Review fix rounds (`--max-fix-rounds`, default 2)
+
+A `changes_requested` verdict does not park the issue outright. Every
+in-scope `blocker` / `issue` finding of that round becomes a fresh plan item
+(`- [ ] R<k>.<j> — <severity> <file>:<line>: <note>`) appended to the issue's
+`IMPLEMENTATION_PLAN.md`, its `STATUS:` line is reopened to `in-progress`, and
+`loop.sh` runs again on the **same** `--state-dir` — so BUILD sees the same
+charter, memory and feedback, and only fixes what the review named. Each
+round is a fresh autopilot run with its own `--issue-max-*` caps; how many
+rounds an issue may spend is what `--max-fix-rounds` bounds.
+Out-of-scope findings and suggestions never become plan items — a suggestion
+never appears anywhere but the review's own PR comment.
+
+Once that round's autopilot run reports done, the same gates as the first run
+apply: an autopilot exit 1 or a dirty tree stops the whole run, anything
+short of `done` (or a run with no new commit) parks the issue, the full
+verify runs again on the new head, and the branch is pushed **fast-forward
+only** — never forced; a rejected (non-fast-forward) push stops the run. The
+PR body is rewritten from the current plan (`forge_pr_set_body`, `gh pr edit
+--body-file`), and the new head is reviewed again as round `k+1`, with round
+`k`'s findings inlined into the prompt so the reviewer can judge what was
+fixed — the round's PR comment lists the ids it marks `resolved`.
+
+Each fix round spends one round from the issue's `--max-fix-rounds` budget,
+the same counter a red CI draws from (below). A review still requesting
+changes once the budget is gone parks the issue, with a reason naming the
+review count and the PR; `--max-fix-rounds 0` parks on the first
+`changes_requested`. Decision record: `docs/adr/0011-*.md`.
+
+## Out-of-scope findings become follow-up issues
+
+Every out-of-scope `blocker` / `issue` finding (suggestions are never
+followed up — they only ever appear in the review's PR comment) becomes a
+`needs-triage` issue instead of a plan item, in every round, whether that
+round approves or requests changes:
+
+- a **finding hash** (sha256 of its normalized `file`, `line` and `severity` — not the note, which a fresh reviewer words differently every round)
+  is its identity across rounds, autopilot re-runs and separate `/deliver`
+  invocations. `forge_issue_search` looks for an open or closed issue already
+  carrying `<!-- deliver:finding <hash> -->`; only when there is none does
+  `gh issue create --label needs-triage` open a new one (label created if the
+  repo lacks it), titled from the finding's `issue_title` (else a conventional
+  fallback) and linking the Map, the PR and the `file:line`;
+- the follow-up (found or freshly created) is appended under the Map's
+  `## Follow-ups` section (`map_add_follow_up`, `docs/adr/0008-*.md` decision
+  7) — created if the Map has none yet, and only once per issue number, with
+  the same re-read/write/read-back retry as ticking a Delivery line;
+- it is also listed in the PR body's `## Follow-ups` section
+  (`forge_pr_set_body`), kept in sync after every round that finds one.
+
+A follow-up is **recorded, never executed** by the run that found it: it
+never touches `## Delivery`, gets no branch and no autopilot run — adding it
+to a Map's Delivery section is a human decision made after triage.
+
 ## The CI wait
 
 Once the review approves, `ci_wait` polls `gh pr checks` (`forge_pr_checks`)
@@ -122,8 +177,8 @@ every `--ci-poll-seconds` (default 30) before the PR may merge:
 - **all reported checks pass** (nothing left `pending`): merges, logged with
   verdict `pass`;
 - **any reported check fails**: spends one round from the issue's shared
-  `--max-fix-rounds` budget (default 2, shared with #63's review fix
-  rounds). The fix round fetches the failed run's log tail
+  `--max-fix-rounds` budget (default 2, shared with the review fix
+  rounds above). The fix round fetches the failed run's log tail
   (`forge_ci_failed_log`, `gh run view <id> --log-failed`), appends a
   `- [ ] C<round> Fix red CI: <check>` plan item with the log fenced as data,
   reopens `STATUS: in-progress` and resumes autopilot (`loop.sh

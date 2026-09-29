@@ -138,3 +138,49 @@ map_tick() {
 map_is_ticked() {
   _map_delivery_lines "$1" | grep -qE "^[[:space:]]*[-*][[:space:]]+\\[[xX]\\][[:space:]]+#$2([[:space:]]|\$)"
 }
+
+# _map_follow_up_lines <body_file>  — every line of '## Follow-ups' (heading
+# excluded), CR stripped. Absent when the Map has no such section yet.
+_map_follow_up_lines() {
+  tr -d '\r' < "$1" | awk '
+    /^##[[:space:]]+Follow-ups[[:space:]]*$/ { inside=1; next }
+    /^##[[:space:]]/                          { inside=0 }
+    inside { print }'
+}
+
+# map_follow_up_has <body_file> <number>  — 0 when #<number> is already
+# listed under '## Follow-ups' (any checkbox state).
+map_follow_up_has() {
+  _map_follow_up_lines "$1" | grep -qE "^[[:space:]]*[-*][[:space:]]+\\[[ xX]\\][[:space:]]+#$2([[:space:]]|\$)"
+}
+
+# map_add_follow_up <body_file> <number> <line>
+#   Prints the body with <line> appended under '## Follow-ups' — creating the
+#   section (right after '## Delivery', or at the body's end when Delivery
+#   runs to EOF) when the Map has none yet — unless #<number> is already
+#   listed there, in which case the body is echoed unchanged: a follow-up
+#   found again in a later review round or a re-run against the same forge
+#   state is recorded once (#63). <line> is the full checklist line, e.g.
+#   "- [ ] #75 found reviewing #62 (PR #72): <title>".
+map_add_follow_up() {
+  local body="$1" n="$2" line="$3"
+  if map_follow_up_has "$body" "$n"; then
+    cat "$body"
+    return 0
+  fi
+  if grep -qE '^##[[:space:]]+Follow-ups[[:space:]]*$' <(tr -d '\r' < "$body"); then
+    awk -v line="$line" '
+      { raw=$0; l=$0; sub(/\r$/, "", l) }
+      l ~ /^##[[:space:]]+Follow-ups[[:space:]]*$/ && !done { print raw; print line; done=1; next }
+      { print raw }
+    ' "$body"
+  else
+    awk -v line="$line" '
+      { raw=$0; l=$0; sub(/\r$/, "", l) }
+      in_delivery && l ~ /^##[[:space:]]/ && !inserted { print "## Follow-ups"; print line; print ""; inserted=1 }
+      { print raw; last=l }
+      l ~ /^##[[:space:]]+Delivery[[:space:]]*$/ { in_delivery=1 }
+      END { if (!inserted) { if (NR > 0 && last !~ /^[[:space:]]*$/) print ""; print "## Follow-ups"; print line } }
+    ' "$body"
+  fi
+}

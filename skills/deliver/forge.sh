@@ -32,6 +32,29 @@ forge_issue_body() {
 forge_issue_set_body() { gh issue edit "$1" --body-file "$2" >/dev/null; }   # <number> <file>
 forge_issue_comment()  { gh issue comment "$1" --body-file "$2" >/dev/null; } # <number> <file>
 
+# forge_issue_search <query>  — the number of the first open or closed issue
+# whose title/body/comments match <query> (a finding-hash marker, #63), or
+# nothing when there is none. Both states: a follow-up already triaged and
+# closed must still dedupe against a recurring finding.
+forge_issue_search() {
+  gh issue list --search "$1" --state all --json number --jq '.[0].number // empty'
+}
+
+# forge_issue_create <title> <body_file> <label>  — a needs-triage follow-up
+# issue (#63); echoes its number. The label must already exist
+# (forge_label_ensure).
+forge_issue_create() {
+  local url
+  url="$(gh issue create --title "$1" --body-file "$2" --label "$3")" || return 1
+  url="$(printf '%s\n' "$url" | grep -oE '/issues/[0-9]+' | tail -1)"
+  [[ -n "$url" ]] || return 1
+  printf '%s\n' "${url##*/}"
+}
+
+# forge_pr_set_body <pr> <file>  — rewrite a PR's body (a fix round's updated
+# plan, #63). Never touches the title.
+forge_pr_set_body() { gh pr edit "$1" --body-file "$2" >/dev/null; }
+
 # forge_push_branch <branch>  — first push of a branch the runner created.
 # Never forced: a rejected push means someone else wrote the branch, and
 # that is a reason to stop, not to overwrite.
