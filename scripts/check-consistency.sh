@@ -293,6 +293,55 @@ for l in map prd ready-for-agent needs-human needs-triage; do
   grep -qF -- "\`$l\`" "$HD" && ok "harness-doctor names label $l" || note "harness-doctor does not name label $l"
 done
 
+# ---------------------------------------------------------------------------
+section "architecture docs describe the two-level model"
+AR="docs/architecture.md"
+for pat in 'agent.sh' 'ADR-0007' '/deliver'; do
+  grep -qF -- "$pat" "$AR" && ok "architecture.md mentions $pat" || note "architecture.md does not mention $pat"
+done
+# The Stop gate is not wired into loop.sh — SKILL.md must offer it as a manual
+# option, not describe the runner registering/removing the hook.
+if grep -qE 'autopilot MAY register|MUST remove that' skills/autopilot/SKILL.md; then
+  note "autopilot SKILL.md still presents the Stop gate as implemented"
+else
+  ok "autopilot SKILL.md no longer presents the Stop gate as implemented"
+fi
+grep -qi 'manual' <(sed -n '/Stop gate/,$p' skills/autopilot/SKILL.md) \
+  && ok "autopilot SKILL.md Stop gate paragraph is a manual option" \
+  || note "autopilot SKILL.md Stop gate paragraph does not say it is manual"
+
+# ---------------------------------------------------------------------------
+section "own-skill inventories list every non-vendored skill"
+SYNC="docs/pocock-sync-log.md"
+README_OWN="$(grep -E '^\| \*\*Skills \(own' README.md || true)"
+CLAUDE_OWN="$(awk '/^3\. \*\*Own\*\*/{b=1} b&&/Plus agents/{exit} b{print}' CLAUDE.md)"
+DOCTOR_OWN="$(awk '/^- Own:/{b=1} b&&/^$/{exit} b{print}' skills/harness-doctor/SKILL.md)"
+for d in skills/*/; do
+  n="$(basename "$d")"
+  grep -qE "^\| ${n} \|" "$SYNC" && continue   # vendored (Pocock or Vercel table)
+  for pair in "README:$README_OWN" "CLAUDE.md:$CLAUDE_OWN" "harness-doctor:$DOCTOR_OWN"; do
+    name="${pair%%:*}"; text="${pair#*:}"
+    grep -qF -- "\`$n\`" <<<"$text" && ok "$name lists own skill $n" || note "$name own-skill list omits $n"
+  done
+done
+grep -qF 'integration/<slug>' CLAUDE.md && ok "CLAUDE.md branch model covers integration branches" \
+  || note "CLAUDE.md branch model does not cover integration/<slug> branches"
+
+# ---------------------------------------------------------------------------
+section "user guide pages: version + Deliver path + no external assets"
+PV="$(jq -r .version .claude-plugin/plugin.json)"
+for f in docs/guide.html docs/index.html; do
+  grep -qF -- "v$PV" "$f" && ok "$f shows v$PV" || note "$f does not show plugin.json version v$PV"
+  if grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$f" | grep -vqxF "v$PV"; then note "$f mentions a stale version string"; fi
+  if grep -qE '<(script|img|iframe|link)[^>]*(src|href)=|rel="stylesheet"' "$f"; then
+    note "$f loads an external asset"
+  else
+    ok "$f loads no external assets"
+  fi
+done
+grep -qF 'id="deliver"' docs/guide.html && grep -qF '/deliver' docs/guide.html \
+  && ok "guide.html has a Deliver a map path" || note "guide.html lacks a Deliver a map path (id=\"deliver\")"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"

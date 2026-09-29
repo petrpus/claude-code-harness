@@ -29,7 +29,8 @@ Check `.claude/skills/` for any of these (each shadows the plugin version):
   `to-prd`, `triage`, `write-a-skill`, `zoom-out`, `find-skills`
 - Own: `next`, `commit-agent`, `implement-issue`, `start-feature`,
   `migration-check`, `worklog`, `harness-init`, `harness-doctor`, `autopilot`,
-  `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`, `code-map`
+  `deliver`, `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`,
+  `repo-map`, `code-map`
 
 Each match → 🟠. Suggest `rm -rf .claude/skills/<name>/`.
 
