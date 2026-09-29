@@ -1606,7 +1606,10 @@ GATE35="$(cat "$R35"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(
 # --- 35b. secret_scan() ignores removed lines too (#94) -------------------
 R35B="$WORK/r35b"; new_repo "$R35B"
 printf -- '- [ ] slice 1\n\nSTATUS: in-progress\n' > "$R35B/tmp/autopilot/IMPLEMENTATION_PLAN.md"
-printf 'unrelated line\ntoken = "AKIAABCDEFGHIJKLMNOP"\nunrelated line\n' > "$R35B/config.txt"
+# The fixture key is assembled at runtime so this test file's own added lines
+# don't trip the very secret scan it exercises.
+FAKE35B="AKIA""ABCDEFGHIJKLMNOP"
+printf 'unrelated line\ntoken = "%s"\nunrelated line\n' "$FAKE35B" > "$R35B/config.txt"
 git -C "$R35B" add config.txt >/dev/null 2>&1
 git -C "$R35B" -c user.email=t@t.est -c user.name=test commit -q -m "add config.txt fixture"
 ( cd "$R35B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=removed \
