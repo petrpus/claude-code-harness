@@ -464,6 +464,10 @@ fi
 cmd="${1:-} ${2:-}"; shift 2 2>/dev/null || true
 case "$cmd" in
   "auth status") [[ -n "${FAKE_GH_UNAUTH:-}" ]] && exit 1; exit 0 ;;
+  "repo view")
+    # forge_default_branch (#62): the fake repo's default branch is main.
+    if jqexpr="$(arg --jq "$@")"; then echo '{"defaultBranchRef":{"name":"main"}}' | jq -r "$jqexpr"
+    else echo '{"defaultBranchRef":{"name":"main"}}'; fi ;;
   "issue view")
     f="$S/issues/$1.json"; [[ -f "$f" ]] || { echo "no issue $1" >&2; exit 1; }
     cat "$f" ;;
@@ -845,6 +849,13 @@ job_happy() {
   git -C "$WORK/happy/remote.git" rev-parse main > "$WORK/happy/main_before"
   run_deliver happy STUB_REVIEW_LOG="$WORK/happy/review.log"
   echo $? > "$WORK/happy/rc"
+}
+job_finalresume() {
+  new_fixture finalresume
+  run_deliver finalresume
+  echo $? > "$WORK/finalresume/rc1"
+  run_deliver finalresume -- --resume
+  echo $? > "$WORK/finalresume/rc"
 }
 job_extra() {
   new_fixture extra
@@ -1240,6 +1251,7 @@ job_ci_timeout() {
 }
 
 bg job_happy
+bg job_finalresume
 bg job_extra
 for i in "${!EXTRABAD_VALUES[@]}"; do bg job_extrabad "$i" "${EXTRABAD_VALUES[$i]}"; done
 bg job_nocreds
@@ -1360,6 +1372,31 @@ PHASES=",$(cat "$RUNDIR"issues/1/run-*.jsonl 2>/dev/null | jq -r '.phase' | sort
 [[ "$PHASES" == *",plan,"* && "$PHASES" == *",build,"* ]] \
   && ok "happy path: issue #1's own run log shows loop.sh actually ran a plan and a build phase" \
   || note "happy path: issue #1's run log phases were: $PHASES"
+
+# --- the final integration -> default PR (#62) --------------------------------
+FP="$H/gh/prs/6.json"
+[[ "$(jq -r .baseRefName "$FP" 2>/dev/null)" == "main" && "$(jq -r .headRefName "$FP" 2>/dev/null)" == "integration/x" ]] \
+  && ok "final PR: opened integration/x -> main after the last issue merged" \
+  || note "final PR: PR #6 base/head are $(jq -r '.baseRefName + "/" + .headRefName' "$FP" 2>/dev/null)"
+FPB="$(jq -r .body "$FP" 2>/dev/null)"
+grep -qx 'Closes #1' <<<"$FPB" && grep -qx 'Closes #2' <<<"$FPB" && grep -qx 'Closes #3' <<<"$FPB" \
+  && grep -qi 'merge commit, not a squash' <<<"$FPB" && ! grep -q '^## ' <<<"$FPB" \
+  && ok "final PR: body closes both issues and the Map (every line ticked), recommends a merge commit, lists nothing else" \
+  || note "final PR: body is: $(tr '\n' '|' <<<"$FPB")"
+FRD="$(ls -d "$H"/repo/tmp/deliver/*/ | head -1)"
+[[ "$(jq -r '.final_pr.number' "${FRD}state.json")" == "6" && "$(jq -r '.final_pr.base' "${FRD}state.json")" == "main" ]] \
+  && grep -q '"event":"final-pr"' "${FRD}events.jsonl" && grep -q 'final PR #6 created' "$H/err" && [[ -s "${FRD}final-pr-body.md" ]] \
+  && ok "final PR: recorded in state.json, events.jsonl, the log and final-pr-body.md" \
+  || note "final PR: state=$(jq -c .final_pr "${FRD}state.json")"
+
+# --resume of a finished run edits the existing final PR, never opens a second
+FR="$WORK/finalresume"
+[[ "$(cat "$FR/rc1")" -eq 0 && "$(cat "$FR/rc")" -eq 0 ]] \
+  && [[ "$(grep -c '^pr create.*--base main' "$FR/gh/calls")" -eq 1 && "$(grep -c '^pr edit 6 ' "$FR/gh/calls")" -eq 1 ]] \
+  && jq -r .body "$FR/gh/prs/6.json" | grep -qx 'Closes #3' && [[ ! -f "$FR/gh/prs/7.json" ]] \
+  && grep -q 'final PR #6 updated' "$FR/err" \
+  && ok "final PR: a --resume re-run updates PR #6 (one create, one edit)" \
+  || note "final PR resume: rc=$(cat "$FR/rc1")/$(cat "$FR/rc") creates=$(grep -c '^pr create.*--base main' "$FR/gh/calls") edits=$(grep -c '^pr edit 6 ' "$FR/gh/calls") — $(tail -2 "$FR/err" | tr '\n' '|')"
 
 # --- the review step on the happy path (#59) ---------------------------------
 for pr in 4 5; do
@@ -1577,6 +1614,13 @@ MAPB="$(jq -r .body "$P/gh/issues/3.json")"
   && [[ "$(git -C "$P/remote.git" log --format=%s main..integration/x)" == "feat: independent thing (#5)" ]] \
   && ok "park: #2 (after #1) is skipped, independent #4 is still delivered — one commit on integration/x" \
   || note "park: map=$(printf '%s' "$MAPB" | grep '#' | tr '\n' '|') log=$(git -C "$P/remote.git" log --format=%s main..integration/x | tr '\n' '|')"
+PFB="$(jq -r .body "$P/gh/prs/6.json" 2>/dev/null)"
+[[ "$(jq -r '.baseRefName + ">" + .headRefName' "$P/gh/prs/6.json" 2>/dev/null)" == "main>integration/x" ]] \
+  && grep -qx 'Closes #4' <<<"$PFB" && ! grep -q 'Closes #[123]$' <<<"$PFB" \
+  && sed -n '/^## Parked/,/^## /p' <<<"$PFB" | grep -q '#1 ' \
+  && sed -n '/^## Skipped/,/^## /p' <<<"$PFB" | grep -q '#2 ' \
+  && ok "park: the final PR closes only #4 (no Closes of the Map), listing #1 as parked and #2 as skipped" \
+  || note "park: final PR body: $(tr '\n' '|' <<<"$PFB")"
 grep -q 'parked: #1' "$P/err" && grep -q 'skipped (blocked by a parked issue): #2' "$P/err" \
   && ok "park: the run's summary names what was parked and what was skipped" \
   || note "park: summary line missing: $(tail -1 "$P/err")"
@@ -1932,7 +1976,7 @@ KR="$WORK/killresume"
   && ok "kill+resume: both issues' PRs end up merged" \
   || note "kill+resume: PR states #4=$(jq -r .state "$KR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$KR/gh/prs/5.json" 2>/dev/null)"
 [[ "$(jq -r '.comments | length' "$KR/gh/prs/4.json" 2>/dev/null)" -eq 1 ]] \
-  && [[ "$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)" -eq 2 ]] \
+  && [[ "$(grep -c '^pr create.*--head \(feat\|fix\)/' "$KR/gh/calls" 2>/dev/null)" -eq 2 ]] \
   && ok "kill+resume: the issue resumed at pr-open gets exactly one PR and one review comment, not two" \
   || note "kill+resume: PR #4 comments=$(jq -r '.comments|length' "$KR/gh/prs/4.json" 2>/dev/null), pr-create calls=$(grep -c '^pr create' "$KR/gh/calls" 2>/dev/null)"
 

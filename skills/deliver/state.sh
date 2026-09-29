@@ -39,6 +39,14 @@ state_set_active_seconds() {
     > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
 }
 
+# state_set_final_pr <run_dir> <pr> <base> <head>  — the integration → default
+# PR (#62), recorded at the top level; rewritten when a later run updates it.
+state_set_final_pr() {
+  jq --argjson pr "$2" --arg base "$3" --arg head "$4" \
+     '.final_pr = {number:$pr, base:$base, head:$head}' "$1/state.json" \
+     > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
+}
+
 # state_event <run_dir> <issue_number_or_empty> <event> [reason]  — appended,
 # never rewritten; a run's events.jsonl is its own transition log.
 state_event() {
