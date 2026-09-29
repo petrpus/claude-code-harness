@@ -7,7 +7,7 @@ All notable changes to claude-code-harness. Semver via git tags.
 `/deliver`: a Map issue in, one merged PR per issue out, into an integration
 branch, with one final PR into `main` left for a human. Autopilot gets the
 seams and fixes that make it safe to run unattended. PRD
-`docs/prd/0003-deliver.md`, ADR-0007/0008 and ADR-0009…0012.
+`docs/prd/0003-deliver.md`, ADR-0007/0008 and ADR-0009…0013.
 
 ### Added
 
@@ -54,11 +54,11 @@ seams and fixes that make it safe to run unattended. PRD
 - Docs: architecture, user guide (`docs/guide.html`) and glossary for
   `/deliver`. (#66, #104)
 - `/deliver --review-max-turns <n>` (default 80): the independent review's
-  own turn cap, separate from `--max-turns` (#102).
+  own turn cap, separate from `--max-turns` (#102, #108).
 - `/deliver` names a turn-limited review reply `turn-limit` in the run log and
   retry message, and the park reason says the reviewer ran out of turns
   instead of "no usable verdict twice" (#102).
-- Map format and label alignment across the workflow skills (#64).
+- Map format and label alignment across the workflow skills (#64, #100).
   `skills/deliver/MAP-FORMAT.md` documents the Map issue per ADR-0008;
   `to-issues` publishes a Map, `to-prd` labels the PRD `prd`, `start-feature`
   uses `prd` / `ready-for-agent` with a Blocked-by DAG and ends with
@@ -69,7 +69,7 @@ seams and fixes that make it safe to run unattended. PRD
   `needs-human` and `needs-triage` labels. `check-consistency.sh` asserts it all.
   `CLAUDE.md` lists triage's dangling `/setup-matt-pocock-skills` reference as a
   known upstream mismatch.
-- `/deliver`: run state, resume, stop and global caps (#61). Every run writes
+- `/deliver`: run state, resume, stop and global caps (#61, #92). Every run writes
   `tmp/deliver/<run-id>/state.json` (atomic; the resume truth — map, base,
   runner version, active time, per-issue state/branch/PR/round/head),
   `events.jsonl` (one row per issue-state transition), `status.json` (the
@@ -130,9 +130,10 @@ seams and fixes that make it safe to run unattended. PRD
 - A long conventional Map title keeps its own type instead of getting a
   second one. The description is cut at a word boundary to fit 72 bytes.
   (#111, #112)
-- `/deliver` no longer counts a review's cost twice (CI log rows).
+- `/deliver` no longer counts a review's cost twice (CI log rows). (#92)
 - `/deliver --allow-main`: each issue PR says `Closes #N` (there is no final
   PR to close them), so delivered issues no longer stay open (ADR-0013).
+  (#113)
 - e2e fixtures skip the 120 s "no CI" grace: `test-deliver.sh` takes about
   1 minute again (#74, #91).
 

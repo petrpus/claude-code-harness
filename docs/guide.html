@@ -534,7 +534,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
         <h3>Watch the event stream</h3>
         <p>Progress is appended to <code>tmp/deliver/&lt;run-id&gt;/events.jsonl</code>; the session surfaces each phase as it happens.</p>
         <ul class="steps">
-          <li><code>deliver.sh --map 12 --status</code> — the run's headline (<code>--json</code> for a script)</li>
+          <li><code>deliver.sh --map 12 --status</code> — the run's headline, as one JSON line</li>
           <li><code>deliver.sh --map 12 --stop</code> — graceful stop at the next phase boundary (exit&nbsp;6, resumable)</li>
           <li><code>tmux kill-session -t deliver-12</code> — hard stop</li>
         </ul>

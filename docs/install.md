@@ -36,7 +36,7 @@ ensure `jq` is on `PATH` (`/harness-doctor` flags it if missing).
 (`gh auth status`), `jq`, bash ≥ 4.2, `tmp/` in `.gitignore`, and the five
 labels `map`, `prd`, `ready-for-agent`, `needs-human`, `needs-triage`
 (`/harness-init` creates them). `tmux` is optional; it runs the launcher
-detached. `/harness-doctor` checks all of it. See `skills/deliver/SKILL.md`.
+detached. `/harness-doctor` checks tmux, the labels and the `tmp/` ignore. See `skills/deliver/SKILL.md`.
 
 ## Updating
 
