@@ -6,6 +6,17 @@ All notable changes to claude-code-harness. Semver via git tags.
 
 ### Added
 
+- Map format and label alignment across the workflow skills (#64).
+  `skills/deliver/MAP-FORMAT.md` documents the Map issue per ADR-0008;
+  `to-issues` publishes a Map, `to-prd` labels the PRD `prd`, `start-feature`
+  uses `prd` / `ready-for-agent` with a Blocked-by DAG and ends with
+  `/deliver #<map>`, `next` points to `/deliver`. `/implement-issue` follows the
+  same contract (`ready-for-agent`, `--base`, commit before review, reviewer
+  `--base` / `--head`, `gh pr create --base`, out-of-scope findings → `needs-triage`
+  issues). `harness-init` bootstraps the `map`, `prd`, `ready-for-agent`,
+  `needs-human` and `needs-triage` labels. `check-consistency.sh` asserts it all.
+  `CLAUDE.md` lists triage's dangling `/setup-matt-pocock-skills` reference as a
+  known upstream mismatch.
 - `/deliver`: run state, resume, stop and global caps (#61). Every run writes
   `tmp/deliver/<run-id>/state.json` (atomic; the resume truth — map, base,
   runner version, active time, per-issue state/branch/PR/round/head),

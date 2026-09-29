@@ -250,6 +250,19 @@ grep -q 'setup-matt-pocock-skills' CLAUDE.md && grep -qi 'known upstream mismatc
   && ok "CLAUDE.md lists triage's /setup-matt-pocock-skills known upstream mismatch" \
   || note "CLAUDE.md lacks the triage /setup-matt-pocock-skills known-mismatch note"
 
+# ---------------------------------------------------------------------------
+section "harness-init bootstraps the workflow labels"
+HI="skills/harness-init/SKILL.md"
+for l in map prd ready-for-agent needs-human needs-triage; do
+  grep -qE -- "gh label create $l( |\$)" "$HI" \
+    && ok "harness-init creates label $l" || note "harness-init does not create label $l"
+done
+grep -q -- '--force' "$HI" && ok "harness-init label creation is idempotent (--force)" \
+  || note "harness-init label creation is not idempotent (--force)"
+grep -qiE 'without .?gh|no .?gh|skip.*label' "$HI" \
+  && ok "harness-init degrades gracefully without gh/remote" \
+  || note "harness-init label step lacks a graceful-degradation note"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
