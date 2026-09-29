@@ -263,6 +263,36 @@ grep -qiE 'without .?gh|no .?gh|skip.*label' "$HI" \
   && ok "harness-init degrades gracefully without gh/remote" \
   || note "harness-init label step lacks a graceful-degradation note"
 
+# ---------------------------------------------------------------------------
+section "deliver.sh flags <-> skills/deliver/SKILL.md"
+DS="skills/deliver/deliver.sh"; DD="skills/deliver/SKILL.md"
+# Every --flag in deliver.sh's argument case must appear in SKILL.md ...
+RUNNER_FLAGS="$(awk '/^[[:space:]]*case "\$1" in/{c=1;next} c&&/^[[:space:]]*esac/{c=0} c' "$DS" \
+  | grep -oE '^[[:space:]]*(-[a-z],?\|?)?--[a-z][a-z-]*' | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+[[ -n "$RUNNER_FLAGS" ]] && ok "deliver.sh: found $(echo "$RUNNER_FLAGS" | wc -l | tr -d ' ') argument flags" \
+  || note "deliver.sh: could not extract argument flags"
+for f in $RUNNER_FLAGS; do
+  [[ "$f" == "--help" ]] && continue
+  grep -qE -- "${f}([^a-z-]|\$)" "$DD" && ok "SKILL.md mentions $f" || note "SKILL.md does not mention deliver.sh flag $f"
+done
+# ... and a flag in a SKILL.md deliver.sh command block must be one the runner accepts.
+DOC_FLAGS="$(awk '/^[[:space:]]*```/{if(b&&blk~/deliver\.sh/)printf "%s",blk; b=!b; blk=""; next} b{blk=blk $0 "\n"}' "$DD" \
+  | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+for f in $DOC_FLAGS; do
+  echo "$RUNNER_FLAGS" | grep -qx -- "$f" && ok "SKILL.md's $f is accepted by deliver.sh" \
+    || note "SKILL.md documents $f, which deliver.sh does not accept"
+done
+
+# ---------------------------------------------------------------------------
+section "harness-doctor names the deliver readiness checks"
+HD="skills/harness-doctor/SKILL.md"
+for pat in 'command -v tmux' 'setsid nohup' 'command -v jq' 'gh auth status' 'gh label list' 'git check-ignore -q tmp/'; do
+  grep -qF -- "$pat" "$HD" && ok "harness-doctor names '$pat'" || note "harness-doctor does not name '$pat'"
+done
+for l in map prd ready-for-agent needs-human needs-triage; do
+  grep -qF -- "\`$l\`" "$HD" && ok "harness-doctor names label $l" || note "harness-doctor does not name label $l"
+done
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"

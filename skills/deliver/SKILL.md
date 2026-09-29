@@ -23,7 +23,7 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 > handling and merge retry, the CI wait with its fix round (#60), bounded
 > review fix rounds with follow-up issues (#63), and run state / resume /
 > stop / global caps (#61), and the final integration → default PR (#62,
-> below). Not yet: the tmux launcher.
+> below), and the one-command launcher (#65, next section).
 
 ## The final PR
 
@@ -66,6 +66,53 @@ ones continue. The run ends with exit **2** and a summary naming both lists.
 A failure of the machinery itself — the forge unreachable, autopilot refusing
 to start, a dirty checkout, a review that changed the checkout — is not an
 issue's fault: it ends the run with exit 1, where it is.
+
+## `/deliver #<map>` — the one command
+
+Pre-flight, one confirmation, a detached run, milestone reports. `<plugin>`
+is the installed plugin dir; `<N>` the Map number.
+
+1. **Plan.** Run `<plugin>/skills/deliver/deliver.sh --map <N> --plan-only --json`
+   (read-only: no run dir, no branch switch, no label or issue edits; pass
+   through any runner flag, e.g. `--allow-main`). It returns one JSON
+   object: `checks[]` (name/status/detail), `issues[]` (run order),
+   `skipped[]` (already ticked), `caps`, `estimate_usd`, `ok`.
+2. **Show it.** Print the ordered issues, the skipped ones, the caps, the
+   cost estimate and every check that is not `pass`. A hard failure (`ok` is
+   false, exit non-zero) is reported and the run is not launched. Warnings
+   (no `tmux`, branch protection) are shown but do not block.
+3. **Confirm once.** Ask a single yes/no to launch. `--yes` skips the
+   question (the plan is still shown). No other prompts follow.
+4. **Launch detached**, from the project root, without `--plan-only`/`--json`:
+
+   ```bash
+   tmux new-session -d -s deliver-<N> '<plugin>/skills/deliver/deliver.sh --map <N> [flags]'
+   ```
+
+   Without `tmux`, fall back to
+   `setsid nohup <plugin>/skills/deliver/deliver.sh --map <N> [flags] > tmp/deliver-<N>.out 2>&1 &`.
+   `tmux has-session -t deliver-<N>` tells whether a run is alive; tmux
+   refuses a second session of the same name. The runner bootstraps the five
+   workflow labels itself before the graph walk.
+5. **Monitor.** Find the run dir (`tmp/deliver/<run-id>/`, the newest for this
+   map) and arm Monitor on `tmp/deliver/<run-id>/events.jsonl`
+   (`tail -F … | jq -c --unbuffered`). Report each milestone as it arrives —
+   `pr-open`, `merged`, `parked`, `closed-external`, `final-pr`, `stopped`,
+   `budget_exhausted`, `time_exhausted` — one line each. Monitor ends when its
+   command ends or times out: **re-arm it** until a terminal state, i.e.
+   `status.json` reads `done`, `partial`, `stopped`, `budget_exhausted` or
+   `time_exhausted`.
+6. **`runner-dead`.** On every re-arm, and whenever events stop, check the
+   run's `lock` file: if its PID is no longer alive (`kill -0 "$(cat lock)"`)
+   or the lock is gone while `status.json` still reads `running`, report
+   `runner-dead` (the run died without a terminal state), point at
+   `deliver.sh --map <N> --resume`, and stop monitoring.
+
+Companions, same runner: `--status` prints the newest run's `status.json`
+for the map (read-only); `--stop` touches that run's `STOP` file (the run
+stops at the next phase boundary; `tmux kill-session -t deliver-<N>` is the
+hard stop); `--resume [--retry '#N']` continues the newest run — then re-arm
+Monitor as above.
 
 ## How to run (terminal)
 

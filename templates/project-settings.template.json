@@ -34,6 +34,10 @@
       "Bash(gh api *)",
       "Bash(gh repo *)",
 
+      "Bash(tmux new-session -d -s deliver-*)",
+      "Bash(tmux has-session -t deliver-*)",
+      "Bash(tmux kill-session -t deliver-*)",
+
       "Bash(docker:*)",
       "Bash(docker compose:*)",
       "Bash(prisma:*)",

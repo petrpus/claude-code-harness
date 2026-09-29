@@ -134,6 +134,30 @@ forge_label_ensure() {
   # that follows is what matters, and it reports its own failure.
   gh label create "$1" --color "$2" --description "$3" >/dev/null 2>&1 || true
 }
+# forge_gh_version — gh's first version line (--plan-only reports it).
+forge_gh_version() { gh --version 2>/dev/null | sed -n 1p; }
+
+# forge_label_list —the repo's label names, one per line (--plan-only's
+# label check; read-only).
+forge_label_list() {
+  gh label list --limit 200 --json name --jq '.[].name'
+}
+
+# forge_branch_protected <branch> — 0 when the branch has protection rules
+# (--plan-only warns: required reviews would park every merge). Read-only.
+forge_branch_protected() {
+  gh api "repos/{owner}/{repo}/branches/$1/protection" >/dev/null 2>&1
+}
+
+# forge_labels_bootstrap — the five labels /deliver relies on, created when
+# the repo lacks them (existing ones are left as they are).
+forge_labels_bootstrap() {
+  forge_label_ensure map 5319e7 "A Map issue: the delivery graph /deliver walks"
+  forge_label_ensure prd 0e8a16 "A product requirements document"
+  forge_label_ensure ready-for-agent 1d76db "Fully specified; an agent can pick it up"
+  forge_label_ensure needs-human d93f0b "Parked by /deliver: needs a human decision before an agent retries it"
+  forge_label_ensure needs-triage e4e669 "Out-of-scope review finding awaiting human triage before it joins a Map"
+}
 forge_issue_add_label()    { gh issue edit "$1" --add-label "$2" >/dev/null; }    # <number> <label>
 forge_issue_remove_label() { gh issue edit "$1" --remove-label "$2" >/dev/null; } # <number> <label>
 
