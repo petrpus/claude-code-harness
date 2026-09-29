@@ -208,6 +208,31 @@ else
   ok "no src=/<link/@import/url(http) in docs/*.html"
 fi
 
+# ---------------------------------------------------------------------------
+section "Map format + front-half alignment (ADR-0008)"
+MAPF="skills/deliver/MAP-FORMAT.md"
+[[ -f "$MAPF" ]] && ok "$MAPF exists" || note "$MAPF is missing"
+for s in to-issues start-feature; do
+  grep -q 'MAP-FORMAT\.md' "skills/$s/SKILL.md" \
+    && ok "$s references MAP-FORMAT.md" || note "skills/$s/SKILL.md does not reference MAP-FORMAT.md"
+done
+grep -q '`prd`' skills/to-prd/SKILL.md \
+  && ok "to-prd labels the PRD prd" || note "to-prd does not apply the prd label"
+grep -q 'ready-for-agent' skills/start-feature/SKILL.md && grep -q '`prd`' skills/start-feature/SKILL.md \
+  && ok "start-feature uses prd / ready-for-agent" || note "start-feature lacks prd / ready-for-agent labels"
+grep -qi 'blocked by' skills/start-feature/SKILL.md \
+  && ok "start-feature uses a Blocked-by DAG" || note "start-feature lacks Blocked-by wording"
+grep -qiE 'no "?waits on' skills/start-feature/SKILL.md \
+  && note "start-feature still says 'no waits on #X'" || ok "start-feature has no 'no waits on' wording"
+grep -qF '/deliver #<map>' skills/start-feature/SKILL.md \
+  && ok "start-feature ends with /deliver #<map>" || note "start-feature does not point to /deliver #<map>"
+grep -q '/deliver' skills/next/SKILL.md \
+  && ok "next points to /deliver" || note "next does not point to /deliver"
+grep -E '^\| to-issues \|' docs/pocock-sync-log.md | grep -q 'Map-publishing' \
+  && ok "sync-log records the to-issues Map-publishing patch" || note "sync-log to-issues row lacks the Map-publishing local patch"
+grep -E '^\| to-prd \|' docs/pocock-sync-log.md | grep -q '`prd` label' \
+  && ok "sync-log records the to-prd prd-label patch" || note "sync-log to-prd row lacks the \`prd\` label local patch"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
