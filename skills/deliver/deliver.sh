@@ -938,27 +938,39 @@ run_status running
 #   <dir>/review-<round>.json exists (only written when a verdict parsed).
 review_issue() {
   local n="$1" pr="$2" base_sha="$3" head_sha="$4" dir="$5" round="$6" prev="${7:-[]}"
-  local attempt rc out verdict comment="$dir/review-$round.comment.md"
+  local attempt rc out verdict turn_limited comment="$dir/review-$round.comment.md"
   for attempt in 1 2; do
     out="$dir/review-$round"
     review_run "$n" "$round" "$BASE" "$base_sha" "$head_sha" "$dir/PROMPT.md" "$out" "$REVIEW_MODEL" "$prev"; rc=$?
     case "$rc" in
       0) deliver_logline review "$n" "$round" "$(jq -r '.verdict' "$out.json")"; break ;;
-      2) # A failed call (timeout, crash) and an off-contract reply both leave
-         # no verdict; the run log keeps them apart.
-         if [[ "${AGENT_LAST_RC:-0}" -ne 0 ]]; then
+      2) # A turn-limited reply, a failed call (timeout, crash) and an
+         # off-contract reply all leave no verdict; the run log keeps them apart.
+         turn_limited=false
+         if [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]]; then
+           turn_limited=true
+           deliver_logline review "$n" "$round" turn-limit
+         elif [[ "${AGENT_LAST_RC:-0}" -ne 0 ]]; then
            deliver_logline review "$n" "$round" call_failed
          else
            deliver_logline review "$n" "$round" no_verdict
          fi
          if [[ "$attempt" -eq 1 ]]; then
-           log "#$n: round $round — the reviewer returned no usable verdict — retrying once."
+           if $turn_limited; then
+             log "#$n: round $round — the reviewer ran out of turns (--review-max-turns $REVIEW_MAX_TURNS) — retrying once."
+           else
+             log "#$n: round $round — the reviewer returned no usable verdict — retrying once."
+           fi
            continue
          fi
          review_comment "$n" "$round" "$head_sha" "$out.md" "" > "$comment"
          forge_pr_comment_has_marker "$pr" "$(review_marker "$n" "$round" "$head_sha")" \
            || forge_pr_comment "$pr" "$comment" || true
-         PARK_REASON="round $round's reviewer returned no usable verdict twice (PR #$pr)"
+         if $turn_limited; then
+           PARK_REASON="round $round's reviewer ran out of turns twice (cap $REVIEW_MAX_TURNS; raise --review-max-turns) (PR #$pr)"
+         else
+           PARK_REASON="round $round's reviewer returned no usable verdict twice (PR #$pr)"
+         fi
          return 10 ;;
       3) deliver_logline review "$n" "$round" breach
          die "#$n: SAFETY BREACH — the checkout changed during round $round's review of PR #$pr: $(tr '\n' ' ' < "$out.breach"). Stopping the run; nothing further is pushed or merged." ;;

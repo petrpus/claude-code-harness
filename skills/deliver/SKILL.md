@@ -187,7 +187,10 @@ a block without it (a restated format example, say) is not read. The runner
 then **recomputes** the verdict itself — `changes_requested` if and only if
 there is an in-scope blocker or issue — so a reply that lists a blocker and
 says "approve" still holds the PR. A reply with no usable verdict is retried
-once, then holds the PR (fail closed). The report is posted as a PR comment
+once, then holds the PR (fail closed). The run log tells the causes apart: a
+reviewer that ran out of turns (`--review-max-turns`) is logged `turn-limit`,
+a failed call `call_failed`, any other off-contract reply `no_verdict`; two
+turn-limited attempts park with a reason naming the turn cap. The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
 

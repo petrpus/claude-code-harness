@@ -679,6 +679,10 @@ As required, the format example is:
 $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.ts","line":42,"note":"example","in_scope":true}]' "")" ;;
       wrong-head) r="$(review_json approve '[]' 0000000000000000000000000000000000000000)" ;;
     esac
+    if [[ "$mode" == "turnlimit" ]]; then
+      printf '{"type":"result","subtype":"error_max_turns","num_turns":81,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+      exit 0
+    fi
     printf '{"result":%s,"total_cost_usd":0.02,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$(printf '%s' "$r" | jq -Rs .)"
     exit 0 ;;
   *"PLAN phase"*|*"autonomous run is stuck"*)
@@ -1045,6 +1049,7 @@ job_rvblockrounds1() {
 }
 job_rvoos()     { new_fixture rvoos;      run_deliver rvoos      STUB_REVIEW=outofscope;                                               echo $? > "$WORK/rvoos/rc"; }
 job_rvgarbage() { new_fixture rvgarbage;  run_deliver rvgarbage  STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log";      echo $? > "$WORK/rvgarbage/rc"; }
+job_rvturns()   { new_fixture rvturns;    run_deliver rvturns    STUB_REVIEW=turnlimit STUB_REVIEW_LOG="$WORK/rvturns/review.log";     echo $? > "$WORK/rvturns/rc"; }
 job_rvretry()   { new_fixture rvretry;    run_deliver rvretry    STUB_REVIEW=garbage-once STUB_REVIEW_STATE="$WORK/rvretry/review.state"; echo $? > "$WORK/rvretry/rc"; }
 job_rvmutate()  { new_fixture rvmutate;   run_deliver rvmutate   STUB_REVIEW=mutate;                                                    echo $? > "$WORK/rvmutate/rc"; }
 job_rvmutatevariant() { # <mutate-ref|mutate-tmp|mutate-hook>
@@ -1352,6 +1357,7 @@ bg job_rvblockrounds2
 bg job_rvblockrounds1
 bg job_rvoos
 bg job_rvgarbage
+bg job_rvturns
 bg job_rvretry
 bg job_rvmutate
 bg job_rvmutatevariant mutate-ref
@@ -1879,6 +1885,13 @@ RC="$(cat "$WORK/rvgarbage/rc")"
   && jq -r '.comments[0].body' "$WORK/rvgarbage/gh/prs/4.json" | grep -q 'Runner verdict: no verdict' \
   && ok "review: no usable verdict is retried once, then parks the issue (fail closed)" \
   || note "review garbage: exit $RC, calls $(grep -c . "$WORK/rvgarbage/review.log" 2>/dev/null)"
+
+RC="$(cat "$WORK/rvturns/rc")"
+[[ "$RC" -eq 2 ]] && held rvturns && [[ "$(grep -c . "$WORK/rvturns/review.log")" -eq 2 ]] \
+  && [[ "$(cat "$WORK"/rvturns/repo/tmp/deliver/*/run-*.jsonl | jq -s '[.[] | select(.phase=="review") | .verdict] | join(",")')" == '"turn-limit,turn-limit"' ]] \
+  && jq -r '.comments[-1].body' "$WORK/rvturns/gh/issues/1.json" | grep -q 'ran out of turns' \
+  && ok "review: a turn-limited reply is logged as turn-limit (not no_verdict) and the park reason names the turn limit" \
+  || note "review turn-limit: exit $RC"
 
 RC="$(cat "$WORK/rvretry/rc")"
 [[ "$RC" -eq 0 ]] && [[ "$(cat "$WORK"/rvretry/repo/tmp/deliver/*/run-*.jsonl | jq -s '[.[] | select(.phase=="review") | .verdict] | join(",")')" == '"no_verdict,approve,approve"' ]] \
