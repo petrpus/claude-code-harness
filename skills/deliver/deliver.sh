@@ -607,7 +607,7 @@ active_seconds_now() { echo $(( ACTIVE_SECONDS_BASE + ( $(date +%s) - START_EPOC
 # run_status <state> — refresh status.json with the run's current headline.
 run_status() {
   state_write_status "$RUN_DIR" "$1" "$CUR_ISSUE" "${#MERGED[@]}" "${#PARKED[@]}" \
-    "$(state_total_cost "$RUN_DIR")" "$(active_seconds_now)"
+    "$(state_total_cost "$RUN_DIR")" "$(active_seconds_now)" "$(state_cost_unknown_calls "$RUN_DIR")"
 }
 
 # stop_run <exit_code> <state_label> — a global cap or STOP tripped: persist
@@ -675,15 +675,16 @@ deliver_logline() {
   # review's cost twice — in /usage-report and in --budget-usd (#61).
   local model="$REVIEW_MODEL" dur="${AGENT_LAST_DURATION:-0}" cost="${AGENT_LAST_COST:-0}"
   local tin="${AGENT_LAST_IN_TOKENS:-0}" tout="${AGENT_LAST_OUT_TOKENS:-0}" rc="${AGENT_LAST_RC:-0}"
-  if [[ "$1" != "review" ]]; then model=""; dur=0; cost=0; tin=0; tout=0; rc=0; fi
+  local unknown="${AGENT_LAST_COST_UNKNOWN:-0}"
+  if [[ "$1" != "review" ]]; then model=""; dur=0; cost=0; tin=0; tout=0; rc=0; unknown=0; fi
   jq -cn --arg run "$RUN_ID" --arg phase "$1" --arg model "$model" \
      --argjson issue "$2" --argjson round "$3" --arg verdict "$4" \
      --argjson dur "$dur" --argjson cost "$cost" \
      --argjson in "$tin" --argjson out "$tout" \
-     --argjson rc "$rc" \
+     --argjson rc "$rc" --argjson unknown "$unknown" \
      '{ts:(now|todate),run_id:$run,iter:0,phase:$phase,model:$model,issue:$issue,round:$round,
        duration_s:$dur,cost_usd:$cost,input_tokens:$in,output_tokens:$out,exit_code:$rc,
-       verdict:$verdict,holdout_failed:0}' >> "$RUN_LOG" 2>/dev/null || true
+       verdict:$verdict,holdout_failed:0,cost_unknown:($unknown==1)}' >> "$RUN_LOG" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

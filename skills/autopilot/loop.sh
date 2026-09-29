@@ -336,14 +336,14 @@ if [[ -n "$RESTORED_START_EPOCH" ]]; then
   fi
 fi
 
-logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json]
+logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json] [cost_unknown 0|1]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
      --arg phase "$1" --arg model "$2" --argjson dur "${3:-0}" \
      --argjson cost "${4:-0}" --argjson intok "${5:-0}" --argjson outtok "${6:-0}" \
      --argjson exit "${7:-0}" --arg verdict "${8:-}" --argjson holdout_failed "${9:-0}" \
      --argjson turns "${10:-0}" --argjson cache_read "${11:-0}" --argjson cache_creation "${12:-0}" \
-     --argjson violations "${13:-[]}" \
-     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed,turns:$turns,cache_read_input_tokens:$cache_read,cache_creation_input_tokens:$cache_creation,violations:$violations}' \
+     --argjson violations "${13:-[]}" --argjson cost_unknown "${14:-0}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed,turns:$turns,cache_read_input_tokens:$cache_read,cache_creation_input_tokens:$cache_creation,violations:$violations,cost_unknown:($cost_unknown==1)}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -390,7 +390,7 @@ log_iteration() {
 # again; the max is the "how bad did it get" read /usage-report wants.
 run_aggregates() {
   if [[ ! -s "$RUN_LOG" ]]; then
-    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0}'
+    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0,"cost_unknown_calls":0}'
     return
   fi
   # $widths drops unmeasured iterations rather than reading them as zero. A
@@ -409,6 +409,7 @@ run_aggregates() {
     | ($it | map(.parked_count // 0) | (max // 0)) as $parked_total
     | ($it | map(select(.escalated == true)) | length) as $escalations
     | (map(select(.phase=="verify_cmd" and .verdict=="deferred")) | length) as $deferred
+    | (map(select(.cost_unknown == true)) | length) as $unknown
     | {
         iterations: $n,
         gate_fail_rate: (if $n > 0 then ($failed / $n) else 0 end),
@@ -417,9 +418,10 @@ run_aggregates() {
         mean_dag_width: (if ($widths|length) > 0 then (($widths|add) / ($widths|length)) else 0 end),
         parked_total: $parked_total,
         escalations: $escalations,
-        verify_deferred: $deferred
+        verify_deferred: $deferred,
+        cost_unknown_calls: $unknown
       }
-  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0}'
+  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0,"cost_unknown_calls":0}'
 }
 
 write_status() { # state
@@ -457,7 +459,8 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
   [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]] && call_verdict="turn-limit"
   logline "$phase" "$model" "$AGENT_LAST_DURATION" "${AGENT_LAST_COST:-0}" \
     "${AGENT_LAST_IN_TOKENS:-0}" "${AGENT_LAST_OUT_TOKENS:-0}" "$rc" "$call_verdict" 0 \
-    "${AGENT_LAST_TURNS:-0}" "${AGENT_LAST_CACHE_READ:-0}" "${AGENT_LAST_CACHE_CREATION:-0}"
+    "${AGENT_LAST_TURNS:-0}" "${AGENT_LAST_CACHE_READ:-0}" "${AGENT_LAST_CACHE_CREATION:-0}" \
+    '[]' "${AGENT_LAST_COST_UNKNOWN:-0}"
   return "$rc"
 }
 

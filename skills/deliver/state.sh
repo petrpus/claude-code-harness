@@ -78,12 +78,28 @@ state_total_cost() {
     || echo 0
 }
 
+# state_cost_unknown_calls <run_dir>  — how many logged calls (same files and
+# exclusions as state_total_cost) were killed by a timeout, so their cost is
+# unknown rather than zero: a budget cap is not "met" by such a run.
+state_cost_unknown_calls() {
+  local rd="$1"
+  local -a files=()
+  shopt -s nullglob
+  files=("$rd"/run-*.jsonl "$rd"/issues/*/run-*.jsonl)
+  shopt -u nullglob
+  [[ ${#files[@]} -eq 0 ]] && { echo 0; return; }
+  jq -s '[.[] | select(.phase != "iteration" and .cost_unknown == true)] | length' "${files[@]}" 2>/dev/null \
+    || echo 0
+}
+
 # state_write_status <run_dir> <state> <current_issue_or_empty> <merged_count> <parked_count> <cost_usd> <elapsed_s>
+#                    [cost_unknown_calls]   (default 0; see state_cost_unknown_calls)
 state_write_status() {
   jq -cn --arg state "$2" --arg cur "${3:-}" --argjson merged "$4" --argjson parked "$5" \
-     --argjson cost "$6" --argjson elapsed "$7" \
+     --argjson cost "$6" --argjson elapsed "$7" --argjson unknown "${8:-0}" \
      '{state:$state, current_issue:(if $cur=="" then null else ($cur|tonumber? // $cur) end),
-       merged_count:$merged, parked_count:$parked, cost_usd:$cost, elapsed_s:$elapsed}' \
+       merged_count:$merged, parked_count:$parked, cost_usd:$cost, elapsed_s:$elapsed,
+       cost_unknown_calls:$unknown}' \
      > "$1/status.json.tmp" && mv "$1/status.json.tmp" "$1/status.json"
 }
 

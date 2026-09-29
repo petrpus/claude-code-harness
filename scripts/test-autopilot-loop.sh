@@ -72,6 +72,7 @@ mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 [[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
+[[ -n "${STUB_SLEEP:-}" ]] && sleep "$STUB_SLEEP"
 prompt="$*"
 # The plan path comes from the prompt, not a hardcoded tmp/autopilot/: every
 # phase that touches the plan names it (loop.sh interpolates $PLAN_FILE), and
@@ -1724,6 +1725,31 @@ RC43C=$?
 [[ "$RC43B" -eq 1 && "$RC43C" -eq 1 ]] \
   && ok "--iteration-verify-cmd without --verify-at-completion and --plan-max-items 0 are refused" \
   || note "flag validation: exit $RC43B / $RC43C — expected 1 / 1"
+
+# --- 44. a timed-out call records an unknown cost, not zero ----------------
+# The stub sleeps past --per-call-timeout 1, so `timeout` kills every call.
+R44="$WORK/r44"; new_repo "$R44"
+( cd "$R44" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SLEEP=3 \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+      --per-call-timeout 1 >"$WORK/r44.out" 2>"$WORK/r44.err" )
+[[ "$(cat "$R44"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase!="iteration" and .cost_unknown==true)] | length')" -ge 1 ]] \
+  && ok "a timed-out call's run-log row carries cost_unknown:true" \
+  || note "no cost_unknown:true row after a timeout: $(cat "$R44"/tmp/autopilot/run-*.jsonl 2>/dev/null | head -3)"
+[[ "$(jq -r '.cost_unknown_calls' "$R44/tmp/autopilot/status.json" 2>/dev/null)" -ge 1 ]] \
+  && ok "status.json counts the unknown-cost calls (cost_unknown_calls)" \
+  || note "status.json cost_unknown_calls: $(cat "$R44/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$(cat "$R1"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.cost_unknown==true)] | length')" -eq 0 \
+   && "$(jq -r '.cost_unknown_calls' "$R1/tmp/autopilot/status.json")" == "0" ]] \
+  && ok "a run with no timeout has cost_unknown_calls 0 and no unknown rows" \
+  || note "a clean run reports unknown-cost calls"
+
+# report.sh names the unknown-cost calls per day and model.
+RU="$WORK/report-unknown"; mkdir -p "$RU"
+printf '%s\n' '{"ts":"2026-09-01T10:00:00Z","run_id":"20260901T100000Z-1","iter":1,"phase":"build","model":"sonnet","cost_usd":0,"cost_unknown":true}' \
+  '{"ts":"2026-09-01T11:00:00Z","run_id":"20260901T100000Z-1","iter":1,"phase":"plan","model":"sonnet","cost_usd":0.1,"cost_unknown":false}' > "$RU/run-20260901T100000Z-1.jsonl"
+bash "$REPORT_ABS" "$RU" 2>/dev/null | grep -q '2026-09-01 | sonnet | 1 call(s) with unknown cost' \
+  && ok "report.sh prints the count of calls with unknown cost per day/model" \
+  || note "report.sh did not print the unknown-cost count"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

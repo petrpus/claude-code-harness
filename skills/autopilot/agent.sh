@@ -32,6 +32,9 @@
 #     AGENT_LAST_RC, AGENT_LAST_JSON, AGENT_LAST_RESULT, AGENT_LAST_COST,
 #     AGENT_LAST_DURATION, AGENT_LAST_IN_TOKENS, AGENT_LAST_OUT_TOKENS,
 #     AGENT_LAST_TURNS, AGENT_LAST_CACHE_READ, AGENT_LAST_CACHE_CREATION,
+#     AGENT_LAST_COST_UNKNOWN (1 when `timeout` killed the call: the cost it
+#     had run up is unknowable, and AGENT_LAST_COST's 0 means "unknown", not
+#     "free"; 0 otherwise, dry runs included),
 #     AGENT_LAST_SUBTYPE (the reply's `subtype`: "success", or an error such
 #     as "error_max_turns" — the call ran out of --max-turns, #96)
 #
@@ -146,6 +149,14 @@ agent_run() {
   AGENT_LAST_RC="$rc"
   AGENT_LAST_JSON="$out"
   AGENT_LAST_DURATION=$(( t1 - t0 ))
+  # rc 124 is timeout's kill; an empty reply after a call that ran to the
+  # limit is the same thing seen through a wrapper that ate the code.
+  AGENT_LAST_COST_UNKNOWN=0
+  if [[ "${AGENT_DRY_RUN:-0}" -ne 1 ]]; then
+    if [[ "$rc" -eq 124 ]] || { [[ -z "$out" ]] && (( AGENT_LAST_DURATION >= ${AGENT_TIMEOUT:-1200} )); }; then
+      AGENT_LAST_COST_UNKNOWN=1
+    fi
+  fi
   # One jq pass: every field or its default, tab-separated. A non-JSON reply
   # (a crash, a timeout's empty output) falls through to the all-defaults line.
   local fields

@@ -108,3 +108,22 @@ COMPARISON_ROW="$(printf '%s' "$ALL" | jq -s -r '
 echo "| repo_map=true | repo_map=false |"
 echo "|---|---|"
 echo "${COMPARISON_ROW:-| — | — |}"
+
+# --- 4. Calls with an unknown cost --------------------------------------------
+# A call `timeout` killed reports no cost, so its cost_usd of 0 means "unknown",
+# not "free" (`cost_unknown:true` in the row). Every total above is a floor when
+# any such call exists; say how many, per day and model.
+echo
+echo "## Calls with unknown cost (timed out — totals above are a lower bound)"
+UNKNOWN_ROWS="$(printf '%s' "$ALL" | jq -s -r '
+  [ .[] | select(.cost_unknown == true) | {day: (.ts // "" | .[0:10]), model: (if (.model // "") == "" then "-" else .model end)} ]
+  | group_by([.day, .model]) | map({day: .[0].day, model: .[0].model, n: length})
+  | .[] | "| \(.day) | \(.model) | \(.n) call(s) with unknown cost |"
+' 2>/dev/null)"
+if [[ -n "$UNKNOWN_ROWS" ]]; then
+  echo "| Day | Model | Calls |"
+  echo "|---|---|---|"
+  printf '%s\n' "$UNKNOWN_ROWS"
+else
+  echo "None."
+fi

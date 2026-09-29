@@ -1998,6 +1998,12 @@ CG_RUNDIR="$(ls -d "$CG"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && [[ "$(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci" and .verdict=="pass")] | length')" -ge 1 ]] \
   && ok "CI: pending polled until green, then merged (no 'no CI' note once CI reported)" \
   || note "ci pending->green: exit $RC, pr checks calls $(grep -c '^pr checks 4' "$CG/gh/calls" 2>/dev/null)"
+[[ "$(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci")] | (length >= 1) and all(.cost_unknown == false)')" == "true" ]] \
+  && ok "a ci row stays cost_unknown:false" \
+  || note "ci rows: $(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -c 'select(.phase=="ci")' | head -2)"
+jq -e '.cost_unknown_calls==0' "$CG_RUNDIR/status.json" >/dev/null 2>&1 \
+  && ok "deliver status.json carries cost_unknown_calls" \
+  || note "deliver status.json: $(cat "$CG_RUNDIR/status.json" 2>/dev/null)"
 
 # a failed check gets one fix round (#60); still red after it parks the issue.
 CF="$WORK/cifail"
