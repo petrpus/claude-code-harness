@@ -124,6 +124,42 @@ case "$prompt" in
        && printf '%s' "$prompt" | grep -qF "$STUB_HOLDOUT_SENTINEL"; then
       printf 'LEAK: holdout sentinel reached the BUILD prompt\n' >> "${STUB_LEAK_FILE:-/dev/null}"
     fi
+    # S1 (issue #54): simulate a BUILD that leaves a secret behind — either by
+    # committing it itself (pre-fix, when the allowlist still granted git
+    # add/commit) or by leaving it in a new untracked file, which a
+    # `git diff HEAD` never sees at all. Both must be caught now that
+    # secret_scan() reads `git diff --cached $ITER_BASE_SHA` over the
+    # runner's own `git add -A`.
+    if [[ "${STUB_SECRET_MODE:-}" == "commit" ]]; then
+      printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret.txt
+      git add secret.txt >/dev/null 2>&1
+      git commit -q -m "build: oops" >/dev/null 2>&1
+    elif [[ "${STUB_SECRET_MODE:-}" == "lockindex" ]]; then
+      # A held index lock: the runner's own `git add -A` after BUILD fails.
+      printf 'work\n' > locked-work.txt
+      : > "$(git rev-parse --git-dir)/index.lock"
+    elif [[ "${STUB_SECRET_MODE:-}" == "untracked" ]]; then
+      printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret_untracked.txt
+    elif [[ "${STUB_SECRET_MODE:-}" == "nearby" ]]; then
+      # Regression (#54 dogfooding): a secret-looking line already at
+      # ITER_BASE_SHA, untouched by this iteration, must not fail the gate
+      # just because an edit lands within the diff's context window (git's
+      # default 3 lines) of it — `git diff`'s unified context reprints
+      # unchanged lines around a real change, and a scan over the raw diff
+      # text (rather than only its +/- lines) can't tell "shown as context"
+      # from "added".
+      sed -i 's/^unrelated line$/unrelated line, edited by BUILD/' config.txt
+    fi
+    # S2 (issue #54): simulate a BUILD that commits a (non-secret) change
+    # itself, moving HEAD before the runner's own `git add -A`/checkpoint —
+    # the verifier's prompt must still diff the whole iteration against
+    # ITER_BASE_SHA (recorded before this call ran), not HEAD, or a
+    # same-iteration BUILD commit would make the change invisible to it.
+    if [[ -n "${STUB_BUILD_SELF_COMMIT_FILE:-}" ]]; then
+      printf 'build committed this itself\n' > "$STUB_BUILD_SELF_COMMIT_FILE"
+      git add "$STUB_BUILD_SELF_COMMIT_FILE" >/dev/null 2>&1
+      git commit -q -m "build: self-commit" >/dev/null 2>&1
+    fi
     # R1 (runner self-reload): simulate a slice whose own job is to edit
     # loop.sh, exactly once, guarded by a flag file so it doesn't keep
     # editing on every subsequent iteration (which would never converge).
@@ -170,6 +206,20 @@ case "$prompt" in
     emit '"built"'
     ;;
   *"verdict"*|*"shortcut"*|*"Verdict"*)
+    # S2 (issue #54): the stub verifier plays along with the prompt's own
+    # instructions — it extracts the `git diff --cached <sha>` command the
+    # prompt tells it to run and actually runs it (read-only, same as the
+    # real verifier's allowlist), so the outer test can assert on what a
+    # verifier obeying the prompt would actually have seen, not just on the
+    # prompt text containing a SHA.
+    if [[ -n "${STUB_VERIFY_DIFF_LOG:-}" ]]; then
+      diff_cmd_seen="$(printf '%s' "$prompt" | grep -oE 'git diff --cached [0-9a-f]{7,40}' | head -1)"
+      if [[ -n "$diff_cmd_seen" ]]; then
+        $diff_cmd_seen > "$STUB_VERIFY_DIFF_LOG" 2>&1
+      else
+        : > "$STUB_VERIFY_DIFF_LOG"
+      fi
+    fi
     # R2: a verifier that declines to judge (prose, a clarifying question, no
     # parseable `.pass`) must be told apart from a real {"pass": false} — the
     # three STUB_VERIFY_* knobs below simulate each shape the runner has to
@@ -1443,6 +1493,130 @@ RC32C=$?
 [[ "$RC32C" -eq 1 ]] && grep -q "no verify command found" "$WORK/r32c.err" 2>/dev/null \
   && ok "a repo with no detectable verify command still exits 1 with the expected message" \
   || note "a repo with no verify command exited $RC32C — expected 1 with 'no verify command found'"
+
+# --- 33. S1 (#54): the runner owns the checkpoint commit and the secret ----
+# scan sees the whole iteration, committed or not ---------------------------
+# Both fixtures run a single iteration (--max-iterations 1): the WIP
+# checkpoint the runner makes even on a gate failure commits the secret into
+# history, so on a *second* iteration the same static content is no longer
+# "new" against that iteration's own ITER_BASE_SHA and the gate would (rightly)
+# stay quiet — the fixture only needs to prove iteration 1 itself caught it.
+#
+# (a) BUILD commits a secret itself (bypassing the runner's own checkpoint) —
+# still caught, because the scan diffs the index against ITER_BASE_SHA
+# (recorded before BUILD ran), not HEAD: `git diff HEAD` would see nothing
+# once BUILD's own commit moved HEAD to match the working tree.
+R33A="$WORK/r33a"; new_repo "$R33A"
+( cd "$R33A" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=commit \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r33a.out" 2>"$WORK/r33a.err" )
+RC33A=$?
+GATE33A="$(cat "$R33A"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC33A" -eq 2 && "$GATE33A" == "secret" ]] \
+  && ok "a secret committed by BUILD itself fails iteration 1's gate (gate_failed=secret)" \
+  || note "BUILD-committed secret: exit $RC33A (expected 2), gate_failed='$GATE33A'"
+grep -q "possible secret in diff" "$R33A/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "FEEDBACK.md names the secret finding for a BUILD-side commit" \
+  || note "FEEDBACK.md missing the secret finding: $(cat "$R33A/tmp/autopilot/FEEDBACK.md" 2>/dev/null)"
+
+# (b) BUILD leaves the secret in a new untracked file, never staged or
+# committed at all — a `git diff HEAD` would never see it at all (untracked
+# files never appear in a diff against HEAD); `git add -A` + `git diff
+# --cached ITER_BASE_SHA` must.
+R33B="$WORK/r33b"; new_repo "$R33B"
+( cd "$R33B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=untracked \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r33b.out" 2>"$WORK/r33b.err" )
+RC33B=$?
+GATE33B="$(cat "$R33B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC33B" -eq 2 && "$GATE33B" == "secret" ]] \
+  && ok "a secret left in a new untracked file fails iteration 1's gate (gate_failed=secret)" \
+  || note "untracked secret: exit $RC33B (expected 2), gate_failed='$GATE33B'"
+grep -q "possible secret in diff" "$R33B/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "FEEDBACK.md names the secret finding for an untracked secret file" \
+  || note "FEEDBACK.md missing the secret finding: $(cat "$R33B/tmp/autopilot/FEEDBACK.md" 2>/dev/null)"
+
+# (c) BUILD's own --allowedTools no longer grants git add/git commit — the
+# runner owns the checkpoint, not BUILD. Across the whole run, "Bash(git
+# add"/"Bash(git commit" could only ever have come from BUILD_ALLOWED_TOOLS —
+# PLAN's tool list has no Bash at all, and the verifier's has only git
+# diff/log/status — so a plain absence check over every call this run made
+# is enough to prove the grant is gone.
+grep -q 'ONE iteration of an autonomous BUILD loop' "$WORK/r1.calls" 2>/dev/null \
+  && ! grep -qE 'Bash\(git add|Bash\(git commit' "$WORK/r1.calls" \
+  && ok "BUILD_ALLOWED_TOOLS no longer grants git add/git commit" \
+  || note "BUILD's allowed-tools still mention git add/git commit: $(grep -oE 'Bash\(git [a-z]+:[^)]*\)' "$WORK/r1.calls" | sort -u | tr '\n' ' ')"
+grep -qF 'Do not run `git add` or `git commit`' "$WORK/r1.calls" 2>/dev/null \
+  && ok "the BUILD prompt tells BUILD the runner stages and commits the checkpoint" \
+  || note "the BUILD prompt doesn't mention the runner owning the commit"
+
+# --- 34. S2 (#54): the verifier diffs the whole iteration against ----------
+# ITER_BASE_SHA, not HEAD — a change BUILD committed itself must still be
+# visible to the verifier, exactly as it must to the secret scan (test 33a).
+R34="$WORK/r34"; new_repo "$R34"
+PRE_SHA_34="$(git -C "$R34" rev-parse HEAD)"
+( cd "$R34" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    STUB_BUILD_SELF_COMMIT_FILE="build-own-commit.txt" \
+    STUB_VERIFY_DIFF_LOG="$WORK/r34-verify.diff" STUB_CALL_LOG="$WORK/r34.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r34.out" 2>"$WORK/r34.err" )
+grep -qF "git diff --cached $PRE_SHA_34" "$WORK/r34.calls" 2>/dev/null \
+  && ok "the verifier's prompt names the pre-BUILD SHA (ITER_BASE_SHA), not HEAD" \
+  || note "verifier prompt doesn't name $PRE_SHA_34: $(grep -oE 'git diff[^\`]*' "$WORK/r34.calls" 2>/dev/null | sort -u | tr '\n' ' ')"
+grep -qF "build-own-commit.txt" "$WORK/r34-verify.diff" 2>/dev/null \
+  && ok "running the prompt's own diff command shows the file BUILD committed itself" \
+  || note "the prompt's diff command missed BUILD's own commit: $(cat "$WORK/r34-verify.diff" 2>/dev/null)"
+FC34="$(jq -s '[.[] | select(.phase=="iteration")][0].files_changed // -1' "$R34"/tmp/autopilot/run-*.jsonl 2>/dev/null)"
+WANT34="$(git -C "$R34" diff --stat "$PRE_SHA_34" HEAD 2>/dev/null | grep -c '|')"
+[[ "${WANT34:-0}" -ge 2 && "$FC34" == "$WANT34" ]] \
+  && ok "the iteration row's files_changed counts BUILD's own commit too ($FC34 = the whole iteration's diff from ITER_BASE_SHA)" \
+  || note "files_changed=$FC34, but the iteration changed $WANT34 file(s) since ITER_BASE_SHA"
+
+# --- 35. secret_scan() ignores unchanged lines shown only as diff context --
+# (regression, found dogfooding S1/S2 on this very repo: a plan-adjacent test
+# edit landed within 3 lines of an already-committed AKIA-pattern fixture
+# line and tripped the gate even though that line itself was untouched).
+# secret_scan() must judge the actual change, not everything unified diff
+# context reprints around it.
+R35="$WORK/r35"; new_repo "$R35"
+printf -- '- [ ] slice 1\n\nSTATUS: in-progress\n' > "$R35/tmp/autopilot/IMPLEMENTATION_PLAN.md"
+printf 'unrelated line\ntoken = "AKIAABCDEFGHIJKLMNOP"\nunrelated line\n' > "$R35/config.txt"
+git -C "$R35" add config.txt >/dev/null 2>&1
+git -C "$R35" -c user.email=t@t.est -c user.name=test commit -q -m "add config.txt fixture"
+( cd "$R35" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=nearby \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r35.out" 2>"$WORK/r35.err" )
+RC35=$?
+GATE35="$(cat "$R35"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC35" -eq 0 && "$GATE35" == "none" ]] \
+  && ok "an edit merely near a pre-existing secret-looking line (diff context) does not fail the gate" \
+  || note "edit near a pre-existing secret line: exit $RC35 (expected 0), gate_failed='$GATE35', FEEDBACK='$(cat "$R35/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 36. The gates fail closed when the runner cannot stage the iteration ---
+# (#54 review): a failed `git add -A` must not let the secret scan and the
+# verifier read a partial index as "clean".
+R36="$WORK/r36"; new_repo "$R36"
+( cd "$R36" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=lockindex \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r36.out" 2>"$WORK/r36.err" )
+GATE36="$(cat "$R36"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+rm -f "$R36/.git/index.lock"
+[[ "$GATE36" == "stage" ]] && grep -q 'could not stage the iteration' "$R36/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "a failed git add -A fails the iteration (gate_failed=stage) instead of passing the gates on a partial index" \
+  || note "held index lock: gate_failed='$GATE36', FEEDBACK='$(cat "$R36/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 37. Files the verify command writes are scanned too ------------------------
+# The runner stages again after GATE b: a secret in generated, non-ignored
+# output would otherwise ride into the checkpoint commit unscanned.
+R37="$WORK/r37"; new_repo "$R37"
+( cd "$R37" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd 'printf "token = \"AKIAABCDEFGHIJKLMNOP\"\n" > generated.txt' \
+    --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r37.out" 2>"$WORK/r37.err" )
+GATE37="$(cat "$R37"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$GATE37" == "secret" ]] \
+  && ok "a secret the verify command wrote into a non-ignored file fails the secret gate" \
+  || note "verify-written secret: gate_failed='$GATE37'"
 
 # --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and
