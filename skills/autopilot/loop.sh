@@ -1159,7 +1159,9 @@ while :; do
   # pipefail its own exit-1-on-no-match would still make an `|| echo 0` fallback
   # fire and double the output ("0\n0") — so no fallback here, just a default
   # for the pathological case where the pipeline produced no output at all.
-  FILES_CHANGED="$(git diff --stat HEAD 2>/dev/null | grep -c '|' 2>/dev/null)"
+  # Against ITER_BASE_SHA, not HEAD, like the gates (#54): a commit BUILD
+  # made itself moved HEAD and would drop its files from the count.
+  FILES_CHANGED="$(git diff --stat "$ITER_BASE_SHA" 2>/dev/null | grep -c '|' 2>/dev/null)"
   FILES_CHANGED="${FILES_CHANGED:-0}"
   GATE_FAILED="${FP:-none}"
 

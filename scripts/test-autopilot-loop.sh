@@ -1562,6 +1562,11 @@ grep -qF "git diff --cached $PRE_SHA_34" "$WORK/r34.calls" 2>/dev/null \
 grep -qF "build-own-commit.txt" "$WORK/r34-verify.diff" 2>/dev/null \
   && ok "running the prompt's own diff command shows the file BUILD committed itself" \
   || note "the prompt's diff command missed BUILD's own commit: $(cat "$WORK/r34-verify.diff" 2>/dev/null)"
+FC34="$(jq -s '[.[] | select(.phase=="iteration")][0].files_changed // -1' "$R34"/tmp/autopilot/run-*.jsonl 2>/dev/null)"
+WANT34="$(git -C "$R34" diff --stat "$PRE_SHA_34" HEAD 2>/dev/null | grep -c '|')"
+[[ "${WANT34:-0}" -ge 2 && "$FC34" == "$WANT34" ]] \
+  && ok "the iteration row's files_changed counts BUILD's own commit too ($FC34 = the whole iteration's diff from ITER_BASE_SHA)" \
+  || note "files_changed=$FC34, but the iteration changed $WANT34 file(s) since ITER_BASE_SHA"
 
 # --- 35. secret_scan() ignores unchanged lines shown only as diff context --
 # (regression, found dogfooding S1/S2 on this very repo: a plan-adjacent test

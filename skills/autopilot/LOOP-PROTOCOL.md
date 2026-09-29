@@ -97,9 +97,11 @@ loop:
     └─ exactly the selected plan item, TDD (red-green-refactor), ADR if
        architectural, run verify, tick box, append MEMORY, set STATUS —
        does NOT `git add`/`git commit` (not in its allowlist): the runner
-       stages (`git add -A`) and commits the checkpoint itself, after BUILD
-       and before the gates below, from `ITER_BASE_SHA` (HEAD as recorded
-       right before this BUILD call)
+       stages the whole iteration (`git add -A`) after BUILD and before the
+       gates below, which all read that index against `ITER_BASE_SHA` (HEAD
+       as recorded right before this BUILD call); it commits the checkpoint
+       itself only after the gates settle, in whichever outcome the
+       iteration ends with (green / unmeasured / progress / wip)
   GATE b  machine verify   runner    executes the verify command itself
   GATE c  secret scan      runner    greps `git diff --cached ITER_BASE_SHA`
                                       for keys/tokens — covers everything
