@@ -734,6 +734,9 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
       prev=""; for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && printf '%s\n' "$a" >> "$STUB_BUILD_LOG"; prev="$a"; done
     fi
     n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
+    # What status.json says the issue in flight is, while issue $n builds (#84).
+    [[ -n "${STUB_STATUS_SNAP:-}" ]] \
+      && printf 'building=%s current_issue=%s\n' "$n" "$(jq -r '.current_issue' tmp/deliver/*/status.json 2>/dev/null | head -1)" >> "$STUB_STATUS_SNAP"
     if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
       # A STOP that lands while BUILD works on plan item $STUB_STOP_ON_SLICE
@@ -2324,6 +2327,25 @@ pf_fails() { # <fixture> <check> <what> <rc>
     && ok "plan-only: $3 fails the '$2' check (exit $4, other checks still reported)" \
     || note "plan-only $3: rc=$4 $2=$(pocheck "$1" "$2") out=$(head -c 200 "$WORK/$1/out")"
 }
+# verify detection is shared with autopilot (#84): a repo with only
+# scripts/verify.sh and no --verify-cmd passes the verify pre-flight.
+new_fixture pfvsh
+mkdir -p "$WORK/pfvsh/repo/scripts" && printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/pfvsh/repo/scripts/verify.sh"
+git -C "$WORK/pfvsh/repo" add -A && git -C "$WORK/pfvsh/repo" commit -q -m "add verify.sh" && git -C "$WORK/pfvsh/repo" push -q origin integration/x 2>/dev/null
+( cd "$WORK/pfvsh/repo" && env PATH="$BIN:$PATH" FAKE_GH_DIR="$WORK/pfvsh/gh" XDG_STATE_HOME="$WORK/pfvsh/state" \
+    bash "$DELIVER_ABS" --map 3 --plan-only --json >"$WORK/pfvsh/out" 2>"$WORK/pfvsh/err" ); RC=$?
+[[ "$RC" -eq 0 && "$(pocheck pfvsh verify)" == "ok" ]] \
+  && ok "plan-only: scripts/verify.sh alone (no package.json, no --verify-cmd) passes the verify pre-flight" \
+  || note "verify.sh detection: rc=$RC verify=$(pocheck pfvsh verify) out=$(head -c 300 "$WORK/pfvsh/out")"
+
+# status.json names the issue in flight while it builds (#84): the second
+# issue's BUILD sees current_issue == 2, not the first (or null).
+new_fixture cur
+run_deliver cur STUB_STATUS_SNAP="$WORK/cur/snap"; RC=$?
+[[ "$RC" -eq 0 ]] && grep -qx 'building=1 current_issue=1' "$WORK/cur/snap" && grep -qx 'building=2 current_issue=2' "$WORK/cur/snap" \
+  && ok "status.json current_issue names the issue in flight while it builds" \
+  || note "current_issue snapshots: rc=$RC $(tr '\n' '|' < "$WORK/cur/snap" 2>/dev/null)"
+
 new_fixture pfdirty; echo junk > "$WORK/pfdirty/repo/untracked.txt"
 run_deliver pfdirty -- --plan-only --json; pf_fails pfdirty clean-tree "a dirty tree" $?
 new_fixture pfign; : > "$WORK/pfign/repo/.gitignore"
