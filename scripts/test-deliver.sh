@@ -132,6 +132,18 @@ map_title_is_conventional "feat(deliver): tracer bullet" && map_title_is_convent
   && [[ "$(map_branch_name 102 "$(map_pr_title 'fix(deliver): the independent review has no --max-turns and a turn-limited review is unnamed' 'x' '')")" == fix/102-* ]] \
   && ok "PR title: Map title if conventional, else <type from labels>: <title>; a long conventional title keeps its type, cut at a word (#111)" \
   || note "PR title derivation is wrong"
+LONG_OK=1
+for t in "fix: $(printf 'a%.0s' {1..80})" \
+         "fix(x): $(printf 'w%.0s' {1..71}) tail words here" \
+         "fix: $(printf 'é%.0s' {1..50})" \
+         "docs: $(printf '%s ' 'architektura —' 'průvodce' 'a' 'slovníček' 'pro' 'verzi' 'šest' 'celá' 'nula' 'dlouhé' 'české' 'znění')" \
+         "fix:       $(printf 'z%.0s' {1..80})"; do
+  got="$(map_pr_title "$t" 'x' '')"
+  map_title_is_conventional "$got" && [[ "${got%%:*}" == "${t%%:*}" ]] || { LONG_OK=0; note "long title '$t' -> '$got'"; }
+done
+[[ "$LONG_OK" -eq 1 ]] \
+  && ok "PR title: long conventional titles (no spaces, space at the cut, multi-byte, leading blanks) always come out conventional with their own type" \
+  || note "long conventional titles: see the notes above"
 [[ "$(map_integration_slug 'Map: Deliver -- the /deliver skill!')" == "map-deliver-the-deliver-skill" ]] \
   && [[ "$(map_integration_slug '  ***  ')" == "" ]] \
   && [[ "$(map_integration_slug 'A very long map title that keeps going and going forever')" == "a-very-long-map-title-that-keeps-going-a" ]] \

@@ -97,6 +97,24 @@ map_conventional_split() {
   MAP_CONV_HEAD="${BASH_REMATCH[1]}"; MAP_CONV_DESC="${BASH_REMATCH[4]}"
 }
 
+# map_bytes <s> — the length of <s> in bytes, the unit MAP_CONVENTIONAL_RE's
+# `.{1,72}` counts in (it is matched under LC_ALL=C).
+map_bytes() { local LC_ALL=C; printf '%s' "${#1}"; }
+
+# map_fit_desc <desc> — <desc> trimmed and cut to at most 72 bytes: whole
+# words dropped from the end first, then (a single long word) characters,
+# one at a time in the caller's locale, so a multi-byte character is never
+# split under a UTF-8 locale. Echoes "" only for a blank <desc>.
+map_fit_desc() {
+  local d="$1"
+  d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
+  while (( $(map_bytes "$d") > 72 )) && [[ "$d" == *" "* ]]; do
+    d="${d% *}"; d="${d%"${d##*[![:space:]]}"}"
+  done
+  while (( $(map_bytes "$d") > 72 )); do d="${d%?}"; done
+  printf '%s' "$d"
+}
+
 map_pr_title() {
   local map_title="$1" issue_title="$2" labels=",$3," type desc
   if [[ -n "$map_title" ]] && map_title_is_conventional "$map_title"; then
@@ -106,13 +124,8 @@ map_pr_title() {
   # keep its own type and scope, shorten only the description, at a word
   # boundary — never treat it as prose and prefix a second type.
   if [[ -n "$map_title" ]] && map_conventional_split "$map_title"; then
-    desc="$MAP_CONV_DESC"
-    if (( ${#desc} > 72 )); then
-      if [[ "${desc:72:1}" == " " ]]; then desc="${desc:0:72}"
-      else desc="${desc:0:72}"; [[ "$desc" == *" "* ]] && desc="${desc% *}"
-      fi
-    fi
-    printf '%s%s\n' "$MAP_CONV_HEAD" "${desc%"${desc##*[![:space:]]}"}"; return 0
+    desc="$(map_fit_desc "$MAP_CONV_DESC")"
+    [[ -n "$desc" ]] && { printf '%s%s\n' "$MAP_CONV_HEAD" "$desc"; return 0; }
   fi
   case "$labels" in
     *,bug,*)           type=fix ;;
