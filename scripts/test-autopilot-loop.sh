@@ -31,6 +31,14 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 # site that shells out to loop.sh.
 unset AUTOPILOT_RUN_ID AUTOPILOT_ITER AUTOPILOT_TOTAL_COST AUTOPILOT_LOCK_OWNED
 
+# Forge-credential withholding (ADR-0007) sets GH_CONFIG_DIR and appends to
+# GIT_CONFIG_COUNT for everything it runs — the verify command included, so
+# these tests inherit both when autopilot or /deliver verifies this repo. The
+# fixtures bring their own forge (a fake gh, bare remotes) and must not see
+# the caller's: an inherited empty GH_CONFIG_DIR makes the fake gh report
+# "not logged in" (first live run, #83).
+unset GH_CONFIG_DIR GIT_CONFIG_COUNT
+
 FAIL=0
 note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }
@@ -64,8 +72,13 @@ mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 [[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
+[[ -n "${STUB_SLEEP:-}" ]] && sleep "$STUB_SLEEP"
 prompt="$*"
-plan="tmp/autopilot/IMPLEMENTATION_PLAN.md"
+# The plan path comes from the prompt, not a hardcoded tmp/autopilot/: every
+# phase that touches the plan names it (loop.sh interpolates $PLAN_FILE), and
+# --state-dir moves it. Fallback keeps any prompt that doesn't name it working.
+plan="$(printf '%s' "$prompt" | grep -oE '[^[:space:],"]*IMPLEMENTATION_PLAN\.md' | head -1)"
+plan="${plan:-tmp/autopilot/IMPLEMENTATION_PLAN.md}"
 # S4B: a call's own `--model <name>` token is right there in `$*` (loop.sh
 # passes it as a separate argv word, and prompt="$*" joins everything with
 # spaces) — cheap enough to grep for rather than threading a new stub arg
@@ -102,12 +115,64 @@ case "$prompt" in
     emit '"planned"'
     ;;
   *"ONE iteration of an autonomous BUILD loop"*)
+    # #96: a BUILD that runs out of --max-turns — claude -p exits 1 with an
+    # error_max_turns reply, having done part of the work and ticked nothing.
+    if [[ -n "${STUB_BUILD_MAX_TURNS:-}" ]]; then
+      # What this BUILD would read as FEEDBACK (it reads the file itself).
+      [[ -n "${STUB_FEEDBACK_LOG:-}" ]] && { echo "=== build"; cat "$(dirname "$plan")/FEEDBACK.md" 2>/dev/null; } >> "$STUB_FEEDBACK_LOG"
+      mkdir -p src && echo "half done" >> src/partial.txt
+      printf '{"type":"result","subtype":"error_max_turns","num_turns":81,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+      exit 1
+    fi
+    # --stop-file: simulate a caller requesting a stop while BUILD is busy.
+    # The runner must finish this iteration and stop at the next boundary.
+    [[ -n "${STUB_TOUCH_AFTER_BUILD:-}" ]] && touch "$STUB_TOUCH_AFTER_BUILD"
     # S2 (holdout scenarios): if this run is checking that holdout content
     # never reaches BUILD, flag it — the outer test asserts the file this
     # writes to stays empty.
     if [[ -n "${STUB_HOLDOUT_SENTINEL:-}" ]] \
        && printf '%s' "$prompt" | grep -qF "$STUB_HOLDOUT_SENTINEL"; then
       printf 'LEAK: holdout sentinel reached the BUILD prompt\n' >> "${STUB_LEAK_FILE:-/dev/null}"
+    fi
+    # S1 (issue #54): simulate a BUILD that leaves a secret behind — either by
+    # committing it itself (pre-fix, when the allowlist still granted git
+    # add/commit) or by leaving it in a new untracked file, which a
+    # `git diff HEAD` never sees at all. Both must be caught now that
+    # secret_scan() reads `git diff --cached $ITER_BASE_SHA` over the
+    # runner's own `git add -A`.
+    if [[ "${STUB_SECRET_MODE:-}" == "commit" ]]; then
+      printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret.txt
+      git add secret.txt >/dev/null 2>&1
+      git commit -q -m "build: oops" >/dev/null 2>&1
+    elif [[ "${STUB_SECRET_MODE:-}" == "lockindex" ]]; then
+      # A held index lock: the runner's own `git add -A` after BUILD fails.
+      printf 'work\n' > locked-work.txt
+      : > "$(git rev-parse --git-dir)/index.lock"
+    elif [[ "${STUB_SECRET_MODE:-}" == "untracked" ]]; then
+      printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret_untracked.txt
+    elif [[ "${STUB_SECRET_MODE:-}" == "nearby" ]]; then
+      # Regression (#54 dogfooding): a secret-looking line already at
+      # ITER_BASE_SHA, untouched by this iteration, must not fail the gate
+      # just because an edit lands within the diff's context window (git's
+      # default 3 lines) of it — `git diff`'s unified context reprints
+      # unchanged lines around a real change, and a scan over the raw diff
+      # text (rather than only its +/- lines) can't tell "shown as context"
+      # from "added".
+      sed -i 's/^unrelated line$/unrelated line, edited by BUILD/' config.txt
+    elif [[ "${STUB_SECRET_MODE:-}" == "removed" ]]; then
+      # #94: BUILD deletes an already-committed secret-looking line (a `-`
+      # line in the diff) and edits next to it — it added nothing.
+      sed -i -e '/AKIA/d' -e 's/^unrelated line$/unrelated line, edited by BUILD/' config.txt
+    fi
+    # S2 (issue #54): simulate a BUILD that commits a (non-secret) change
+    # itself, moving HEAD before the runner's own `git add -A`/checkpoint —
+    # the verifier's prompt must still diff the whole iteration against
+    # ITER_BASE_SHA (recorded before this call ran), not HEAD, or a
+    # same-iteration BUILD commit would make the change invisible to it.
+    if [[ -n "${STUB_BUILD_SELF_COMMIT_FILE:-}" ]]; then
+      printf 'build committed this itself\n' > "$STUB_BUILD_SELF_COMMIT_FILE"
+      git add "$STUB_BUILD_SELF_COMMIT_FILE" >/dev/null 2>&1
+      git commit -q -m "build: self-commit" >/dev/null 2>&1
     fi
     # R1 (runner self-reload): simulate a slice whose own job is to edit
     # loop.sh, exactly once, guarded by a flag file so it doesn't keep
@@ -155,6 +220,20 @@ case "$prompt" in
     emit '"built"'
     ;;
   *"verdict"*|*"shortcut"*|*"Verdict"*)
+    # S2 (issue #54): the stub verifier plays along with the prompt's own
+    # instructions — it extracts the `git diff --cached <sha>` command the
+    # prompt tells it to run and actually runs it (read-only, same as the
+    # real verifier's allowlist), so the outer test can assert on what a
+    # verifier obeying the prompt would actually have seen, not just on the
+    # prompt text containing a SHA.
+    if [[ -n "${STUB_VERIFY_DIFF_LOG:-}" ]]; then
+      diff_cmd_seen="$(printf '%s' "$prompt" | grep -oE 'git diff --cached [0-9a-f]{7,40}' | head -1)"
+      if [[ -n "$diff_cmd_seen" ]]; then
+        $diff_cmd_seen > "$STUB_VERIFY_DIFF_LOG" 2>&1
+      else
+        : > "$STUB_VERIFY_DIFF_LOG"
+      fi
+    fi
     # R2: a verifier that declines to judge (prose, a clarifying question, no
     # parseable `.pass`) must be told apart from a real {"pass": false} — the
     # three STUB_VERIFY_* knobs below simulate each shape the runner has to
@@ -417,6 +496,9 @@ grep -q "stuck on 'holdout'" "$WORK/r8.err" 2>/dev/null \
   && ok "the holdout failure is fingerprinted 'holdout', distinct from verify_agent" \
   || note "holdout failure was not fingerprinted as 'holdout' in the runner's log"
 
+ls "$R8"/tmp/autopilot/calls/*-verify_agent.md >/dev/null 2>&1 \
+  && note "a holdout-aware verifier reply was kept in calls/, where BUILD can read it (ADR-0006)" \
+  || ok "with a holdout, the verifier's replies are not kept in calls/ (ADR-0006)"
 grep -q "H1" "$R8/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
   && ok "FEEDBACK.md names the failing holdout scenario id" \
   || note "FEEDBACK.md doesn't mention the failing scenario id H1"
@@ -450,6 +532,12 @@ LOOP_SRC_DIR="$(dirname "$LOOP_ABS")"
 cp "$LOOP_ABS" "$PLUGIN_COPY/skills/autopilot/loop.sh"
 cp "$LOOP_SRC_DIR/plan.sh" "$PLUGIN_COPY/skills/autopilot/plan.sh"
 cp "$LOOP_SRC_DIR/allowlist.sh" "$PLUGIN_COPY/skills/autopilot/allowlist.sh"
+# Every file loop.sh sources must be in the copy: a missing one is sourced
+# with an error the runner does not stop on, and its functions then fail
+# silently — slices.sh was missing here until #55, so tests 10-11 ran the
+# ladder as no-ops.
+cp "$LOOP_SRC_DIR/slices.sh" "$PLUGIN_COPY/skills/autopilot/slices.sh"
+cp "$LOOP_SRC_DIR/agent.sh" "$PLUGIN_COPY/skills/autopilot/agent.sh"
 cp agents/verifier.md "$PLUGIN_COPY/agents/verifier.md"
 COPY_LOOP="$PLUGIN_COPY/skills/autopilot/loop.sh"
 
@@ -518,10 +606,15 @@ cat > "$R12/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
 STATUS: in-progress
 EOF
 PRIOR_RUN_ID="20260101T000000Z-999999"
+# S2: --resume-run now also restores the time cap's start time from this
+# log's earliest ts (see case 12c below) — a fixed past date here would trip
+# a spurious time cap under --max-minutes 30 and has nothing to do with what
+# THIS case tests (cost/iter adoption), so its rows are timestamped "now".
+NOW_TS_12="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cat > "$R12/tmp/autopilot/run-$PRIOR_RUN_ID.jsonl" <<EOF
-{"ts":"2026-01-01T00:00:00Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
-{"ts":"2026-01-01T00:00:01Z","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
-{"ts":"2026-01-01T00:00:02Z","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":1,"phase":"iteration","model":"-","duration_s":0,"cost_usd":0,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+{"ts":"$NOW_TS_12","run_id":"$PRIOR_RUN_ID","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
 EOF
 ( cd "$R12" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
     bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
@@ -541,6 +634,122 @@ COST_IS_TWO="$(jq -n --argjson v "${RESUMED_COST:--1}" '$v == 2' 2>/dev/null)"
 [[ "$COST_IS_TWO" == "true" ]] \
   && ok "--resume-run's cost total starts from the prior run's \$2 (1.25+0.75), not \$0" \
   || note "--resume-run's cost total is '$RESUMED_COST', expected 2 (summed from the prior log)"
+
+# --- 12b. --resume-run excludes a phase:"iteration" row's own cost_usd from --
+# the resumed total, even when that row is non-zero, so a per-iteration ------
+# summary cost is never double-counted on top of the per-call rows it summarizes
+R12B="$WORK/r12b"; new_repo "$R12B"
+cat > "$R12B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12B="20260101T000000Z-999998"
+# S2: see the NOW_TS_12 note above — same reasoning, this case tests cost
+# summation, not the time cap.
+NOW_TS_12B="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12B/tmp/autopilot/run-$PRIOR_RUN_ID_12B.jsonl" <<EOF
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":1.25,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.75,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+{"ts":"$NOW_TS_12B","run_id":"$PRIOR_RUN_ID_12B","iter":2,"phase":"iteration","model":"-","duration_s":0,"cost_usd":2.00,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"wip","holdout_failed":0}
+EOF
+( cd "$R12B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12b.out" 2>"$WORK/r12b.err" )
+RC12B=$?
+[[ "$RC12B" -eq 2 ]] \
+  && ok "--resume-run (non-zero iteration-row cost) adopts the prior iteration count (hits the iteration cap immediately)" \
+  || note "--resume-run (non-zero iteration-row cost) exited $RC12B — expected 2 (iteration cap)"
+
+RESUMED_COST_12B="$(jq -r '.total_cost_usd // -1' "$R12B/tmp/autopilot/status.json" 2>/dev/null)"
+COST_IS_TWO_12B="$(jq -n --argjson v "${RESUMED_COST_12B:--1}" '$v == 2' 2>/dev/null)"
+[[ "$COST_IS_TWO_12B" == "true" ]] \
+  && ok "--resume-run's cost total excludes the phase:\"iteration\" row's \$2 (1.25+0.75=2, not 4)" \
+  || note "--resume-run's cost total is '$RESUMED_COST_12B', expected 2 (the iteration row's \$2 must not be added on top)"
+
+# --- 12c. S2: the time cap survives resume — a ~2h-old prior run trips it --
+# immediately, before any model call (#78's plausibility check on top of the
+# restored value, not just the current clock).
+R12C="$WORK/r12c"; new_repo "$R12C"
+cat > "$R12C/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12C="20260101T000000Z-999997"
+OLD_TS_12C="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12C/tmp/autopilot/run-$PRIOR_RUN_ID_12C.jsonl" <<EOF
+{"ts":"$OLD_TS_12C","run_id":"$PRIOR_RUN_ID_12C","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12C" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_CALL_LOG="$WORK/r12c.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12c.out" 2>"$WORK/r12c.err" )
+RC12C=$?
+[[ "$RC12C" -eq 3 ]] \
+  && ok "S2: --resume-run restores a ~2h-old start time and hits the time cap (exit 3)" \
+  || note "S2: resume from a ~2h-old log exited $RC12C — expected 3 (time cap)"
+
+STATE_12C="$(jq -r '.state // ""' "$R12C/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$STATE_12C" == "time-cap" ]] \
+  && ok "S2: status.json reports state 'time-cap' for the restored-start resume" \
+  || note "S2: status.json state is '$STATE_12C', expected 'time-cap'"
+
+[[ ! -s "$WORK/r12c.calls" ]] \
+  && ok "S2: the restored time cap trips before any model call" \
+  || note "S2: expected no model calls before the time cap, got: $(cat "$WORK/r12c.calls" 2>/dev/null)"
+
+# --- 12d. S2: a prior run started seconds ago resumes with no time cap -----
+R12D="$WORK/r12d"; new_repo "$R12D"
+cat > "$R12D/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12D="20260101T000000Z-999996"
+RECENT_TS_12D="$(date -u -d '-5 seconds' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$R12D/tmp/autopilot/run-$PRIOR_RUN_ID_12D.jsonl" <<EOF
+{"ts":"$RECENT_TS_12D","run_id":"$PRIOR_RUN_ID_12D","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12D" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12d.out" 2>"$WORK/r12d.err" )
+RC12D=$?
+[[ "$RC12D" -eq 2 ]] \
+  && ok "S2: --resume-run with a seconds-old prior start runs normally (iteration cap, not time cap)" \
+  || note "S2: resume from a seconds-old log exited $RC12D — expected 2 (iteration cap)"
+
+STATE_12D="$(jq -r '.state // ""' "$R12D/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$STATE_12D" == "iteration-cap" ]] \
+  && ok "S2: status.json reports 'iteration-cap', not a spurious time cap" \
+  || note "S2: status.json state is '$STATE_12D', expected 'iteration-cap'"
+
+# --- 12e. S2: an unparseable prior ts falls back to the current clock, -----
+# never reports a time cap.
+R12E="$WORK/r12e"; new_repo "$R12E"
+cat > "$R12E/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] slice 1
+- [ ] slice 2
+
+STATUS: in-progress
+EOF
+PRIOR_RUN_ID_12E="20260101T000000Z-999995"
+cat > "$R12E/tmp/autopilot/run-$PRIOR_RUN_ID_12E.jsonl" <<EOF
+{"ts":"not-a-timestamp","run_id":"$PRIOR_RUN_ID_12E","iter":1,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.1,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}
+EOF
+( cd "$R12E" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 --resume-run \
+    >"$WORK/r12e.out" 2>"$WORK/r12e.err" )
+RC12E=$?
+[[ "$RC12E" -eq 2 ]] \
+  && ok "S2: an unparseable prior ts falls back to the current clock (iteration cap, not time cap)" \
+  || note "S2: resume from an unparseable-ts log exited $RC12E — expected 2 (iteration cap)"
+
+grep -q "restored start time" "$WORK/r12e.err" 2>/dev/null \
+  && ok "S2: the unparseable restored start time is logged, not silently swallowed" \
+  || note "S2: no fallback notice found in stderr for the unparseable ts"
 
 # --- 13. R2: a verifier stuck on "no verdict" still aborts, and FEEDBACK.md --
 # names the malfunction instead of quoting the refusal as findings ----------
@@ -1042,6 +1251,530 @@ EMPTY_RC_23=$?
 [[ "$EMPTY_RC_23" -eq 0 ]] \
   && ok "report.sh exits 0 against a directory with no run logs" \
   || note "report.sh exited $EMPTY_RC_23 against an empty directory — expected 0"
+
+# --- 24. --state-dir: a run lives entirely in the given directory ----------
+# /deliver runs one autopilot per issue, each in its own state dir. The whole
+# run — charter, plan, logs, status, lock — must follow the flag, and the
+# default tmp/autopilot/ must stay untouched.
+R24="$WORK/r24"; new_repo "$R24"
+mkdir -p "$R24/tmp/deliver/run1/issues/7"
+mv "$R24/tmp/autopilot/PROMPT.md" "$R24/tmp/deliver/run1/issues/7/PROMPT.md"
+run_loop "$R24" progress true --state-dir tmp/deliver/run1/issues/7
+RC24=$?
+S24="$R24/tmp/deliver/run1/issues/7"
+[[ "$RC24" -eq 0 ]] \
+  && ok "--state-dir: a five-slice run completes in a custom state dir (exit 0)" \
+  || note "--state-dir run exited $RC24 — expected 0 ($(tail -2 "$WORK/r24.err" 2>/dev/null | tr '\n' ' '))"
+[[ -f "$S24/IMPLEMENTATION_PLAN.md" && -f "$S24/status.json" && -f "$S24/MEMORY.md" ]] \
+  && ls "$S24"/run-*.jsonl >/dev/null 2>&1 \
+  && ok "--state-dir: plan, status, memory and run log all land in the given dir" \
+  || note "--state-dir: expected plan/status/memory/run log under $S24"
+[[ "$(jq -r '.state' "$S24/status.json" 2>/dev/null)" == "done" ]] \
+  && ok "--state-dir: status.json in the given dir reports done" \
+  || note "--state-dir: status.json state is '$(jq -r '.state' "$S24/status.json" 2>/dev/null)', expected done"
+[[ -z "$(ls -A "$R24/tmp/autopilot" 2>/dev/null)" ]] \
+  && ok "--state-dir: the default tmp/autopilot/ is left untouched" \
+  || note "--state-dir: files appeared in tmp/autopilot/: $(ls -A "$R24/tmp/autopilot" | tr '\n' ' ')"
+[[ ! -f "$S24/lock" ]] \
+  && ok "--state-dir: the lock in the given dir is released on exit" \
+  || note "--state-dir: lock left behind in $S24"
+
+# Trailing slashes name the same directory, not a different one.
+R24B="$WORK/r24b"; new_repo "$R24B"
+mkdir -p "$R24B/tmp/other"
+mv "$R24B/tmp/autopilot/PROMPT.md" "$R24B/tmp/other/PROMPT.md"
+run_loop "$R24B" progress true --state-dir tmp/other//
+RC24B=$?
+[[ "$RC24B" -eq 0 && -f "$R24B/tmp/other/status.json" ]] \
+  && ! grep -q 'tmp/other//' "$WORK/r24b.calls" 2>/dev/null \
+  && ok "--state-dir: trailing slashes are stripped (tmp/other// → tmp/other)" \
+  || note "--state-dir with trailing slashes exited $RC24B or leaked a doubled slash into prompts"
+
+# --- 25. --state-dir: an un-ignored state dir is refused -------------------
+# Checkpoints are `git add -A`; a state dir git tracks would commit the run's
+# own charter, logs and lock into the branch.
+R25="$WORK/r25"; new_repo "$R25"
+mkdir -p "$R25/state"
+cp "$R25/tmp/autopilot/PROMPT.md" "$R25/state/PROMPT.md"
+git -C "$R25" add state/PROMPT.md >/dev/null 2>&1
+git -C "$R25" commit -q -m "add state"
+run_loop "$R25" progress true --state-dir state
+RC25=$?
+[[ "$RC25" -eq 1 ]] && grep -q "not gitignored" "$WORK/r25.err" 2>/dev/null \
+  && ok "--state-dir: a state dir git does not ignore is refused (exit 1)" \
+  || note "--state-dir: un-ignored state dir exited $RC25 — expected 1 with a 'not gitignored' error"
+[[ "$(git -C "$R25" log --oneline | wc -l | tr -d ' ')" -eq 2 ]] \
+  && ok "--state-dir: the refused run made no checkpoint commit" \
+  || note "--state-dir: the refused run still committed"
+
+# --- 26. --stop-file: a stop requested mid-run ends it at the next boundary -
+# The stub touches the stop file during the first BUILD; the runner must let
+# that iteration finish (gates + checkpoint) and exit 6 before the second.
+R26="$WORK/r26"; new_repo "$R26"
+STOP26="$R26/tmp/deliver-STOP"
+( cd "$R26" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_TOUCH_AFTER_BUILD="$STOP26" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+      --stop-file tmp/deliver-STOP \
+    >"$WORK/r26.out" 2>"$WORK/r26.err" )
+RC26=$?
+[[ "$RC26" -eq 6 ]] \
+  && ok "--stop-file: a stop requested during BUILD exits 6" \
+  || note "--stop-file run exited $RC26 — expected 6"
+[[ "$(jq -r '.state' "$R26/tmp/autopilot/status.json" 2>/dev/null)" == "stopped" ]] \
+  && ok "--stop-file: status.json reports stopped" \
+  || note "--stop-file: status.json state is '$(jq -r '.state' "$R26/tmp/autopilot/status.json" 2>/dev/null)', expected stopped"
+[[ "$(jq -r '.iterations_done' "$R26/tmp/autopilot/status.json" 2>/dev/null)" == "1" ]] \
+  && ok "--stop-file: the running iteration finished; status.json counts exactly 1" \
+  || note "--stop-file: iterations_done is '$(jq -r '.iterations_done' "$R26/tmp/autopilot/status.json" 2>/dev/null)', expected 1"
+R26_LOG="$(git -C "$R26" log --oneline 2>/dev/null)"
+case "$R26_LOG" in
+  *"iteration 1 "*) ok "--stop-file: the interrupted iteration was still checkpointed" ;;
+  *)                note "--stop-file: no checkpoint commit for iteration 1" ;;
+esac
+[[ -z "$(git -C "$R26" status --porcelain 2>/dev/null)" && ! -f "$R26/tmp/autopilot/lock" ]] \
+  && ok "--stop-file: the stop leaves a clean tree and releases the lock" \
+  || note "--stop-file: dirty tree or lock left after stop"
+[[ -f "$STOP26" ]] \
+  && ok "--stop-file: the runner leaves the stop file to its owner" \
+  || note "--stop-file: the runner deleted the stop file"
+
+# Resuming with the file removed continues the same run to completion.
+rm -f "$STOP26"
+( cd "$R26" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+      --stop-file tmp/deliver-STOP --resume-run \
+    >"$WORK/r26b.out" 2>"$WORK/r26b.err" )
+RC26B=$?
+[[ "$RC26B" -eq 0 && "$(ls "$R26"/tmp/autopilot/run-*.jsonl | wc -l | tr -d ' ')" -eq 1 ]] \
+  && ok "--stop-file: --resume-run after the stop finishes the same run (exit 0, one run log)" \
+  || note "--stop-file: resume after stop exited $RC26B / $(ls "$R26"/tmp/autopilot/run-*.jsonl | wc -l | tr -d ' ') run logs — expected 0 / 1"
+
+# A stop file already present at start stops before PLAN spends anything.
+R26C="$WORK/r26c"; new_repo "$R26C"
+touch "$R26C/tmp/STOP"
+run_loop "$R26C" progress true --stop-file tmp/STOP
+RC26C=$?
+[[ "$RC26C" -eq 6 ]] && ! grep -q "PLAN phase" "$WORK/r26c.calls" 2>/dev/null \
+  && ok "--stop-file: a stop file present at start exits 6 before the PLAN call" \
+  || note "--stop-file: pre-existing stop file exited $RC26C (or PLAN still ran) — expected 6 with no PLAN call"
+
+# --- 27. --state-dir + --resume-run: the prior run is found in the given dir -
+R27="$WORK/r27"; new_repo "$R27"
+S27="$R27/tmp/deliver/run1/issues/9"
+mkdir -p "$S27"
+mv "$R27/tmp/autopilot/PROMPT.md" "$S27/PROMPT.md"
+printf -- '- [ ] slice 1\n- [ ] slice 2\n\nSTATUS: in-progress\n' > "$S27/IMPLEMENTATION_PLAN.md"
+PRIOR27="20260101T000000Z-424242"
+# S2: a fixed past date would now also restore the time cap's start time and
+# trip a spurious time cap under --max-minutes 30 — irrelevant to what this
+# case tests (state-dir plumbing), so timestamped "now" like cases 12/12b.
+printf '{"ts":"%s","run_id":"%s","iter":2,"phase":"build","model":"sonnet","duration_s":1,"cost_usd":0.5,"input_tokens":0,"output_tokens":0,"exit_code":0,"verdict":"","holdout_failed":0}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PRIOR27" \
+  > "$S27/run-$PRIOR27.jsonl"
+( cd "$R27" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 999 \
+      --state-dir tmp/deliver/run1/issues/9 --resume-run \
+    >"$WORK/r27.out" 2>"$WORK/r27.err" )
+RC27=$?
+[[ "$RC27" -eq 2 && "$(jq -r '.run_id' "$S27/status.json" 2>/dev/null)" == "$PRIOR27" ]] \
+  && ok "--state-dir + --resume-run adopts the run log found in the given dir" \
+  || note "--state-dir + --resume-run exited $RC27, run '$(jq -r '.run_id' "$S27/status.json" 2>/dev/null)' — expected 2 and $PRIOR27"
+
+# --- 28. every call's cost reaches the budget, verifier calls included ------
+# The verifier used to be called as `VOUT="$(run_claude ...)"`: the subshell
+# logged its cost to the run log but dropped it from the in-memory total the
+# budget cap and status.json read. A five-slice run is 1 PLAN + 5 BUILD +
+# 5 verifier calls = 11 calls; at $0.10 each the total must be $1.10, not the
+# $0.60 that leaves the verifier out.
+R28="$WORK/r28"; new_repo "$R28"
+( cd "$R28" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_COST_PER_CALL=0.1 \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r28.out" 2>"$WORK/r28.err" )
+RC28=$?
+TOTAL28="$(jq -r '.total_cost_usd' "$R28/tmp/autopilot/status.json" 2>/dev/null)"
+LOGSUM28="$(cat "$R28"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase != "iteration") | .cost_usd // 0] | add')"
+[[ "$RC28" -eq 0 ]] && jq -en --argjson t "${TOTAL28:-0}" '($t - 1.1 | fabs) < 0.0001' >/dev/null 2>&1 \
+  && ok "status.json total cost counts all 11 calls, verifier included (\$$TOTAL28)" \
+  || note "status.json total cost is \$$TOTAL28 (exit $RC28) — expected \$1.1; verifier cost dropped?"
+jq -en --argjson t "${TOTAL28:-0}" --argjson l "${LOGSUM28:-0}" '($t - $l | fabs) < 0.0001' >/dev/null 2>&1 \
+  && ok "the in-memory total equals the run log's per-call sum (\$$LOGSUM28)" \
+  || note "in-memory total \$$TOTAL28 != run log per-call sum \$$LOGSUM28"
+
+# --- 29. --dry-run calls no model and logs no model rows --------------------
+# A preview run must spend nothing and leave the run log as small as before
+# agent.sh: no plan/build/verify_agent rows from calls that never happened.
+R29="$WORK/r29"; new_repo "$R29"
+( cd "$R29" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_CALL_LOG="$WORK/r29.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 --dry-run \
+    >"$WORK/r29.out" 2>"$WORK/r29.err" )
+[[ ! -s "$WORK/r29.calls" ]] \
+  && ok "--dry-run never invokes claude" \
+  || note "--dry-run invoked claude $(wc -l < "$WORK/r29.calls") time(s)"
+PHASES29="$(cat "$R29"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r '.phase' | sort -u | tr '\n' ' ')"
+case " $PHASES29 " in
+  *" plan "*|*" build "*|*" replan "*) note "--dry-run logged model-call rows: $PHASES29" ;;
+  *) ok "--dry-run logs no plan/build/replan rows (phases: ${PHASES29:-none})" ;;
+esac
+[[ "$(cat "$R29"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="verify_agent" and .duration_s > 0)] | length')" -eq 0 ]] \
+  && [[ "$(jq -r '.total_cost_usd' "$R29/tmp/autopilot/status.json" 2>/dev/null)" == "0" ]] \
+  && ok "--dry-run spends \$0 and records no timed verifier call" \
+  || note "--dry-run recorded a cost or a timed verifier call"
+
+# --- 30. the clock does not depend on `date` (#78) --------------------------
+# now_epoch used to be `date +%s || echo 0`: one failed `date` at startup made
+# START_EPOCH 0 and the first cap check exited 3 ("time cap") on a healthy
+# run. The stub `date` fails only its FIRST `+%s` read — the startup one —
+# and answers every later one, which is exactly the shape of that bug (a
+# `date` that always fails reads 0 twice and hides it).
+DATE_BIN="$WORK/brokendate"; mkdir -p "$DATE_BIN"
+REAL_DATE="$(command -v date)"
+cat > "$DATE_BIN/date" <<DATESTUB
+#!/bin/sh
+if [ "\$1" = "+%s" ] && [ ! -f "$WORK/date-failed-once" ]; then
+  : > "$WORK/date-failed-once"; exit 1
+fi
+exec "$REAL_DATE" "\$@"
+DATESTUB
+chmod +x "$DATE_BIN/date"; rm -f "$WORK/date-failed-once"
+R30="$WORK/r30"; new_repo "$R30"
+( cd "$R30" && PATH="$DATE_BIN:$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r30.out" 2>"$WORK/r30.err" )
+RC30=$?
+[[ "$RC30" -eq 0 ]] && ! grep -q 'time cap' "$WORK/r30.err" \
+  && ok "a \`date\` that fails once at startup no longer ends a healthy run as a time cap (exit 0)" \
+  || note "with a failing date: exit $RC30 — $(grep -m1 'cap\|clock' "$WORK/r30.err")"
+
+# --- 31. every model reply is kept in calls/ (#86) ---------------------------
+# The run log says an iteration failed; only the reply says why. A five-slice
+# run makes 1 PLAN + 5 BUILD + 5 verifier calls: eleven files, in order.
+R31="$WORK/r31"; new_repo "$R31"
+run_loop "$R31" progress true
+RC31=$?
+CALLS31="$(ls "$R31/tmp/autopilot/calls" 2>/dev/null | tr '\n' ' ')"
+[[ "$RC31" -eq 0 && "$(ls "$R31/tmp/autopilot/calls" | wc -l | tr -d ' ')" -eq 11 ]] \
+  && [[ "$CALLS31" == "001-plan.md 002-build.md 003-verify_agent.md "* ]] \
+  && grep -q '^"built"$\|^built$' "$R31/tmp/autopilot/calls/002-build.md" \
+  && ok "calls/ keeps all 11 replies of a five-slice run, numbered in call order" \
+  || note "calls/ after a five-slice run: exit $RC31, '$CALLS31'"
+
+# --- 32. S4: loop.sh auto-detects the verify command via detect_verify_cmd -
+# No --verify-cmd given — the runner must fall back to allowlist.sh's
+# detect_verify_cmd (S3) instead of the old inline package.json-only block.
+R32="$WORK/r32"; new_repo "$R32"
+mkdir -p "$R32/scripts"
+cat > "$R32/scripts/verify.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$R32/scripts/verify.sh"
+git -C "$R32" add -A >/dev/null 2>&1
+git -C "$R32" -c user.email=t@t.est -c user.name=test commit -q -m "add scripts/verify.sh"
+( cd "$R32" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32.out" 2>"$WORK/r32.err" )
+RC32=$?
+[[ "$RC32" -ne 1 ]] \
+  && ok "a scripts/verify.sh-only repo runs without --verify-cmd (exit $RC32, not 1)" \
+  || note "a scripts/verify.sh-only repo exited 1 without --verify-cmd — expected auto-detection"
+grep -q "verify='bash scripts/verify.sh'" "$WORK/r32.err" 2>/dev/null \
+  && ok "startup log reports verify='bash scripts/verify.sh'" \
+  || note "startup log missing verify='bash scripts/verify.sh': $(cat "$WORK/r32.err")"
+
+R32B="$WORK/r32b"; new_repo "$R32B"
+cat > "$R32B/Makefile" <<'EOF'
+verify:
+	@true
+EOF
+git -C "$R32B" add -A >/dev/null 2>&1
+git -C "$R32B" -c user.email=t@t.est -c user.name=test commit -q -m "add Makefile"
+( cd "$R32B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32b.out" 2>"$WORK/r32b.err" )
+RC32B=$?
+[[ "$RC32B" -ne 1 ]] \
+  && ok "a Makefile-only repo runs without --verify-cmd (exit $RC32B, not 1)" \
+  || note "a Makefile-only repo exited 1 without --verify-cmd — expected auto-detection"
+grep -q "verify='make verify'" "$WORK/r32b.err" 2>/dev/null \
+  && ok "startup log reports verify='make verify'" \
+  || note "startup log missing verify='make verify': $(cat "$WORK/r32b.err")"
+
+R32C="$WORK/r32c"; new_repo "$R32C"
+( cd "$R32C" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r32c.out" 2>"$WORK/r32c.err" )
+RC32C=$?
+[[ "$RC32C" -eq 1 ]] && grep -q "no verify command found" "$WORK/r32c.err" 2>/dev/null \
+  && ok "a repo with no detectable verify command still exits 1 with the expected message" \
+  || note "a repo with no verify command exited $RC32C — expected 1 with 'no verify command found'"
+
+# --- 33. S1 (#54): the runner owns the checkpoint commit and the secret ----
+# scan sees the whole iteration, committed or not ---------------------------
+# Both fixtures run a single iteration (--max-iterations 1): the WIP
+# checkpoint the runner makes even on a gate failure commits the secret into
+# history, so on a *second* iteration the same static content is no longer
+# "new" against that iteration's own ITER_BASE_SHA and the gate would (rightly)
+# stay quiet — the fixture only needs to prove iteration 1 itself caught it.
+#
+# (a) BUILD commits a secret itself (bypassing the runner's own checkpoint) —
+# still caught, because the scan diffs the index against ITER_BASE_SHA
+# (recorded before BUILD ran), not HEAD: `git diff HEAD` would see nothing
+# once BUILD's own commit moved HEAD to match the working tree.
+R33A="$WORK/r33a"; new_repo "$R33A"
+( cd "$R33A" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=commit \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r33a.out" 2>"$WORK/r33a.err" )
+RC33A=$?
+GATE33A="$(cat "$R33A"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC33A" -eq 2 && "$GATE33A" == "secret" ]] \
+  && ok "a secret committed by BUILD itself fails iteration 1's gate (gate_failed=secret)" \
+  || note "BUILD-committed secret: exit $RC33A (expected 2), gate_failed='$GATE33A'"
+grep -q "possible secret in diff" "$R33A/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "FEEDBACK.md names the secret finding for a BUILD-side commit" \
+  || note "FEEDBACK.md missing the secret finding: $(cat "$R33A/tmp/autopilot/FEEDBACK.md" 2>/dev/null)"
+
+# (b) BUILD leaves the secret in a new untracked file, never staged or
+# committed at all — a `git diff HEAD` would never see it at all (untracked
+# files never appear in a diff against HEAD); `git add -A` + `git diff
+# --cached ITER_BASE_SHA` must.
+R33B="$WORK/r33b"; new_repo "$R33B"
+( cd "$R33B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=untracked \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r33b.out" 2>"$WORK/r33b.err" )
+RC33B=$?
+GATE33B="$(cat "$R33B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC33B" -eq 2 && "$GATE33B" == "secret" ]] \
+  && ok "a secret left in a new untracked file fails iteration 1's gate (gate_failed=secret)" \
+  || note "untracked secret: exit $RC33B (expected 2), gate_failed='$GATE33B'"
+grep -q "possible secret in diff" "$R33B/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "FEEDBACK.md names the secret finding for an untracked secret file" \
+  || note "FEEDBACK.md missing the secret finding: $(cat "$R33B/tmp/autopilot/FEEDBACK.md" 2>/dev/null)"
+
+# (c) BUILD's own --allowedTools no longer grants git add/git commit — the
+# runner owns the checkpoint, not BUILD. Across the whole run, "Bash(git
+# add"/"Bash(git commit" could only ever have come from BUILD_ALLOWED_TOOLS —
+# PLAN's tool list has no Bash at all, and the verifier's has only git
+# diff/log/status — so a plain absence check over every call this run made
+# is enough to prove the grant is gone.
+grep -q 'ONE iteration of an autonomous BUILD loop' "$WORK/r1.calls" 2>/dev/null \
+  && ! grep -qE 'Bash\(git add|Bash\(git commit' "$WORK/r1.calls" \
+  && ok "BUILD_ALLOWED_TOOLS no longer grants git add/git commit" \
+  || note "BUILD's allowed-tools still mention git add/git commit: $(grep -oE 'Bash\(git [a-z]+:[^)]*\)' "$WORK/r1.calls" | sort -u | tr '\n' ' ')"
+grep -qF 'Do not run `git add` or `git commit`' "$WORK/r1.calls" 2>/dev/null \
+  && ok "the BUILD prompt tells BUILD the runner stages and commits the checkpoint" \
+  || note "the BUILD prompt doesn't mention the runner owning the commit"
+
+# --- 34. S2 (#54): the verifier diffs the whole iteration against ----------
+# ITER_BASE_SHA, not HEAD — a change BUILD committed itself must still be
+# visible to the verifier, exactly as it must to the secret scan (test 33a).
+R34="$WORK/r34"; new_repo "$R34"
+PRE_SHA_34="$(git -C "$R34" rev-parse HEAD)"
+( cd "$R34" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    STUB_BUILD_SELF_COMMIT_FILE="build-own-commit.txt" \
+    STUB_VERIFY_DIFF_LOG="$WORK/r34-verify.diff" STUB_CALL_LOG="$WORK/r34.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r34.out" 2>"$WORK/r34.err" )
+grep -qF "git diff --cached $PRE_SHA_34" "$WORK/r34.calls" 2>/dev/null \
+  && ok "the verifier's prompt names the pre-BUILD SHA (ITER_BASE_SHA), not HEAD" \
+  || note "verifier prompt doesn't name $PRE_SHA_34: $(grep -oE 'git diff[^\`]*' "$WORK/r34.calls" 2>/dev/null | sort -u | tr '\n' ' ')"
+grep -qF "build-own-commit.txt" "$WORK/r34-verify.diff" 2>/dev/null \
+  && ok "running the prompt's own diff command shows the file BUILD committed itself" \
+  || note "the prompt's diff command missed BUILD's own commit: $(cat "$WORK/r34-verify.diff" 2>/dev/null)"
+FC34="$(jq -s '[.[] | select(.phase=="iteration")][0].files_changed // -1' "$R34"/tmp/autopilot/run-*.jsonl 2>/dev/null)"
+WANT34="$(git -C "$R34" diff --stat "$PRE_SHA_34" HEAD 2>/dev/null | grep -c '|')"
+[[ "${WANT34:-0}" -ge 2 && "$FC34" == "$WANT34" ]] \
+  && ok "the iteration row's files_changed counts BUILD's own commit too ($FC34 = the whole iteration's diff from ITER_BASE_SHA)" \
+  || note "files_changed=$FC34, but the iteration changed $WANT34 file(s) since ITER_BASE_SHA"
+
+# --- 35. secret_scan() ignores unchanged lines shown only as diff context --
+# (regression, found dogfooding S1/S2 on this very repo: a plan-adjacent test
+# edit landed within 3 lines of an already-committed AKIA-pattern fixture
+# line and tripped the gate even though that line itself was untouched).
+# secret_scan() must judge the actual change, not everything unified diff
+# context reprints around it.
+R35="$WORK/r35"; new_repo "$R35"
+printf -- '- [ ] slice 1\n\nSTATUS: in-progress\n' > "$R35/tmp/autopilot/IMPLEMENTATION_PLAN.md"
+printf 'unrelated line\ntoken = "AKIAABCDEFGHIJKLMNOP"\nunrelated line\n' > "$R35/config.txt"
+git -C "$R35" add config.txt >/dev/null 2>&1
+git -C "$R35" -c user.email=t@t.est -c user.name=test commit -q -m "add config.txt fixture"
+( cd "$R35" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=nearby \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r35.out" 2>"$WORK/r35.err" )
+RC35=$?
+GATE35="$(cat "$R35"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC35" -eq 0 && "$GATE35" == "none" ]] \
+  && ok "an edit merely near a pre-existing secret-looking line (diff context) does not fail the gate" \
+  || note "edit near a pre-existing secret line: exit $RC35 (expected 0), gate_failed='$GATE35', FEEDBACK='$(cat "$R35/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 35b. secret_scan() ignores removed lines too (#94) -------------------
+R35B="$WORK/r35b"; new_repo "$R35B"
+printf -- '- [ ] slice 1\n\nSTATUS: in-progress\n' > "$R35B/tmp/autopilot/IMPLEMENTATION_PLAN.md"
+# The fixture key is assembled at runtime so this test file's own added lines
+# don't trip the very secret scan it exercises.
+FAKE35B="AKIA""ABCDEFGHIJKLMNOP"
+printf 'unrelated line\ntoken = "%s"\nunrelated line\n' "$FAKE35B" > "$R35B/config.txt"
+git -C "$R35B" add config.txt >/dev/null 2>&1
+git -C "$R35B" -c user.email=t@t.est -c user.name=test commit -q -m "add config.txt fixture"
+( cd "$R35B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=removed \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r35b.out" 2>"$WORK/r35b.err" )
+RC35B=$?
+GATE35B="$(cat "$R35B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC35B" -eq 0 && "$GATE35B" == "none" ]] \
+  && ok "removing a pre-existing secret-looking line (a '-' diff line) does not fail the gate" \
+  || note "removed secret line: exit $RC35B (expected 0), gate_failed='$GATE35B'"
+
+# --- 36. The gates fail closed when the runner cannot stage the iteration ---
+# (#54 review): a failed `git add -A` must not let the secret scan and the
+# verifier read a partial index as "clean".
+R36="$WORK/r36"; new_repo "$R36"
+( cd "$R36" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=lockindex \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r36.out" 2>"$WORK/r36.err" )
+GATE36="$(cat "$R36"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+rm -f "$R36/.git/index.lock"
+[[ "$GATE36" == "stage" ]] && grep -q 'could not stage the iteration' "$R36/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "a failed git add -A fails the iteration (gate_failed=stage) instead of passing the gates on a partial index" \
+  || note "held index lock: gate_failed='$GATE36', FEEDBACK='$(cat "$R36/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 37. Files the verify command writes are scanned too ------------------------
+# The runner stages again after GATE b: a secret in generated, non-ignored
+# output would otherwise ride into the checkpoint commit unscanned.
+R37="$WORK/r37"; new_repo "$R37"
+( cd "$R37" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd 'printf "token = \"AKIAABCDEFGHIJKLMNOP\"\n" > generated.txt' \
+    --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r37.out" 2>"$WORK/r37.err" )
+GATE37="$(cat "$R37"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$GATE37" == "secret" ]] \
+  && ok "a secret the verify command wrote into a non-ignored file fails the secret gate" \
+  || note "verify-written secret: gate_failed='$GATE37'"
+
+# --- 38. A BUILD that runs out of --max-turns is named as such (#96) ---------
+R38="$WORK/r38"; new_repo "$R38"
+( cd "$R38" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_BUILD_MAX_TURNS=1 \
+    STUB_CALL_LOG="$WORK/r38.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 --max-turns 42 \
+    >"$WORK/r38.out" 2>"$WORK/r38.err" )
+BUILD38="$(cat "$R38"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs '[.[] | select(.phase=="build")][0].verdict' 2>/dev/null)"
+ITER38="$(cat "$R38"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rcs '[.[] | select(.phase=="iteration")][0] | [.turn_limit, .gate_failed] | join(" ")' 2>/dev/null)"
+grep -q -- '--max-turns 42' "$WORK/r38.calls" \
+  && ok "--max-turns reaches claude -p" \
+  || note "--max-turns 42 not in the calls: $(grep -oE -- '--max-turns [0-9]+' "$WORK/r38.calls" | sort -u | tr '\n' ' ')"
+[[ "$BUILD38" == "turn-limit" && "$ITER38" == "true turn-limit" ]] \
+  && grep -q 'BUILD ran out of turns (--max-turns 42)' "$R38/tmp/autopilot/FEEDBACK.md" \
+  && ok "an error_max_turns BUILD reply is logged as turn-limit (call row, iteration row, FEEDBACK)" \
+  || note "turn limit: build verdict='$BUILD38', iteration='$ITER38', FEEDBACK='$(head -c 300 "$R38/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+R39="$WORK/r39"; new_repo "$R39"
+( cd "$R39" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_BUILD_MAX_TURNS=1 \
+    bash "$LOOP_ABS" --verify-cmd false --max-iterations 1 --max-minutes 30 --budget-usd 5 --max-turns 42 \
+    >"$WORK/r39.out" 2>"$WORK/r39.err" )
+ITER39="$(cat "$R39"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rcs '[.[] | select(.phase=="iteration")][0] | [.turn_limit, .gate_failed] | join(" ")' 2>/dev/null)"
+[[ "$ITER39" == "true verify_cmd" ]] && grep -q 'BUILD also ran out of turns' "$R39/tmp/autopilot/FEEDBACK.md" \
+  && ok "a turn-limited BUILD whose work fails verify keeps gate_failed=verify_cmd, turn_limit:true, and FEEDBACK names the turn limit" \
+  || note "turn limit + red verify: iteration='$ITER39', FEEDBACK='$(head -c 300 "$R39/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 38b. A slice that keeps hitting the turn limit is not escalated (#101) ----
+# Same shape as test 20, but every BUILD ends on error_max_turns: rung 2 must
+# stay on --build-model (a stronger model hits the same cap), say why in the
+# run log and FEEDBACK, and leave the rest of the ladder (park) as it was.
+R38B="$WORK/r38b"; new_repo "$R38B"
+cat > "$R38B/tmp/autopilot/IMPLEMENTATION_PLAN.md" <<'EOF'
+- [ ] A — too large for one call (after: —)
+
+STATUS: in-progress
+EOF
+( cd "$R38B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_BUILD_MAX_TURNS=1 \
+    STUB_CALL_LOG="$WORK/r38b.calls" STUB_FEEDBACK_LOG="$WORK/r38b.feedback" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 3 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r38b.out" 2>"$WORK/r38b.err" )
+MODELS38B="$(cat "$R38B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="build") | .model' 2>/dev/null | tr '\n' ',')"
+SKIP38B="$(cat "$R38B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -r 'select(.phase=="escalation") | .verdict' 2>/dev/null | head -1)"
+[[ "$MODELS38B" == "sonnet,sonnet,sonnet," && "$SKIP38B" == "skipped-turn-limit" ]] \
+  && ! grep -q -- '--model opus' "$WORK/r38b.calls" \
+  && grep -q 'not escalating to opus' "$WORK/r38b.err" \
+  && awk '/^=== build/{n++} n==3' "$WORK/r38b.feedback" | grep -q 'Not escalated to opus' \
+  && ok "a slice whose last failure was a turn limit stays on --build-model (no opus call), and the skip is logged" \
+  || note "turn-limit escalation: models='$MODELS38B', escalation row='$SKIP38B', opus calls=$(grep -c -- '--model opus' "$WORK/r38b.calls" 2>/dev/null)"
+
+# --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
+# /deliver hands autopilot an issue that is already a slice: a small plan, and
+# the full verify once, at completion.
+R40="$WORK/r40"; new_repo "$R40"
+run_loop "$R40" progress true --plan-max-items 2
+[[ $? -eq 0 ]] && grep -q 'most 2 items' "$WORK/r40.calls" && grep -q 'ONE issue, already sized' "$WORK/r40.calls" \
+  && ok "--plan-max-items puts the size hint into the PLAN prompt" \
+  || note "--plan-max-items hint missing from the PLAN prompt"
+grep -q 'ONE issue, already sized' "$WORK/r1.calls" \
+  && note "the size hint appears without --plan-max-items" \
+  || ok "without --plan-max-items the PLAN prompt is unchanged"
+
+R41="$WORK/r41"; new_repo "$R41"
+run_loop "$R41" progress "echo x >> '$WORK/r41.verify-count'" --verify-at-completion
+RC41=$?
+VERDICTS41="$(cat "$R41"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="verify_cmd") | .verdict' | sort | uniq -c | tr -s ' ' | tr '\n' ',')"
+[[ "$RC41" -eq 0 && "$(wc -l < "$WORK/r41.verify-count" | tr -d ' ')" -eq 1 ]] \
+  && [[ "$VERDICTS41" == " 4 deferred, 1 pass," ]] \
+  && ok "--verify-at-completion: a five-item run runs the full verify once, at completion (4 deferred, 1 pass)" \
+  || note "--verify-at-completion: exit $RC41, verify ran $(wc -l < "$WORK/r41.verify-count" 2>/dev/null) time(s), verdicts '$VERDICTS41', stderr: $(tail -3 "$WORK/r41.err" | tr '\n' '|')"
+grep -q 'Do NOT run the full verify command' "$WORK/r41.calls" && ! grep -q 'Run the verify command:' "$WORK/r41.calls" \
+  && ok "--verify-at-completion: BUILD is told to run its item's tests, not the full verify" \
+  || note "--verify-at-completion: BUILD prompt still asks for the full verify"
+[[ "$(jq -r '.verify_deferred' "$R41/tmp/autopilot/status.json" 2>/dev/null)" == "4" \
+   && "$(jq -r '.verify_deferred' "$R1/tmp/autopilot/status.json" 2>/dev/null)" == "0" ]] \
+  && ok "status.json counts deferred gate-(b) runs (verify_deferred: 4 here, 0 in a bare run)" \
+  || note "verify_deferred: '$(jq -r '.verify_deferred' "$R41/tmp/autopilot/status.json" 2>/dev/null)' with deferral, '$(jq -r '.verify_deferred' "$R1/tmp/autopilot/status.json" 2>/dev/null)' without"
+
+# A completion whose full verify fails is not done: back to work, then done.
+R42="$WORK/r42"; new_repo "$R42"
+run_loop "$R42" progress "n=\$(cat '$WORK/r42.n' 2>/dev/null || echo 0); echo \$((n+1)) > '$WORK/r42.n'; [ \$n -ge 1 ]" --verify-at-completion
+RC42=$?
+[[ "$RC42" -eq 0 && "$(cat "$WORK/r42.n")" -eq 2 ]] \
+  && [[ "$(cat "$R42"/tmp/autopilot/run-*.jsonl | jq -r 'select(.phase=="iteration") | .verdict' | tail -2 | tr '\n' ' ')" == "fail done " ]] \
+  && ok "--verify-at-completion: a failing completion verify sends the run back, the next completion finishes it" \
+  || note "failing completion verify: exit $RC42, verify ran $(cat "$WORK/r42.n" 2>/dev/null) time(s), stderr: $(tail -3 "$WORK/r42.err" | tr '\n' '|')"
+
+R43="$WORK/r43"; new_repo "$R43"
+run_loop "$R43" progress "echo full >> '$WORK/r43.count'" --verify-at-completion --iteration-verify-cmd "echo quick >> '$WORK/r43.count'"
+RC43=$?
+[[ "$RC43" -eq 0 && "$(sort "$WORK/r43.count" | uniq -c | tr -s ' ' | tr '\n' ',')" == " 1 full, 4 quick," ]] \
+  && ok "--iteration-verify-cmd runs on every other iteration, the full verify once" \
+  || note "--iteration-verify-cmd: exit $RC43, runs: $(sort "$WORK/r43.count" 2>/dev/null | uniq -c | tr '\n' ','), stderr: $(tail -3 "$WORK/r43.err" | tr '\n' '|'), status: $(cat "$R43/tmp/autopilot/status.json" 2>/dev/null)"
+R43B="$WORK/r43b"; new_repo "$R43B"
+run_loop "$R43B" progress true --iteration-verify-cmd true
+RC43B=$?
+R43C="$WORK/r43c"; new_repo "$R43C"
+run_loop "$R43C" progress true --plan-max-items 0
+RC43C=$?
+[[ "$RC43B" -eq 1 && "$RC43C" -eq 1 ]] \
+  && ok "--iteration-verify-cmd without --verify-at-completion and --plan-max-items 0 are refused" \
+  || note "flag validation: exit $RC43B / $RC43C — expected 1 / 1"
+
+# --- 44. a timed-out call records an unknown cost, not zero ----------------
+# The stub sleeps past --per-call-timeout 1, so `timeout` kills every call.
+R44="$WORK/r44"; new_repo "$R44"
+( cd "$R44" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SLEEP=3 \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+      --per-call-timeout 1 >"$WORK/r44.out" 2>"$WORK/r44.err" )
+[[ "$(cat "$R44"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase!="iteration" and .cost_unknown==true)] | length')" -ge 1 ]] \
+  && ok "a timed-out call's run-log row carries cost_unknown:true" \
+  || note "no cost_unknown:true row after a timeout: $(cat "$R44"/tmp/autopilot/run-*.jsonl 2>/dev/null | head -3)"
+[[ "$(jq -r '.cost_unknown_calls' "$R44/tmp/autopilot/status.json" 2>/dev/null)" -ge 1 ]] \
+  && ok "status.json counts the unknown-cost calls (cost_unknown_calls)" \
+  || note "status.json cost_unknown_calls: $(cat "$R44/tmp/autopilot/status.json" 2>/dev/null)"
+[[ "$(cat "$R1"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.cost_unknown==true)] | length')" -eq 0 \
+   && "$(jq -r '.cost_unknown_calls' "$R1/tmp/autopilot/status.json")" == "0" ]] \
+  && ok "a run with no timeout has cost_unknown_calls 0 and no unknown rows" \
+  || note "a clean run reports unknown-cost calls"
+
+# report.sh names the unknown-cost calls per day and model.
+RU="$WORK/report-unknown"; mkdir -p "$RU"
+printf '%s\n' '{"ts":"2026-09-01T10:00:00Z","run_id":"20260901T100000Z-1","iter":1,"phase":"build","model":"sonnet","cost_usd":0,"cost_unknown":true}' \
+  '{"ts":"2026-09-01T11:00:00Z","run_id":"20260901T100000Z-1","iter":1,"phase":"plan","model":"sonnet","cost_usd":0.1,"cost_unknown":false}' > "$RU/run-20260901T100000Z-1.jsonl"
+bash "$REPORT_ABS" "$RU" 2>/dev/null | grep -q '2026-09-01 | sonnet | 1 call(s) with unknown cost' \
+  && ok "report.sh prints the count of calls with unknown cost per day/model" \
+  || note "report.sh did not print the unknown-cost count"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

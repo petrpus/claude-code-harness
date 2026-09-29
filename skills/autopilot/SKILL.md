@@ -31,7 +31,12 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 ## How to run
 
 1. **Provision a verify command** if the project has none: `/project-infra verify`.
-   The loop refuses to start without an objective gate.
+   The loop refuses to start without an objective gate. Absent `--verify-cmd`,
+   `detect_verify_cmd` (`allowlist.sh`) picks one for you, in order: a
+   `package.json` with a `scripts.verify` entry (`pnpm verify` if
+   `pnpm-lock.yaml` exists, else `npm run verify`) → `scripts/verify.sh`
+   (`bash scripts/verify.sh`) → a `Makefile`/`makefile`/`GNUmakefile` with a
+   `verify:` target (`make verify`) → none found, which is a startup error.
 2. **Scaffold the charter.** Create `tmp/autopilot/PROMPT.md` from
    `PROMPT.template.md` — derive it from a PRD or issue, and fill in the source
    link and acceptance criteria (these are mandatory; they're what the verifier
@@ -53,8 +58,13 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    `--plan-model` / `--build-model` / `--verify-model` / `--escalate-model`,
    the last accepting `none` to disable escalation outright). `--dry-run` prints the
    plan of calls without spending. `--resume-run` continues an interrupted run,
-   adopting its prior run id, iteration count and accumulated cost from disk
-   (R1) instead of starting over at iteration 0 / cost 0. `--holdout <path>`
+   adopting its prior run id, iteration count, accumulated cost and start time
+   from disk (R1) instead of starting over at iteration 0 / cost 0 / now. Cost
+   is summed excluding `phase:"iteration"` rows, so a prior run's per-iteration
+   summary rows never get added on top of the per-call rows that made them up
+   (no double-counting); the start time is restored from the earliest `ts` in
+   the prior run log, so `--max-minutes` keeps measuring from the run's
+   original start, not from the moment it was resumed. `--holdout <path>`
    overrides the default holdout location
    (`${XDG_STATE_HOME:-$HOME/.local/state}/autopilot/<run-id>/HOLDOUT.md`);
    omit it and a missing file just disables gate (e). Every BUILD prompt also
@@ -69,8 +79,28 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
    `--extra-allowed-tools <list>` appends to BUILD's `--allowedTools`
    allowlist for a project that needs one more command.
 
+   `--state-dir <dir>` (default `tmp/autopilot`) moves every state file —
+   charter, plan, memory, feedback, status, run log, lock — to another
+   directory; `/deliver` uses one per issue. A relative path resolves against
+   the repo root, and the runner refuses a directory inside the repo that git
+   does not ignore (checkpoints are `git add -A`). `--stop-file <path>` asks
+   for a graceful stop: the runner checks it at every iteration boundary and,
+   once the file exists, lets the current iteration finish and exits 6 with
+   state `stopped`. It never deletes the file — remove it, then `--resume-run`
+   continues the same run.
+
+   Pacing for a charter that is already one PR-sized slice (what `/deliver`
+   hands over): `--plan-max-items <n>` tells PLAN and replan to plan at most n
+   items and to fold documentation into the item it documents, because every
+   item costs a whole iteration. `--verify-at-completion` runs the verify
+   command only on the iteration that completes the plan; the others run
+   `--iteration-verify-cmd <cmd>` if given (a cheap check), otherwise no
+   machine verify, and BUILD proves its item with the tests that cover it. A
+   completion whose verify fails goes back to work like any other failure. In
+   the live runs a full verify per item was most of each ~15-minute iteration.
+
    If this repo *is* the autopilot harness's own source, a slice can
-   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — the runner
+   legitimately be to fix `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh` — the runner
    notices its own sourced files changed on disk and re-execs itself under the
    same run id before the next iteration (R1), so a live run picks up the fix
    without a human restart. See `LOOP-PROTOCOL.md` § Runner self-reload.
@@ -93,7 +123,7 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 
 1. `STATUS: done` sentinel in the plan.
 2. **Machine verify** (gate b) — the runner executes the verify command itself.
-3. **Secret scan** (gate c) — the iteration diff is grepped for keys/tokens/private keys.
+3. **Secret scan** (gate c) — the iteration diff's added lines are grepped for keys/tokens/private keys.
 4. **Semantic verify** (gate d) — haiku runs `agents/verifier.md` adversarially
    against the diff (the 17-shortcuts checklist).
 5. **Holdout** (gate e) — when `--holdout <path>` (or its default location) points
@@ -108,12 +138,15 @@ from a generic semantic-verify failure (`verify_agent`), so stuck detection can
 tell them apart. Stuck detection is the five-rung ladder (S4A/S4B, `slices.sh`,
 `docs/adr/0005-*.md`): a slice retries on its 1st failure, runs its next BUILD
 on `--escalate-model` after its 2nd (back to `--build-model` once it ticks;
-`--escalate-model none` skips straight to another retry), is parked on its
+not when that failure was a turn limit — a stronger model hits the same
+`--max-turns` cap; `--escalate-model none` skips straight to another retry), is parked on its
 3rd (a sibling runs instead), and once every remaining slice is parked or
 blocked a single replan unparks everything — a second failure after that
 replan aborts. A plan with no real slice ids falls back to the pre-S4A rule
 verbatim (same fingerprint twice → replan, third time → abort).
-Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck.
+Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck ·
+6 stopped (`--stop-file`) · 1 precondition error. Budget cap and stuck share 4;
+`status.json .state` (`budget-cap` vs `stuck`) tells them apart.
 
 Gate (d) parses the verifier's output three ways, not just pass/fail: a reply
 that isn't a JSON object with a boolean `.pass` (refusal prose, a clarifying
@@ -144,11 +177,10 @@ stay active (they fire in headless mode too), so the push-from-main and
 devcontainer (`/project-infra devcontainer`). Before opening a PR, do a manual
 `/security-review` pass — the loop's secret scan is a floor, not a full audit.
 
-**Opt-in Stop gate.** For a run, autopilot MAY register
-`templates/require-verify-before-stop.sh` as a Stop hook in the project's
-`.claude/settings.json` — the deterministic verification tier (ADR-0002), so a
-turn cannot end on a stale or failing verify. If it does, it **MUST remove that
-hook entry on run end** (success or abort), leaving the project's Stop config
-exactly as it found it. The runner's own machine-verify gate is unaffected
-either way; the Stop gate only adds belt-and-suspenders for the interactive
-iterations.
+**Manual Stop gate (not wired into the runner).** `loop.sh` registers no Stop
+hook; its own machine-verify gate is what protects a run. For extra
+belt-and-suspenders on interactive iterations you can enable
+`templates/require-verify-before-stop.sh` yourself as a Stop hook in the
+project's `.claude/settings.json` (the deterministic verification tier,
+ADR-0002) and remove it when the run ends, leaving the project's Stop config as
+you found it.

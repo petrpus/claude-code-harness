@@ -5,7 +5,7 @@
 # hard verify gates, iteration/time/budget caps, per-call timeout, git
 # checkpointing, stuck-detection, a concurrency lock, and a structured JSONL
 # run log. Each iteration is a FRESH `claude -p` session — state lives on disk
-# in tmp/autopilot/, never in a growing context window.
+# in tmp/autopilot/ (or --state-dir), never in a growing context window.
 #
 # See LOOP-PROTOCOL.md for the full protocol and safety rationale.
 #
@@ -15,9 +15,12 @@
 #           [--verify-cmd '<cmd>'] [--max-turns 80] [--per-call-timeout 1200]
 #           [--extra-allowed-tools '<csv>'] [--holdout '<path>']
 #           [--escalate-model opus|none] [--no-repo-map] [--resume-run] [--dry-run]
+#           [--state-dir tmp/autopilot] [--stop-file '<path>']
+#           [--plan-max-items <n>] [--verify-at-completion] [--iteration-verify-cmd '<cmd>']
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
-#             cap · 1 runner error (bad preconditions, missing deps).
+#             cap · 6 stopped (--stop-file appeared) · 1 runner error (bad
+#             preconditions, missing deps).
 
 set -uo pipefail
 
@@ -36,16 +39,14 @@ PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERIFIER_AGENT="$PLUGIN_ROOT/agents/verifier.md"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
+# Where the run keeps its state. Every state path is derived from it after the
+# option parser below, so --state-dir can move all of them at once — /deliver
+# runs one autopilot per issue, each in its own directory.
 STATE_DIR="tmp/autopilot"
-PROMPT_FILE="$STATE_DIR/PROMPT.md"
-PLAN_FILE="$STATE_DIR/IMPLEMENTATION_PLAN.md"
-MEMORY_FILE="$STATE_DIR/MEMORY.md"
-FEEDBACK_FILE="$STATE_DIR/FEEDBACK.md"
-STATUS_FILE="$STATE_DIR/status.json"
-LOCK_FILE="$STATE_DIR/lock"
-# S4A: runner-owned per-slice ladder state — written and read only by
-# loop.sh, never named in any prompt (skills/autopilot/slices.sh).
-SLICES_FILE="$STATE_DIR/slices.json"
+STOP_FILE=""
+PLAN_MAX_ITEMS=""        # empty: no size hint to PLAN
+VERIFY_AT_COMPLETION=0   # 1: full verify only when the plan completes
+ITERATION_VERIFY_CMD=""  # cheap per-iteration check under --verify-at-completion
 
 # Defaults (all overridable).
 MAX_ITERATIONS=10
@@ -66,7 +67,11 @@ REPO_MAP_ENABLED=1
 # reproducing S4A's own "rung 2 is just another retry" behaviour exactly.
 ESCALATE_MODEL=opus
 
-BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
+# No `git add`/`git commit` here: the runner owns the iteration's checkpoint
+# commit (ITER_BASE_SHA, below) so the secret scan and the verifier see the
+# whole iteration, including anything BUILD would otherwise have committed
+# out from under them.
+BUILD_ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Bash(npm run:*),Bash(npm test:*),Bash(pnpm:*),Bash(npx:*),Bash(node:*),Bash(tsx:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)"
 VERIFY_ALLOWED_TOOLS="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git status:*)"
 
 log_err() { echo "autopilot: $*" >&2; }
@@ -88,7 +93,12 @@ while [[ $# -gt 0 ]]; do
     --no-repo-map)       REPO_MAP_ENABLED=0; shift ;;
     --resume-run)       RESUME=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
-    -h|--help)          sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --state-dir)        STATE_DIR="$2"; shift 2 ;;
+    --stop-file)        STOP_FILE="$2"; shift 2 ;;
+    --plan-max-items)   PLAN_MAX_ITEMS="$2"; shift 2 ;;
+    --verify-at-completion) VERIFY_AT_COMPLETION=1; shift ;;
+    --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
+    -h|--help)          sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) log_err "unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -102,17 +112,62 @@ command -v jq     >/dev/null 2>&1 || { log_err "'jq' is required (parses claude 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_err "not inside a git repo"; exit 1; }
 cd "$(git rev-parse --show-toplevel)" || { log_err "cannot cd to repo root"; exit 1; }
 
+# Relative --state-dir / --stop-file paths resolve against the repo root, not
+# the caller's cwd: an R1 reload re-execs with the original argv from here, so
+# resolving them anywhere else would move the state mid-run.
+while [[ "$STATE_DIR" == */ && "$STATE_DIR" != / ]]; do STATE_DIR="${STATE_DIR%/}"; done
+[[ -n "$STATE_DIR" ]] || { log_err "--state-dir must not be empty"; exit 1; }
+PROMPT_FILE="$STATE_DIR/PROMPT.md"
+PLAN_FILE="$STATE_DIR/IMPLEMENTATION_PLAN.md"
+MEMORY_FILE="$STATE_DIR/MEMORY.md"
+FEEDBACK_FILE="$STATE_DIR/FEEDBACK.md"
+STATUS_FILE="$STATE_DIR/status.json"
+LOCK_FILE="$STATE_DIR/lock"
+# S4A: runner-owned per-slice ladder state — written and read only by
+# loop.sh, never named in any prompt (skills/autopilot/slices.sh).
+SLICES_FILE="$STATE_DIR/slices.json"
+
+# agent_run() knobs (agent.sh), from this run's flags.
+AGENT_TIMEOUT="$PER_CALL_TIMEOUT"
+AGENT_MAX_TURNS="$MAX_TURNS"
+AGENT_DRY_RUN="$DRY_RUN"
+AGENT_STDERR_LOG="$STATE_DIR/claude-stderr.log"
+# Every model reply is kept (calls/<seq>-<phase>.md): the run log records
+# that an iteration failed, the reply says why (#86).
+AGENT_TRANSCRIPT_DIR="$STATE_DIR/calls"
+
+# Every checkpoint is `git add -A`, so a state dir git does not ignore would
+# commit the run's own charter, plan, logs and lock into the branch under
+# work. A dir outside the repo is git's business not at all (check-ignore
+# exits 128 there), so only "inside and not ignored" (exit 1) is refused.
+git check-ignore -q "$STATE_DIR/.autopilot-probe" 2>/dev/null
+if [[ $? -eq 1 ]]; then
+  log_err "state dir '$STATE_DIR' is not gitignored — checkpoint commits would include the run's own state."
+  log_err "Ignore it (e.g. add 'tmp/' to .gitignore) or pass a --state-dir that is."
+  exit 1
+fi
+
 BRANCH="$(git branch --show-current 2>/dev/null || echo '')"
 if [[ "$BRANCH" == "main" || "$BRANCH" == "master" || -z "$BRANCH" ]]; then
   log_err "refusing to run on '$BRANCH'. Check out a feature branch first."
   exit 1
 fi
 
+# "Nothing broader" is the whole point, so the prefix grant is conditional —
+# see allowlist.sh, which owns the derivation (detect_verify_cmd, verify_grants)
+# so it can be tested on its own.
+# shellcheck source=allowlist.sh
+. "$SCRIPT_DIR/allowlist.sh"
+
 # Auto-detect a verify command if none was given.
 if [[ -z "$VERIFY_CMD" ]]; then
-  if [[ -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
-    if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
-  fi
+  VERIFY_CMD="$(detect_verify_cmd || true)"
+fi
+if [[ -n "$PLAN_MAX_ITEMS" && ! "$PLAN_MAX_ITEMS" =~ ^[1-9][0-9]*$ ]]; then
+  log_err "--plan-max-items takes a positive whole number"; exit 1
+fi
+if [[ -n "$ITERATION_VERIFY_CMD" && "$VERIFY_AT_COMPLETION" -ne 1 ]]; then
+  log_err "--iteration-verify-cmd only applies with --verify-at-completion"; exit 1
 fi
 if [[ -z "$VERIFY_CMD" ]]; then
   log_err "no verify command found and --verify-cmd not given."
@@ -125,11 +180,6 @@ fi
 # script (./scripts/verify.sh, make verify, …) would have that call *denied*,
 # leaving BUILD unable to prove a slice before ticking it. Grant exactly the
 # resolved verify command, nothing broader.
-#
-# "Nothing broader" is the whole point, so the prefix grant is conditional —
-# see allowlist.sh, which owns the derivation so it can be tested on its own.
-# shellcheck source=allowlist.sh
-. "$SCRIPT_DIR/allowlist.sh"
 # select_next_slice() over the Plan DAG (docs/adr/0005-*.md) — own file so it's
 # unit-testable without a run (scripts/verify.sh exercises it directly).
 # shellcheck source=plan.sh
@@ -138,9 +188,12 @@ fi
 # file, same reasoning as plan.sh/allowlist.sh.
 # shellcheck source=slices.sh
 . "$SCRIPT_DIR/slices.sh"
+# The model-call core (claude -p + timeout + JSON parse), shared with /deliver.
+# shellcheck source=agent.sh
+. "$SCRIPT_DIR/agent.sh"
 
 # R1: bash parses this script's function bodies once, at startup — a slice
-# whose job is to fix loop.sh/plan.sh/allowlist.sh/slices.sh therefore never
+# whose job is to fix loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh therefore never
 # changes the behaviour of the very process running it, only the next run a
 # human starts by hand. runner_files_hash() lets each iteration notice its own
 # sourced files changed on disk since startup and re-exec itself (see the
@@ -149,7 +202,7 @@ fi
 # a clock skew — never triggers a spurious reload.
 runner_files_hash() {
   local f
-  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh" "$SCRIPT_DIR/slices.sh"; do
+  { for f in "$SCRIPT_DIR/loop.sh" "$SCRIPT_DIR/plan.sh" "$SCRIPT_DIR/allowlist.sh" "$SCRIPT_DIR/slices.sh" "$SCRIPT_DIR/agent.sh"; do
       [[ -f "$f" ]] && cat "$f"
     done
   } | cksum
@@ -189,14 +242,19 @@ mkdir -p "$STATE_DIR"
 
 # Run identity: fresh, resumed (--resume-run — a human restarting a killed or
 # stopped process), or reloaded (R1 — this exact process re-exec'ing itself
-# after a slice edited loop.sh/plan.sh/allowlist.sh/slices.sh; the AUTOPILOT_* vars are
+# after a slice edited loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh; the AUTOPILOT_* vars are
 # its own handoff to itself, set right before the exec at the top of the main
 # loop below). A reload always wins when both are present, since it also
 # appends --resume-run to argv.
+RESTORED_START_EPOCH=""
 if [[ -n "${AUTOPILOT_RUN_ID:-}" ]]; then
   RUN_ID="$AUTOPILOT_RUN_ID"
   ITER="${AUTOPILOT_ITER:-0}"
   TOTAL_COST="${AUTOPILOT_TOTAL_COST:-0}"
+  # R1 hands its own already-resolved START_EPOCH across the re-exec — this
+  # process must keep measuring --max-minutes from the ORIGINAL start, not
+  # reset it to "now" just because a reload happened mid-run.
+  RESTORED_START_EPOCH="${AUTOPILOT_START_EPOCH:-}"
 elif [[ "$RESUME" -eq 1 ]]; then
   # Adopt the most recent run's identity instead of silently starting a new
   # run at iteration 0 / cost 0 — until this fix, `--resume-run` only relaxed
@@ -207,7 +265,14 @@ elif [[ "$RESUME" -eq 1 ]]; then
   if [[ -n "$LATEST_LOG" ]]; then
     RUN_ID="$(basename "$LATEST_LOG" .jsonl)"; RUN_ID="${RUN_ID#run-}"
     ITER="$(jq -s 'map(.iter // 0) | max // 0' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
-    TOTAL_COST="$(jq -s '[.[].cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+    TOTAL_COST="$(jq -s '[.[] | select(.phase!="iteration") | .cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
+    # #78's time cap must survive a resume too — restore the run's original
+    # start time from the earliest ts in its own log rather than the current
+    # clock, which is what made --max-minutes reset on every manual restart.
+    # `select(. != null)` drops any row whose ts fails fromdateiso8601 (a
+    # corrupt line) before taking the min, so one bad row can't poison the
+    # whole restore; the plausibility check below still has the final say.
+    RESTORED_START_EPOCH="$(jq -s 'map(.ts | fromdateiso8601?) | map(select(. != null)) | min' "$LATEST_LOG" 2>/dev/null)"
   else
     # No prior log to resume from — missing state is never an error
     # (contract item 8), so this behaves like a fresh run.
@@ -222,7 +287,7 @@ else
 fi
 [[ "${AUTOPILOT_LOCK_OWNED:-0}" -eq 1 ]] || echo "$$ $RUN_ID" > "$LOCK_FILE"
 RUN_LOG="$STATE_DIR/run-$RUN_ID.jsonl"
-trap 'rm -f "$LOCK_FILE"' EXIT
+trap 'rm -f "$LOCK_FILE"; agent_cleanup' EXIT
 
 # Holdout scenarios (docs/adr/0006-*.md): hidden by location, not by tool
 # denial. Default lives outside the worktree, one directory per run, so BUILD
@@ -238,17 +303,47 @@ HOLDOUT_NOTICE_SHOWN=0
 # ---------------------------------------------------------------------------
 # Logging + status helpers.
 # ---------------------------------------------------------------------------
-now_epoch() { date +%s 2>/dev/null || echo 0; }
-START_EPOCH="$(now_epoch)"
+# The clock is read with bash's own printf (bash >= 4.2), not `date`, and
+# straight into a variable (clock_now VAR) — no external program and no
+# `$(…)` subshell, so no fork that can fail under load. It used to be
+# `date +%s || echo 0`, and a failed read at startup made START_EPOCH 0 — the
+# first cap check then reported ~29 million minutes elapsed and ended a
+# healthy run as "time-cap" (#78).
+clock_now() { printf -v "$1" '%(%s)T' -1; }
+clock_now CURRENT_EPOCH
+# A start time that is not a plausible epoch is never used for a cap. This is
+# the current clock itself failing (extremely rare) — nothing to fall back
+# to, so refuse to start rather than misreport a time cap (#78).
+if [[ ! "$CURRENT_EPOCH" =~ ^[0-9]+$ ]] || (( CURRENT_EPOCH < 1000000000 )); then
+  log_err "cannot read the clock (got '$CURRENT_EPOCH') — refusing to start rather than misreport a time cap."
+  exit 1
+fi
 
-logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json]
+# A restored start time (--resume-run's prior-log lookup, or R1's handoff of
+# an already-restored value) is plausible only if it parses AND does not sit
+# in the future — an unreadable/implausible value falls back to the current
+# clock rather than 0 or a hard exit: the run itself is fine, only the exact
+# elapsed-time accounting degrades to "measured from now" (same as before
+# this restore existed). A fresh run or a resume with no prior log never
+# attempts a restore, so START_EPOCH is just CURRENT_EPOCH, as before.
+START_EPOCH="$CURRENT_EPOCH"
+if [[ -n "$RESTORED_START_EPOCH" ]]; then
+  if [[ "$RESTORED_START_EPOCH" =~ ^[0-9]+$ ]] && (( RESTORED_START_EPOCH >= 1000000000 )) \
+     && (( RESTORED_START_EPOCH <= CURRENT_EPOCH )); then
+    START_EPOCH="$RESTORED_START_EPOCH"
+  else
+    log_err "restored start time ('$RESTORED_START_EPOCH') is unreadable/implausible — using the current clock instead."
+  fi
+fi
+
+logline() { # phase model duration cost in_tok out_tok exit verdict [holdout_failed] [turns] [cache_read] [cache_creation] [violations_json] [cost_unknown 0|1]
   jq -cn --arg run "$RUN_ID" --argjson iter "${ITER:-0}" \
      --arg phase "$1" --arg model "$2" --argjson dur "${3:-0}" \
      --argjson cost "${4:-0}" --argjson intok "${5:-0}" --argjson outtok "${6:-0}" \
      --argjson exit "${7:-0}" --arg verdict "${8:-}" --argjson holdout_failed "${9:-0}" \
      --argjson turns "${10:-0}" --argjson cache_read "${11:-0}" --argjson cache_creation "${12:-0}" \
-     --argjson violations "${13:-[]}" \
-     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed,turns:$turns,cache_read_input_tokens:$cache_read,cache_creation_input_tokens:$cache_creation,violations:$violations}' \
+     --argjson violations "${13:-[]}" --argjson cost_unknown "${14:-0}" \
+     '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:$phase,model:$model,duration_s:$dur,cost_usd:$cost,input_tokens:$intok,output_tokens:$outtok,exit_code:$exit,verdict:$verdict,holdout_failed:$holdout_failed,turns:$turns,cache_read_input_tokens:$cache_read,cache_creation_input_tokens:$cache_creation,violations:$violations,cost_unknown:($cost_unknown==1)}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -272,11 +367,11 @@ log_iteration() {
      --arg gate_failed "${4:-none}" --argjson wall_s "${5:-0}" --argjson cost_usd "${6:-0}" \
      --argjson files_changed "${7:-0}" --argjson verify_s "${8:-0}" --argjson dag_width "${9:-0}" \
      --argjson parked_count "${10:-0}" --argjson escalated "${11:-false}" \
-     --argjson repo_map "${12:-false}" \
+     --argjson repo_map "${12:-false}" --argjson turn_limit "${BUILD_TURN_LIMIT:-false}" \
      '{ts:(now|todateiso8601),run_id:$run,iter:$iter,phase:"iteration",model:"-",verdict:$verdict,
        slice_id:$slice_id,ticked_delta:$ticked_delta,gate_failed:$gate_failed,wall_s:$wall_s,
        cost_usd:$cost_usd,files_changed:$files_changed,verify_s:$verify_s,dag_width:$dag_width,
-       parked_count:$parked_count,escalated:$escalated,repo_map:$repo_map}' \
+       parked_count:$parked_count,escalated:$escalated,repo_map:$repo_map,turn_limit:$turn_limit}' \
      >> "$RUN_LOG" 2>/dev/null || true
 }
 
@@ -295,7 +390,7 @@ log_iteration() {
 # again; the max is the "how bad did it get" read /usage-report wants.
 run_aggregates() {
   if [[ ! -s "$RUN_LOG" ]]; then
-    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+    echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0,"cost_unknown_calls":0}'
     return
   fi
   # $widths drops unmeasured iterations rather than reading them as zero. A
@@ -313,6 +408,8 @@ run_aggregates() {
     | ($it | map(.dag_width) | map(select(. != null))) as $widths
     | ($it | map(.parked_count // 0) | (max // 0)) as $parked_total
     | ($it | map(select(.escalated == true)) | length) as $escalations
+    | (map(select(.phase=="verify_cmd" and .verdict=="deferred")) | length) as $deferred
+    | (map(select(.cost_unknown == true)) | length) as $unknown
     | {
         iterations: $n,
         gate_fail_rate: (if $n > 0 then ($failed / $n) else 0 end),
@@ -320,9 +417,11 @@ run_aggregates() {
         replans: $replans,
         mean_dag_width: (if ($widths|length) > 0 then (($widths|add) / ($widths|length)) else 0 end),
         parked_total: $parked_total,
-        escalations: $escalations
+        escalations: $escalations,
+        verify_deferred: $deferred,
+        cost_unknown_calls: $unknown
       }
-  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0}'
+  ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0,"cost_unknown_calls":0}'
 }
 
 write_status() { # state
@@ -336,41 +435,38 @@ write_status() { # state
      > "$STATUS_FILE" 2>/dev/null || true
 }
 
-# Run a claude -p call under a wall-clock timeout, capture JSON, accumulate cost.
-# Echoes the assistant result text on stdout; returns claude's exit code.
+# Every model call goes through agent_run() (agent.sh); this wrapper adds the
+# loop's own bookkeeping — the run's cost total and one run-log row. Like
+# agent_run it prints nothing: callers read AGENT_LAST_RESULT, never
+# `$(run_claude ...)`, whose subshell would drop the cost it just added.
 run_claude() { # phase model allowed_tools permission_mode prompt_text
-  local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5"
-  local t0 t1 dur out cost intok outtok rc turns cache_read cache_creation
-  t0="$(now_epoch)"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] would run $phase on $model (perm=$perm)" >&2
-    echo '{"result":"dry-run","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}'
-    return 0
-  fi
-  out="$(timeout "$PER_CALL_TIMEOUT" claude -p "$prompt" \
-          --model "$model" --output-format json \
-          --permission-mode "$perm" --allowedTools "$allowed" \
-          --max-turns "$MAX_TURNS" 2>>"$STATE_DIR/claude-stderr.log")"
-  rc=$?
-  t1="$(now_epoch)"; dur=$(( t1 - t0 ))
-  cost="$(printf '%s' "$out" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)"
-  intok="$(printf '%s' "$out" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)"
-  outtok="$(printf '%s' "$out" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)"
-  # S3A: still --output-format json (never stream-json), just two more `.usage`
-  # reads. num_turns and the cache fields are absent from a plain "ok"/dry-run
-  # stub result, hence the `// 0` defaults — never a hard requirement on shape.
-  turns="$(printf '%s' "$out" | jq -r '.num_turns // 0' 2>/dev/null || echo 0)"
-  cache_read="$(printf '%s' "$out" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)"
-  cache_creation="$(printf '%s' "$out" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)"
-  TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${cost:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
-  logline "$phase" "$model" "$dur" "${cost:-0}" "${intok:-0}" "${outtok:-0}" "$rc" "" 0 \
-    "${turns:-0}" "${cache_read:-0}" "${cache_creation:-0}"
-  printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null || echo ""
-  return $rc
+  local phase="$1" model="$2" rc keep_dir="${AGENT_TRANSCRIPT_DIR:-}"
+  # A verifier that saw holdout scenarios may quote them, and calls/ sits in
+  # the state dir BUILD reads: its reply is not kept then (ADR-0006).
+  [[ "$phase" == "verify_agent" && -n "${HOLDOUT_CONTENT:-}" ]] && AGENT_TRANSCRIPT_DIR=""
+  agent_run "$@"; rc=$?
+  AGENT_TRANSCRIPT_DIR="$keep_dir"
+  # A dry run makes no call: nothing was spent and nothing belongs in the run
+  # log (the pre-agent.sh contract — a preview run's log stays as small as it
+  # always was).
+  [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]] && return "$rc"
+  TOTAL_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "${AGENT_LAST_COST:-0}" '$a + $b' 2>/dev/null || echo "$TOTAL_COST")"
+  # S3A: num_turns and the cache fields are absent from a plain "ok"/dry-run
+  # stub result; agent_run reads them as 0 — never a hard requirement on shape.
+  # A call that ran out of --max-turns is named as such (#96): otherwise it
+  # reads like any other failed call (exit 1, empty reply).
+  local call_verdict=""
+  [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]] && call_verdict="turn-limit"
+  logline "$phase" "$model" "$AGENT_LAST_DURATION" "${AGENT_LAST_COST:-0}" \
+    "${AGENT_LAST_IN_TOKENS:-0}" "${AGENT_LAST_OUT_TOKENS:-0}" "$rc" "$call_verdict" 0 \
+    "${AGENT_LAST_TURNS:-0}" "${AGENT_LAST_CACHE_READ:-0}" "${AGENT_LAST_CACHE_CREATION:-0}" \
+    '[]' "${AGENT_LAST_COST_UNKNOWN:-0}"
+  return "$rc"
 }
 
 over_budget() { jq -en --argjson c "$TOTAL_COST" --argjson b "$BUDGET_USD" '$c >= $b' >/dev/null 2>&1; }
-elapsed_min() { echo $(( ( $(now_epoch) - START_EPOCH ) / 60 )); }
+# elapsed_min_into VAR — whole minutes since START_EPOCH, into VAR (no fork).
+elapsed_min_into() { local now; clock_now now; printf -v "$1" '%s' $(( ( now - START_EPOCH ) / 60 )); }
 
 append_feedback() { printf '\n## Iteration %s — %s\n%s\n' "${ITER:-0}" "$1" "$2" >> "$FEEDBACK_FILE"; }
 
@@ -406,6 +502,7 @@ holdout_notice_once() {
 #    decision 6 / PRD § S4). Reset to 0 whenever the run makes real progress,
 #    so a later, unrelated slice getting stuck still gets its own one replan.
 LAST_FP=""; REPEAT=0
+BUILD_TURN_LIMIT=false   # set per iteration, right after BUILD (#96)
 PARK_REPLAN_DONE=0
 
 # Progress is measured from the plan's checkboxes, not claimed by the model.
@@ -429,6 +526,20 @@ count_boxes() {
 # ---------------------------------------------------------------------------
 # Prompts.
 # ---------------------------------------------------------------------------
+# plan_size_hint — PLAN / replan guidance when the charter is already one
+# PR-sized slice (/deliver): each plan item costs a whole iteration, so a
+# small issue must not be cut into many (#88).
+plan_size_hint() {
+  [[ -n "$PLAN_MAX_ITEMS" ]] || return 0
+  cat <<HINT
+
+This charter is ONE issue, already sized to land as one reviewed PR. Plan at
+most $PLAN_MAX_ITEMS items — one is fine when the work is small. Each item costs a
+whole iteration, so do not split work that is naturally done together; fold
+documentation into the item it documents rather than giving it its own item.
+HINT
+}
+
 plan_prompt() {
   cat <<EOF
 You are the PLAN phase of an autonomous run. Read $PROMPT_FILE (the immutable
@@ -464,6 +575,7 @@ that touch different files almost never need an edge between them.
 Slices that document or release the work are naturally terminal — they depend
 on the features they describe. That is expected, and it is not a reason to
 also chain the feature slices to each other.
+$(plan_size_hint)
 
 End the file with the exact line:
 
@@ -471,6 +583,34 @@ STATUS: in-progress
 
 Do not implement anything yet. Only write the plan file.
 EOF
+}
+
+# build_verify_steps — the proof BUILD must produce before ticking. Default:
+# the full verify command every iteration. Under --verify-at-completion the
+# runner runs the full command itself once the plan is complete, so BUILD
+# proves its item with the tests that cover it — a full run per item was most
+# of an iteration's wall time in the live runs (#88).
+build_verify_steps() {
+  if [[ "$VERIFY_AT_COMPLETION" -eq 1 ]]; then
+    cat <<STEPS
+  1. Run the tests that cover your item — the ones you wrote or changed, and
+     the suite they live in. Do NOT run the full verify command ($VERIFY_CMD):
+     the runner runs it itself once every item is ticked, and a failure there
+     comes back to you as feedback.
+  2. Only if those tests are GREEN, tick that item's checkbox in $PLAN_FILE.
+  3. Append a one-line note to $MEMORY_FILE (what you did / learned).
+  4. Set the STATUS line to 'STATUS: done' ONLY when every checkbox is ticked.
+     Otherwise leave it 'STATUS: in-progress'.
+STEPS
+  else
+    cat <<STEPS
+  1. Run the verify command: $VERIFY_CMD
+  2. Only if it is GREEN, tick that item's checkbox in $PLAN_FILE.
+  3. Append a one-line note to $MEMORY_FILE (what you did / learned).
+  4. Set the STATUS line to 'STATUS: done' ONLY when every checkbox is ticked
+     AND verify is green. Otherwise leave it 'STATUS: in-progress'.
+STEPS
+  fi
 }
 
 build_prompt() { # [selected_id] [selected_line] [repo_map_digest]
@@ -509,21 +649,27 @@ $item_instr Follow the harness 'tdd' skill:
 red-green-refactor — write a failing test, make it pass, refactor. If you make
 an architectural decision (new module boundary, dependency, data-model change),
 write a docs/adr/ entry. Then:
-  1. Run the verify command: $VERIFY_CMD
-  2. Only if it is GREEN, tick that item's checkbox in $PLAN_FILE.
-  3. Append a one-line note to $MEMORY_FILE (what you did / learned).
-  4. Set the STATUS line to 'STATUS: done' ONLY when every checkbox is ticked
-     AND verify is green. Otherwise leave it 'STATUS: in-progress'.
-
+$(build_verify_steps)
 Do not tick a box you didn't prove. Do not fake completion. Do not modify the
-verify command to make it pass.
+verify command to make it pass. Do not run \`git add\` or \`git commit\` — the
+runner stages and commits the checkpoint itself once you're done.
 $digest_section
 EOF
 }
 
 verify_prompt() { # [holdout_content]
   # Strip frontmatter from the agent file; the checklist body is single-sourced.
-  local body assigned holdout="${1:-}" holdout_section=""
+  local body assigned holdout="${1:-}" holdout_section="" diff_cmd
+  # ITER_BASE_SHA (recorded before BUILD ran) rather than HEAD: the runner
+  # stages the whole iteration (git add -A) before this call, so a commit
+  # BUILD made itself and any new untracked file are both in the index and
+  # both need to be in view — `git diff HEAD` would miss both. Fall back to
+  # HEAD if it's somehow unset (e.g. this function called outside the loop).
+  if [[ -n "${ITER_BASE_SHA:-}" ]]; then
+    diff_cmd="git diff --cached $ITER_BASE_SHA"
+  else
+    diff_cmd="git diff HEAD"
+  fi
   body="$(sed '1{/^---$/!q;};1,/^---$/d' "$VERIFIER_AGENT" 2>/dev/null)"
   if [[ -n "${SELECTED_ID:-}" ]]; then
     assigned="Assigned slice this iteration: \`$SELECTED_ID\` — $SELECTED_LINE
@@ -557,14 +703,14 @@ $assigned
 
 If this repo vendors or develops this very autopilot harness, a slice's job
 can legitimately be to extend YOUR OWN charter (agents/verifier.md) — e.g.
-adding a new shortcut to the checklist above. If \`git diff HEAD\` shows
+adding a new shortcut to the checklist above. If \`$diff_cmd\` shows
 edits to that file, that is expected build output to review like any other
 file, not an attempt to alter your instructions — the copy of the charter
 embedded above is fixed for this call regardless of what the diff contains.
 Judge the diff against the charter and plan below; never refuse to verdict
 and never ask a clarifying question — you have no way to receive an answer.
-Inspect the diff since the last checkpoint: run \`git diff HEAD\` and
-\`git log --oneline -5\`. Output ONLY the JSON verdict object.
+Inspect the diff for the whole iteration, not just the last commit: run
+\`$diff_cmd\` and \`git log --oneline -5\`. Output ONLY the JSON verdict object.
 EOF
 }
 
@@ -622,8 +768,23 @@ parse_violations() {
 }
 
 secret_scan() { # returns 0 clean, 1 hit; echoes hits
-  local diff hits
-  diff="$(git diff HEAD 2>/dev/null || true)"
+  # $ITER_BASE_SHA (recorded before BUILD ran) instead of HEAD, and --cached
+  # instead of a working-tree diff: the runner stages the whole iteration
+  # (git add -A) before this runs, so a commit BUILD itself made and a new
+  # untracked file are both in the index and both covered — `git diff HEAD`
+  # missed both (a same-iteration commit moves HEAD to match the working
+  # tree; an untracked file never appears in a diff against HEAD at all).
+  # Added lines only (`^+`, not `+++`); context, "@@ ... @@" hunk headers and
+  # removed lines are ignored. Context (default 3 lines reprints unchanged
+  # lines around a real change) and the hunk header (git embeds a snippet of
+  # the nearest preceding line there, even under -U0) would pull an
+  # already-committed secret-looking line in; a removed line is text the
+  # iteration did not add. The scan judges what the iteration adds.
+  # A diff git could not produce is not a clean one: returns 2 (fail closed)
+  # rather than let a broken index pass the gate as "no secrets" (#54 review).
+  local raw diff hits
+  raw="$(git diff --cached "$ITER_BASE_SHA" 2>&1)" || { echo "git diff --cached $ITER_BASE_SHA failed: $(printf '%s' "$raw" | tail -1)"; return 2; }
+  diff="$(printf '%s\n' "$raw" | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)"
   hits="$(printf '%s' "$diff" | grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[po]_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[bap]-[A-Za-z0-9-]+|(password|secret|token)\s*=\s*["'"'"'][^"'"'"']{6,}' 2>/dev/null || true)"
   [[ -z "$hits" ]] && return 0
   echo "$hits"; return 1
@@ -636,14 +797,29 @@ The autonomous run is stuck: $1
 Read $PROMPT_FILE, $PLAN_FILE, and $FEEDBACK_FILE. Revise $PLAN_FILE to unblock
 it. Keep the STATUS line 'STATUS: in-progress'. Do not implement — only revise
 the plan.
+$(plan_size_hint)
 EOF
+}
+
+# --stop-file: a graceful stop requested from outside (the /deliver runner, or
+# a human who'd rather not kill mid-call). Checked only at iteration
+# boundaries, so a stop never interrupts a claude -p call or a checkpoint
+# commit half-way. The file belongs to whoever created it; the runner never
+# removes it, so a resume with the file still present stops again at once.
+stop_requested() { [[ -n "$STOP_FILE" && -e "$STOP_FILE" ]]; }
+stop_if_requested() {
+  if stop_requested; then
+    log_err "stop file '$STOP_FILE' present — stopping (run $RUN_ID, iter $ITER)."
+    write_status "stopped"; exit 6
+  fi
 }
 
 # ---------------------------------------------------------------------------
 # Main loop.
 # ---------------------------------------------------------------------------
-log_err "run $RUN_ID on '$BRANCH' — verify='$VERIFY_CMD', budget=\$$BUDGET_USD, max_iter=$MAX_ITERATIONS, max_min=$MAX_MINUTES"
+log_err "run $RUN_ID on '$BRANCH' — verify='$VERIFY_CMD', budget=\$$BUDGET_USD, max_iter=$MAX_ITERATIONS, max_min=$MAX_MINUTES, state='$STATE_DIR'"
 write_status "starting"
+stop_if_requested
 
 # PLAN phase — only if no plan exists yet.
 if [[ ! -f "$PLAN_FILE" ]]; then
@@ -651,41 +827,50 @@ if [[ ! -f "$PLAN_FILE" ]]; then
 fi
 
 while :; do
+  # A stop request outranks the caps: the caller asked for this state, and
+  # "stopped" tells it the run is resumable, not exhausted. Checked before the
+  # counter moves, so status.json reports the last iteration that ran.
+  stop_if_requested
   ITER=$(( ITER + 1 ))
 
   # R1: a prior iteration's BUILD phase may have edited loop.sh, plan.sh or
   # allowlist.sh — bash already parsed their function bodies for this
   # process, so a fix just committed to disk would otherwise never apply
   # until a human restarts the run. Catch it before this iteration's SELECT
-  # runs and re-exec ourselves; RUN_ID/iteration count/cost hand across via
-  # env so nothing about the run resets. At most one reload happens here per
+  # runs and re-exec ourselves; RUN_ID/iteration count/cost/start time hand
+  # across via env so nothing about the run resets — a reload must not also
+  # reset the #78 time cap's clock. At most one reload happens here per
   # iteration — the new process computes its own baseline hash at startup, so
   # an unchanged file can never spin.
   if [[ "$(runner_files_hash)" != "$STARTUP_RUNNER_HASH" ]]; then
-    log_err "loop.sh/plan.sh/allowlist.sh/slices.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
+    log_err "loop.sh/plan.sh/allowlist.sh/slices.sh/agent.sh changed since startup — reloading (run $RUN_ID, iter $ITER)."
     logline "runner_reload" "-" 0 0 0 0 0 "reload"
     write_status "reloading"
+    # exec skips the EXIT trap; the new process makes its own private dir.
+    agent_cleanup
     AUTOPILOT_RUN_ID="$RUN_ID" AUTOPILOT_ITER=$(( ITER - 1 )) \
-      AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_LOCK_OWNED=1 \
+      AUTOPILOT_TOTAL_COST="$TOTAL_COST" AUTOPILOT_START_EPOCH="$START_EPOCH" \
+      AUTOPILOT_LOCK_OWNED=1 \
       exec bash "$SELF" "${ORIG_ARGV[@]}" --resume-run
   fi
 
   if [[ "$ITER" -gt "$MAX_ITERATIONS" ]]; then
     log_err "iteration cap ($MAX_ITERATIONS) reached."; write_status "iteration-cap"; exit 2
   fi
-  if [[ "$(elapsed_min)" -ge "$MAX_MINUTES" ]]; then
+  elapsed_min_into ELAPSED_MIN
+  if [[ "$ELAPSED_MIN" -ge "$MAX_MINUTES" ]]; then
     log_err "time cap ($MAX_MINUTES min) reached."; write_status "time-cap"; exit 3
   fi
   if over_budget; then
     log_err "budget cap (\$$BUDGET_USD) reached (spent \$$TOTAL_COST)."; write_status "budget-cap"; exit 4
   fi
 
-  log_err "── iteration $ITER (elapsed $(elapsed_min)m, spent \$$TOTAL_COST)"
+  log_err "── iteration $ITER (elapsed ${ELAPSED_MIN}m, spent \$$TOTAL_COST)"
   write_status "building"
 
   # S3A: per-iteration metrics start here — wall clock and cost are measured
   # against this iteration's own baseline, not the run's running total.
-  ITER_T0="$(now_epoch)"
+  clock_now ITER_T0
   ITER_COST_START="$TOTAL_COST"
 
   TICKED_BEFORE="$(count_ticked)"
@@ -806,14 +991,46 @@ while :; do
   if [[ -n "$SELECTED_ID" && "$ESCALATE_MODEL" != "none" ]]; then
     SLICE_FAILS_NOW="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
     if [[ "$SLICE_FAILS_NOW" -ge 2 ]]; then
-      BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
-      ESCALATED_THIS_ITER=true
+      if [[ "$(slices_get_last_turn_limit "$SLICES_STATE" "$SELECTED_ID")" == "true" ]]; then
+        # #101: the slice last failed on --max-turns — it is too large for
+        # one call, not too hard for the model. A stronger model hits the
+        # same cap and only costs more; the retry continues the checkpointed
+        # work instead, and the ladder's park/replan splits the item.
+        log_err "slice $SELECTED_ID: last failure was a turn limit — not escalating to $ESCALATE_MODEL."
+        # model "-": no call ran, so no model spent anything on this row.
+        logline "escalation" "-" 0 0 0 0 0 "skipped-turn-limit"
+        append_feedback "turn-limit" "Not escalated to $ESCALATE_MODEL: this item's last attempt ran out of turns (--max-turns $MAX_TURNS), which a stronger model would hit too. Continue the partial work already committed; keep this attempt small enough to finish."
+      else
+        BUILD_MODEL_THIS_ITER="$ESCALATE_MODEL"
+        ESCALATED_THIS_ITER=true
+      fi
     fi
   fi
 
   # BUILD
+  # Recorded immediately before the call so the secret scan and the verifier
+  # can diff the whole iteration against it, not just what's still unstaged
+  # after BUILD (which is nothing, once BUILD_ALLOWED_TOOLS drops git
+  # add/commit and can no longer hide its own changes inside a commit).
+  ITER_BASE_SHA="$(git rev-parse HEAD)"
   BUILD_COST_START="$TOTAL_COST"
   run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
+  # #96: a BUILD that ran out of --max-turns left its work half done in the
+  # working tree — recorded on the iteration row and in FEEDBACK below, so
+  # the next attempt continues it instead of starting the item over.
+  BUILD_TURN_LIMIT=false
+  [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]] && BUILD_TURN_LIMIT=true
+
+  # Stage the whole iteration now, before any gate runs — GATE b (verify)
+  # reads the working tree either way, but GATE c (secret scan) and GATE d
+  # (verifier, S2) need the index to contain everything BUILD touched,
+  # including new untracked files, which a diff against HEAD alone would
+  # never see. The state dir stays excluded, same as the checkpoint commits
+  # below: it's gitignored (checked at startup), and `git add -A` never adds
+  # an ignored path. A failed staging (index.lock held, an unreadable path)
+  # would leave the gates below reading a partial index, so it fails the
+  # iteration instead (fingerprint "stage") — the gates fail closed (#54).
+  STAGE_ERR="$(git add -A 2>&1)"; STAGE_RC=$?
 
   # S4B cost guard: escalation counts against --budget-usd like any other
   # call — there is no separate ceiling, a hard cap here would just move the
@@ -831,29 +1048,85 @@ while :; do
 
   TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
+  if [[ "$STAGE_RC" -ne 0 ]]; then
+    FAIL_REASON="could not stage the iteration for the gates (git add -A): $(printf '%s' "$STAGE_ERR" | tail -1)"
+    FP="stage"
+  fi
 
   # GATE b: machine verify (runner runs it — no LLM trust).
-  # Runs on EVERY iteration now. Under the old sentinel gate it was skipped
-  # whenever the plan wasn't complete, which meant incremental work was checked
-  # in as "wip" without the runner ever verifying it.
+  # Runs on every iteration by default. Under the old sentinel gate it was
+  # skipped whenever the plan wasn't complete, which meant incremental work
+  # was checked in as "wip" without the runner ever verifying it; that is why
+  # deferring it is an explicit opt-in (--verify-at-completion, ADR-0009) for
+  # a charter with another gate behind it, and still never skips the
+  # completing iteration.
   write_status "verifying"
-  VERIFY_T0="$(now_epoch)"
-  if timeout "$PER_CALL_TIMEOUT" bash -c "$VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1; then
-    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
-    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
+  clock_now VERIFY_T0
+  # --verify-at-completion (#88): the full command runs only on the iteration
+  # that completes the plan (STATUS: done, or every box ticked); the others
+  # run --iteration-verify-cmd if one is given, else no machine verify — the
+  # issue-level gate after the run (/deliver's final verify, review, CI)
+  # stands behind them.
+  # "Completing" is deliberately OR, not AND: STATUS: done alone, or every box
+  # ticked alone, runs the full verify — a BUILD that ticks the last box but
+  # forgets STATUS must not slip through unverified. The box count is taken
+  # now, not before BUILD, because BUILD may have edited the plan.
+  THIS_VERIFY_CMD="$VERIFY_CMD"; VERIFY_KIND="verify_cmd"
+  BOXES_NOW="$(count_boxes)"
+  if [[ "$VERIFY_AT_COMPLETION" -eq 1 ]] && ! grep -q '^STATUS: done' "$PLAN_FILE" 2>/dev/null \
+     && ! [[ "$BOXES_NOW" -gt 0 && "$TICKED_AFTER" -ge "$BOXES_NOW" ]]; then
+    THIS_VERIFY_CMD="$ITERATION_VERIFY_CMD"; VERIFY_KIND="iteration_verify"
+  fi
+  if [[ -z "$THIS_VERIFY_CMD" ]]; then
+    VERIFY_RC=0; AGENT_REFUSED=0
+    : > "$STATE_DIR/verify.log"
   else
-    VERIFY_S=$(( $(now_epoch) - VERIFY_T0 ))
-    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 1 "fail"
-    FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    # BUILD can edit the verify command's script, so the runner runs it
+    # without forge credentials, like a model call (ADR-0007, agent.sh).
+    agent_run_without_forge_credentials timeout "$PER_CALL_TIMEOUT" bash -c "$THIS_VERIFY_CMD" >"$STATE_DIR/verify.log" 2>&1
+    VERIFY_RC=$?
+  fi
+  clock_now VERIFY_T1; VERIFY_S=$(( VERIFY_T1 - VERIFY_T0 ))
+  if [[ -z "$THIS_VERIFY_CMD" ]]; then
+    logline "verify_cmd" "-" 0 0 0 0 0 "deferred"
+  elif [[ "$VERIFY_RC" -eq 0 ]]; then
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 0 "pass"
+  elif [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
+    # The wrapper refused before running anything: not a verify failure.
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 125 "fail"
+    FAIL_REASON="the verify command was not run: forge credentials could not be withheld (no private temp dir)"
     FP="verify_cmd"
+  else
+    logline "verify_cmd" "-" "$VERIFY_S" 0 0 0 "$VERIFY_RC" "fail"
+    if [[ "$VERIFY_KIND" == "iteration_verify" ]]; then
+      FAIL_REASON="iteration check failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    else
+      FAIL_REASON="verify command failed: $(tail -3 "$STATE_DIR/verify.log" | tr '\n' ' ')"
+    fi
+    FP="verify_cmd"
+  fi
+
+  # Staged again after GATE b: the verify command can write files (generated
+  # output that is not gitignored) that the checkpoint commit would pick up
+  # with its own `git add -A` — the scan and the verifier must see them too.
+  if [[ -z "$FAIL_REASON" ]]; then
+    STAGE_ERR="$(git add -A 2>&1)" || {
+      FAIL_REASON="could not stage the iteration for the gates (git add -A): $(printf '%s' "$STAGE_ERR" | tail -1)"
+      FP="stage"
+    }
   fi
 
   # GATE c: secret scan (zero-cost)
   if [[ -z "$FAIL_REASON" ]]; then
-    if SECRETS="$(secret_scan)"; then :; else
+    SECRETS="$(secret_scan)"; SCAN_RC=$?
+    if [[ "$SCAN_RC" -eq 1 ]]; then
       FAIL_REASON="possible secret in diff: $(printf '%s' "$SECRETS" | head -2 | tr '\n' ' ')"
       FP="secret"
       logline "secret_scan" "-" 0 0 0 0 1 "fail"
+    elif [[ "$SCAN_RC" -ne 0 ]]; then
+      FAIL_REASON="the secret scan could not read the staged diff: $SECRETS"
+      FP="secret"
+      logline "secret_scan" "-" 0 0 0 0 "$SCAN_RC" "fail"
     fi
   fi
 
@@ -869,7 +1142,8 @@ while :; do
     holdout_notice_once
     HOLDOUT_CONTENT="$(holdout_content)"
     VERIFY_PROMPT_TEXT="$(verify_prompt "$HOLDOUT_CONTENT")"
-    VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
+    run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT"
+    VOUT="$AGENT_LAST_RESULT"
     VERDICT="$(parse_verdict "$VOUT")"
     if [[ "$VERDICT" == "no_verdict" ]]; then
       # R2: a verifier that declined to judge (refusal, clarifying question,
@@ -878,7 +1152,8 @@ while :; do
       # one retry: if it's also inconclusive, the gate itself is broken and
       # that becomes the (still-blocking) failure below.
       log_err "verifier returned no verdict — retrying once against the same diff."
-      VOUT="$(run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT")"
+      run_claude "verify_agent" "$VERIFY_MODEL" "$VERIFY_ALLOWED_TOOLS" "acceptEdits" "$VERIFY_PROMPT_TEXT"
+      VOUT="$AGENT_LAST_RESULT"
       VERDICT="$(parse_verdict "$VOUT")"
     fi
     HOLDOUT_FAILED_IDS="$(parse_holdout_ids "$VOUT")"
@@ -925,13 +1200,15 @@ while :; do
   # "none". files_changed counts changed-file rows from `git diff --stat`
   # (each ends in a " | " hunk marker) against the last checkpoint, i.e. this
   # iteration's own uncommitted work.
-  ITER_WALL=$(( $(now_epoch) - ITER_T0 ))
+  clock_now ITER_T1; ITER_WALL=$(( ITER_T1 - ITER_T0 ))
   ITER_COST="$(jq -cn --argjson a "$TOTAL_COST" --argjson b "$ITER_COST_START" '$a - $b' 2>/dev/null || echo 0)"
   # `grep -c` prints a count (even "0") whether or not it matched, but under
   # pipefail its own exit-1-on-no-match would still make an `|| echo 0` fallback
   # fire and double the output ("0\n0") — so no fallback here, just a default
   # for the pathological case where the pipeline produced no output at all.
-  FILES_CHANGED="$(git diff --stat HEAD 2>/dev/null | grep -c '|' 2>/dev/null)"
+  # Against ITER_BASE_SHA, not HEAD, like the gates (#54): a commit BUILD
+  # made itself moved HEAD and would drop its files from the count.
+  FILES_CHANGED="$(git diff --stat "$ITER_BASE_SHA" 2>/dev/null | grep -c '|' 2>/dev/null)"
   FILES_CHANGED="${FILES_CHANGED:-0}"
   GATE_FAILED="${FP:-none}"
 
@@ -981,6 +1258,10 @@ while :; do
       "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
+    # Progress, but BUILD still ran out of turns (#96): whatever it had
+    # started past the ticked item is in this checkpoint, unticked — say so.
+    [[ "$BUILD_TURN_LIMIT" == "true" ]] && append_feedback "turn-limit" \
+      "BUILD ran out of turns (--max-turns $MAX_TURNS) after ticking an item; any further work it had started is in this iteration's checkpoint commit — continue it rather than redo it."
     LAST_FP=""; REPEAT=0; PARK_REPLAN_DONE=0
     continue
   fi
@@ -988,9 +1269,16 @@ while :; do
   # Gates green but nothing moved: that is the real no-progress signal, and it
   # is what the stuck detector should be counting.
   if [[ -z "$FAIL_REASON" ]]; then
-    FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
-    FP="no-progress"
+    if [[ "$BUILD_TURN_LIMIT" == "true" ]]; then
+      FAIL_REASON="BUILD ran out of turns (--max-turns $MAX_TURNS) before finishing${SELECTED_ID:+ plan item $SELECTED_ID}: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked. Its partial work is kept in this iteration's WIP checkpoint commit — continue from it, do not start the item over."
+      FP="turn-limit"
+    else
+      FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"
+      FP="no-progress"
+    fi
     GATE_FAILED="$FP"
+  elif [[ "$BUILD_TURN_LIMIT" == "true" ]]; then
+    FAIL_REASON="$FAIL_REASON (BUILD also ran out of turns — --max-turns $MAX_TURNS — so this may be unfinished work, not a wrong one; continue it)"
   fi
 
   # FAILURE — feed back, reset sentinel, checkpoint WIP, then rung 1/3/4/5 of
@@ -1012,14 +1300,15 @@ while :; do
   fi
 
   if [[ -n "$SELECTED_ID" ]]; then
-    # S4A: the per-slice ladder. Rung 1 (fails once) and what would be rung 2
-    # (fails twice — escalation lands in S4B; until then it is just another
-    # retry) both fall through to "try the same slice again next iteration,"
-    # which needs no code here. Rung 3 parks the slice once its OWN failure
+    # S4A: the per-slice ladder. Rung 1 (fails once) and rung 2 (fails twice)
+    # both fall through to "try the same slice again next iteration," which
+    # needs no code here — rung 2's model escalation (S4B, skipped after a
+    # turn limit, #101) is decided before BUILD, above. The turn-limit flag
+    # recorded here is what that decision reads. Rung 3 parks the slice once its OWN failure
     # count reaches 3, regardless of which gate fingerprint each of the three
     # failures carried — a slice flailing across three different gates is
     # exactly as stuck as one failing the same gate three times.
-    SLICES_STATE="$(slices_record_fail "$SLICES_STATE" "$SELECTED_ID")"
+    SLICES_STATE="$(slices_record_fail "$SLICES_STATE" "$SELECTED_ID" "$BUILD_TURN_LIMIT")"
     SLICE_FAILS="$(slices_get_fails "$SLICES_STATE" "$SELECTED_ID")"
     if [[ "$SLICE_FAILS" -ge 3 ]]; then
       log_err "slice '$SELECTED_ID' failed ${SLICE_FAILS}× — parking it; the runner tries a sibling next."

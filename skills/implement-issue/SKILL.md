@@ -11,15 +11,17 @@ No mega-implementations.
 ## Input
 
 - GitHub issue number (e.g. `42`)
-- Optional: `--base=main` (default), `--draft=true` (open as draft PR)
+- Optional: `--base=<branch>` — what the PR merges into. Defaults to the repo default branch (`git symbolic-ref --short refs/remotes/origin/HEAD`, minus
+  `origin/`); never assume `main`
+- Optional: `--draft=true` (open as draft PR)
 
 ## Pre-flight
 
 The skill checks at start:
 
-- Issue has label `ready` (otherwise fail with hint to call `/start-feature`)
+- Issue has label `ready-for-agent` (otherwise fail with hint to call `/start-feature` or `/triage`)
 - Working tree is clean (otherwise fail; user must commit / stash)
-- Verify on `main` is green (otherwise fail; fix first)
+- Verify on the base (`--base`) is green (otherwise fail; fix first)
 
 ## Phases
 
@@ -39,7 +41,7 @@ approval.**
 
 After plan approval:
 
-- Create branch `feat/<area>-<short-desc>` (from issue title)
+- Create branch `feat/<area>-<short-desc>` (from issue title) off `--base`
 - Generate skeletons:
   - Schema/model change (if needed) — fail-fast if migration is dangerous
     (delete column, NOT NULL without default, …) — see `/migration-check`
@@ -84,7 +86,23 @@ In parallel:
 
 ### 4. REVIEW — `code-reviewer` subagent
 
-After BUILD completes, run the **`code-reviewer` agent** (in `agents/`).
+**Commit before review.** The reviewer reads a committed diff, so commit the
+BUILD work on the feature branch first (see `/commit-agent`).
+
+Then record the guard state and run the **`code-reviewer` agent** (in
+`agents/`), passing `--base=<base> --head=<branch>` (the same base as the PR
+target) plus the issue as charter:
+
+```bash
+branch_before="$(git rev-parse --abbrev-ref HEAD)"
+status_before="$(cat tmp/.last-verify-status 2>/dev/null)"
+```
+
+The reviewer is read-only; **after it returns, assert nothing moved**: the
+current branch equals `$branch_before` and `tmp/.last-verify-status` is
+unchanged. If either differs, stop and report — do not commit, push or open the
+PR from a moved checkout (#52).
+
 The reviewer gets the diff and a checklist:
 
 - [ ] No defensive `if (!x) return null` without reason
@@ -101,7 +119,9 @@ The reviewer gets the diff and a checklist:
 
 The reviewer returns findings. The implementing agent responds (fix or justify),
 then loops until the reviewer is satisfied or a meta-question is flagged for the
-user.
+user. Findings outside the issue's scope are not fixed here: file each as a new
+GitHub issue labelled `needs-triage` (`gh issue create --label needs-triage`)
+and mention it in the PR.
 
 ### 5. VERIFY
 
@@ -115,7 +135,7 @@ stuck, invoke Pocock's `/diagnose`.
 Once verify is green:
 
 - `git push -u origin <branch>`
-- `gh pr create` with template description:
+- `gh pr create --base <base>` with template description:
 
   ```markdown
   ## Issue

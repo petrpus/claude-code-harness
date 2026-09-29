@@ -51,20 +51,25 @@ end-to-end piece, not layer-by-layer).
 
 Rules:
 
-- Each issue must be "independently grabbable" — no "waits on issue #X"
+- Each issue is a vertical slice that declares its blockers in `## Blocked by`;
+  together the issues form a Blocked-by DAG (an issue with no blockers can start
+  immediately)
 - Target size: 2–6 hours of orchestration
 - Issue has acceptance criteria (testable)
 - Issue links to the parent PRD issue
 
-Output: list of GitHub issues, each labelled `ready` (after triage).
+Output: list of GitHub issues, each labelled `ready-for-agent`, plus a **Map**
+issue (label `map`) listing them in a `## Delivery` section — format in
+`skills/deliver/MAP-FORMAT.md`.
 
 ### Step 5 — Triage
 
 If you have more issues than capacity for one sprint, use Pocock's `/triage`
 skill. Default labels:
 
-- `ready` — ready to grab
-- `blocked` — waiting on something external
+- `ready-for-agent` — ready to grab
+- `needs-human` — waiting on a human decision or something external
+- `needs-triage` — not yet triaged (e.g. review follow-ups)
 - `needs-design` — needs a UI mockup (claude.ai/design first)
 - `needs-grill` — needs another alignment session
 
@@ -72,13 +77,16 @@ skill. Default labels:
 
 - Updated `CONTEXT.md` (if needed)
 - New ADR in `docs/adr/` (if needed)
-- Parent PRD issue
-- Set of child issues with acceptance criteria
+- Parent PRD issue (`prd`)
+- Set of child issues with acceptance criteria (`ready-for-agent`)
+- Map issue (`map`) with the Delivery DAG
 
 ## After the skill
 
-Call `/implement-issue <issue-number>` to implement a single issue. Never more
-than one issue at a time on one branch — keep 1 issue = 1 PR.
+Call `/deliver #<map>` to deliver the whole Map (one issue = one PR, in
+dependency order). To implement a single issue instead, call
+`/implement-issue <issue-number>`. Never more than one issue at a time on one
+branch — keep 1 issue = 1 PR.
 
 ## Anti-patterns
 

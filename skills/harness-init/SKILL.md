@@ -60,7 +60,26 @@ If `.gitignore` doesn't exist, create one with `tmp/` + `.env*` +
 `!.env.example` + `node_modules/`. The `!.env.example` un-ignore is important:
 `/project-infra env` writes `.env.example` and it should be committed.
 
-### 5. Print checklist
+### 5. Workflow labels
+
+The workflow skills (`to-prd`, `to-issues`, `start-feature`, `implement-issue`,
+`/deliver`) route work by GitHub labels. Create them idempotently:
+
+```bash
+if command -v gh >/dev/null 2>&1 && gh repo view >/dev/null 2>&1; then
+  gh label create map             --force --color 5319E7 --description "Delivery map: DAG of issues for /deliver"
+  gh label create prd             --force --color 0E8A16 --description "Product requirements document"
+  gh label create ready-for-agent --force --color 1D76DB --description "Fully specified; an agent can pick it up"
+  gh label create needs-human     --force --color D93F0B --description "Needs a human decision or action"
+  gh label create needs-triage    --force --color FBCA04 --description "Needs triage before work"
+fi
+```
+
+`--force` updates a label that already exists, so re-running is safe. If `gh`
+is missing, unauthenticated, or the repo has no GitHub remote, skip this step
+without failing (say "skipped label bootstrap: no gh/remote") — never abort init.
+
+### 6. Print checklist
 
 ```
 Harness initialized.

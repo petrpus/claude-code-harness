@@ -24,6 +24,8 @@
 #      failing open *silently*.
 #   7. scripts/test-autopilot-loop.sh — drives loop.sh end-to-end against a
 #      stub `claude`, so the runner's gating decisions are exercised for free.
+#      scripts/test-deliver.sh does the same for skills/deliver/deliver.sh,
+#      against a bare git remote and a fake `gh`.
 #   8. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
@@ -36,6 +38,14 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 1
 
 FAIL=0
+# Same reason as in the test scripts: never let a caller's withheld-credential
+# environment leak into verify's own checks (#83).
+unset GH_CONFIG_DIR GIT_CONFIG_COUNT
+# The loop and deliver suites run the way autopilot and /deliver run verify:
+# with forge credentials withheld. A test that silently depends on the
+# caller's environment then fails here, in CI, not only in a live run.
+# shellcheck source=../skills/autopilot/agent.sh
+. skills/autopilot/agent.sh
 note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }
 section() { echo; echo "== $1 =="; }
@@ -51,6 +61,7 @@ cleanup() {
   [[ -n "$TMP_FEAT_REPO" && -d "$TMP_FEAT_REPO" ]] && rm -rf "$TMP_FEAT_REPO"
   local d
   for d in "${TMP_GATE_DIRS[@]:-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf "$d"; done
+  agent_cleanup
   return 0
 }
 trap cleanup EXIT
@@ -349,13 +360,28 @@ fi
 # a stub `claude`, so the runner's decisions are exercised without spending.
 section "autopilot loop control flow"
 if [[ -f scripts/test-autopilot-loop.sh ]]; then
-  if bash scripts/test-autopilot-loop.sh; then
+  if agent_run_without_forge_credentials bash scripts/test-autopilot-loop.sh; then
     ok "autopilot loop control flow passed"
   else
     note "autopilot loop control flow failed (see above)"
   fi
 else
   note "scripts/test-autopilot-loop.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# /deliver holds every forge operation (ADR-0007), so its tests run against a
+# bare git remote and a fake gh — offline, and asserting on the commands the
+# runner actually ran (no force push, no --admin, merges pinned to a head).
+section "deliver runner (map → PR → merge)"
+if [[ -f scripts/test-deliver.sh ]]; then
+  if agent_run_without_forge_credentials bash scripts/test-deliver.sh; then
+    ok "deliver runner passed"
+  else
+    note "deliver runner failed (see above)"
+  fi
+else
+  note "scripts/test-deliver.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------
@@ -398,6 +424,56 @@ if [[ -f skills/autopilot/allowlist.sh ]]; then
   verify_grants_are_narrow './scripts/verify.sh' \
     && note "'./scripts/verify.sh' wrongly reported as narrow" \
     || ok "prefix grant kept for a direct script path"
+
+  # detect_verify_cmd: project-type precedence (package.json -> scripts/
+  # verify.sh -> Makefile), each exercised in its own throwaway temp dir so
+  # no test's fixture files leak into another's.
+  detect_case() { # desc setup want_cmd want_rc
+    local desc="$1" setup="$2" want_cmd="$3" want_rc="$4"
+    local d out rc
+    d="$(mktemp -d)"
+    ( cd "$d" && eval "$setup" ) >/dev/null 2>&1
+    out="$(cd "$d" && detect_verify_cmd)"; rc=$?
+    rm -rf "$d"
+    if [[ "$out" == "$want_cmd" && "$rc" -eq "$want_rc" ]]; then
+      ok "detect_verify_cmd: $desc"
+    else
+      note "detect_verify_cmd: $desc: got '$out' (rc=$rc), want '$want_cmd' (rc=$want_rc)"
+    fi
+    # A fixture that detects a command must get exactly that command's grant
+    # from verify_grants, with no broad interpreter prefix (Bash(bash:*),
+    # Bash(make:*)) that would hand BUILD arbitrary shell/make access.
+    if [[ "$rc" -eq 0 ]]; then
+      local grants; grants="$(verify_grants "$out")"
+      if [[ "$grants" == *"Bash($out)"* && "$grants" != *'Bash(bash:*)'* && "$grants" != *'Bash(make:*)'* ]]; then
+        ok "verify_grants for detected '$out': narrow"
+      else
+        note "verify_grants for detected '$out': got '$grants'"
+      fi
+    fi
+  }
+  detect_case 'npm project' \
+    'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json' \
+    'npm run verify' 0
+  detect_case 'pnpm project (pnpm-lock.yaml present)' \
+    'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json; touch pnpm-lock.yaml' \
+    'pnpm verify' 0
+  detect_case 'package.json without a verify script falls through to scripts/verify.sh' \
+    'printf "{\"scripts\":{\"test\":\"echo x\"}}" > package.json; mkdir -p scripts; : > scripts/verify.sh' \
+    'bash scripts/verify.sh' 0
+  detect_case 'scripts/verify.sh (need not be executable)' \
+    'mkdir -p scripts; : > scripts/verify.sh' \
+    'bash scripts/verify.sh' 0
+  detect_case 'Makefile with a verify: target' \
+    'printf "verify:\n\techo x\n" > Makefile' \
+    'make verify' 0
+  detect_case 'Makefile without a verify: target (only verify-all:)' \
+    'printf "verify-all:\n\techo x\n" > Makefile' \
+    '' 1
+  detect_case 'empty directory' '' '' 1
+  detect_case 'package.json wins over scripts/verify.sh' \
+    'printf "{\"scripts\":{\"verify\":\"echo x\"}}" > package.json; mkdir -p scripts; : > scripts/verify.sh' \
+    'npm run verify' 0
 else
   note "skills/autopilot/allowlist.sh is missing"
 fi
@@ -621,6 +697,27 @@ if [[ -f skills/autopilot/slices.sh ]]; then
     && ok "slices_record_fail increments that id's counter (2 calls -> 2)" \
     || note "expected A to be at fails=2 after two record_fail calls, got '$FAILS_A'"
 
+  # -- last_turn_limit: set by a turn-limit failure, cleared by a later one --
+  [[ "$(slices_get_last_turn_limit "$STATE" A)" == "false" ]] \
+    && ok "last_turn_limit defaults to false (record_fail without the flag)" \
+    || note "expected last_turn_limit=false after plain record_fail"
+  STATE="$(slices_record_fail "$STATE" A true)"
+  [[ "$(slices_get_last_turn_limit "$STATE" A)" == "true" && "$(slices_get_fails "$STATE" A)" == "3" ]] \
+    && ok "slices_record_fail <id> true sets last_turn_limit and still counts the fail" \
+    || note "turn-limit record_fail: last_turn_limit='$(slices_get_last_turn_limit "$STATE" A)' fails='$(slices_get_fails "$STATE" A)'"
+  STATE="$(slices_record_fail "$STATE" A false)"
+  [[ "$(slices_get_last_turn_limit "$STATE" A)" == "false" ]] \
+    && ok "a later non-turn-limit failure clears last_turn_limit" \
+    || note "last_turn_limit should be cleared by a non-turn-limit failure"
+  OLD_SHAPE='{"plan_sig":"","slices":{"Z":{"fails":1,"escalated":false,"parked":false}}}'
+  [[ "$(slices_get_last_turn_limit "$OLD_SHAPE" Z)" == "false" \
+    && "$(slices_get_last_turn_limit "$OLD_SHAPE" nope)" == "false" \
+    && "$(slices_get_last_turn_limit 'not json' Z)" == "false" ]] \
+    && ok "an old-shape/absent/corrupt record reads last_turn_limit as false" \
+    || note "getter should read false for old-shape, unknown id and corrupt json"
+  STATE="$(slices_record_fail "$STATE" A false)"
+  STATE="$(printf '%s' "$STATE" | jq -c '.slices.A.fails = 2')"
+
   slices_write "$SLICES_TEST_FILE" "$STATE"
   STATE="$(slices_reconcile "$SLICES_TEST_FILE" A B)"
   FAILS_A="$(slices_get_fails "$STATE" A)"
@@ -671,6 +768,145 @@ if [[ -f skills/autopilot/slices.sh ]]; then
 else
   note "skills/autopilot/slices.sh is missing"
 fi
+
+# ---------------------------------------------------------------------------
+# agent_run() (skills/autopilot/agent.sh) is the single model-call seam for
+# loop.sh and /deliver. Its contract is "print nothing, leave the answer in
+# AGENT_LAST_*" — the echo-your-answer contract it replaced let loop.sh drop
+# every verifier call's cost in a `$(...)` subshell.
+section "autopilot model-call core (agent.sh)"
+AGENT_DIR="$(mktemp -d)"
+mkdir -p "$AGENT_DIR/bin" "$AGENT_DIR/cwd"
+cat > "$AGENT_DIR/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+pwd > "$AGENT_PWD_FILE"
+printf '%s\n' "$*" > "$AGENT_ARGS_FILE"
+case "${STUB_AGENT_MODE:-ok}" in
+  ok)    printf '{"result":"hi there","total_cost_usd":0.25,"num_turns":2,"usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":5}}\n' ;;
+  fail)  echo "not json at all"; exit 3 ;;
+  sleep) sleep 5 ;;
+esac
+STUB
+chmod +x "$AGENT_DIR/bin/claude"
+AGENT_REPO="$(pwd)"
+AGENT_OUT="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_PWD_FILE="$AGENT_DIR/pwd" AGENT_ARGS_FILE="$AGENT_DIR/args" bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  AGENT_MAX_TURNS=7; AGENT_STDERR_LOG=rel-stderr.log; AGENT_DISALLOWED_TOOLS="Bash,Write"
+  agent_run build sonnet "Read,Grep" acceptEdits "the prompt" "$2/cwd" > "$2/stdout"; rc=$?
+  cp "$2/args" "$2/args.first" 2>/dev/null; cp "$2/pwd" "$2/pwd.first" 2>/dev/null
+  printf "%s|%s|%s|%s|%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$AGENT_LAST_COST" "$AGENT_LAST_IN_TOKENS" \
+    "$AGENT_LAST_OUT_TOKENS" "$AGENT_LAST_TURNS" "$AGENT_LAST_CACHE_READ"
+  STUB_AGENT_MODE=fail agent_run build sonnet "Read" acceptEdits "p"; rc=$?
+  printf "%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$AGENT_LAST_COST"
+  AGENT_TIMEOUT=1 STUB_AGENT_MODE=sleep agent_run build sonnet "Read" acceptEdits "p"; echo "$?"
+  rm -f "$2/args"; AGENT_DRY_RUN=1 agent_run plan opus "Read" acceptEdits "p" 2>/dev/null; rc=$?
+  printf "%s|%s|%s\n" "$rc" "$AGENT_LAST_RESULT" "$([[ -f "$2/args" ]] && echo called || echo not-called)"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+AGENT_L1="$(sed -n 1p <<<"$AGENT_OUT")"; AGENT_L2="$(sed -n 2p <<<"$AGENT_OUT")"
+AGENT_L3="$(sed -n 3p <<<"$AGENT_OUT")"; AGENT_L4="$(sed -n 4p <<<"$AGENT_OUT")"
+AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
+[[ "$AGENT_L1" == "0|hi there|0.25|3|4|2|5" ]] \
+  && ok "agent_run parses result, cost, tokens, turns and cache reads into AGENT_LAST_*" \
+  || note "agent_run globals wrong: '$AGENT_L1'"
+[[ -f "$AGENT_DIR/rel-stderr.log" && ! -e "$AGENT_DIR/cwd/rel-stderr.log" ]] \
+  && ok "a relative AGENT_STDERR_LOG resolves against the caller's directory, not the call's cwd" \
+  || note "relative AGENT_STDERR_LOG landed in the wrong place (or nowhere)"
+[[ ! -s "$AGENT_DIR/stdout" ]] \
+  && ok "agent_run prints nothing (callers read AGENT_LAST_RESULT, never \$(...))" \
+  || note "agent_run wrote to stdout: $(head -c 80 "$AGENT_DIR/stdout")"
+[[ "$(cat "$AGENT_DIR/pwd.first" 2>/dev/null)" == "$AGENT_DIR/cwd" ]] \
+  && ok "agent_run runs claude in the given cwd" \
+  || note "agent_run cwd was '$(cat "$AGENT_DIR/pwd" 2>/dev/null)'"
+[[ "$AGENT_ARGS_FIRST" == *"--max-turns 7"* && "$AGENT_ARGS_FIRST" == *"--model sonnet"* && "$AGENT_ARGS_FIRST" == *"--allowedTools Read,Grep"* \
+   && "$AGENT_ARGS_FIRST" == *"--disallowedTools Bash,Write"* ]] \
+  && ok "agent_run passes model, allowlist, AGENT_MAX_TURNS and AGENT_DISALLOWED_TOOLS through" \
+  || note "agent_run args were: '$AGENT_ARGS_FIRST'"
+[[ "$AGENT_ARGS_FIRST" == *'--strict-mcp-config --mcp-config {"mcpServers":{}}'* ]] \
+  && ok "agent_run starts no MCP servers (--strict-mcp-config with an empty --mcp-config)" \
+  || note "agent_run args were: '$AGENT_ARGS_FIRST'"
+[[ "$AGENT_L2" == "3||0" ]] \
+  && ok "a failing call returns its exit code with empty result and zero cost" \
+  || note "failing call: '$AGENT_L2' — expected '3||0'"
+[[ "$AGENT_L3" == "124" ]] \
+  && ok "AGENT_TIMEOUT bounds a hung call (exit 124)" \
+  || note "hung call returned '$AGENT_L3', expected 124"
+[[ "$AGENT_L4" == "0|dry-run|not-called" ]] \
+  && ok "AGENT_DRY_RUN returns a zero-cost dry-run result without calling claude" \
+  || note "dry run: '$AGENT_L4'"
+
+# ADR-0007: the model call runs without forge credentials; the caller keeps
+# its own. The stub reports what it sees; the caller's environment is checked
+# after the call.
+cat > "$AGENT_DIR/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+{
+  echo "GH_TOKEN=${GH_TOKEN-<unset>}"
+  echo "GITHUB_TOKEN=${GITHUB_TOKEN-<unset>}"
+  echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK-<unset>}"
+  echo "GH_CONFIG_DIR_EMPTY=$([[ -d "${GH_CONFIG_DIR:-/nonexistent}" && -z "$(ls -A "$GH_CONFIG_DIR")" ]] && echo yes || echo no)"
+  echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND-<unset>}"
+  echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT-<unset>}"
+  echo "GIT_ASKPASS=${GIT_ASKPASS-<unset>}"
+  echo "LAST_HELPER=[$(git config --get-all credential.helper | tail -1)]"
+  echo "USER_NAME=$(git config --get user.name)"
+  echo "BASH_TIMEOUTS=${BASH_DEFAULT_TIMEOUT_MS-<unset>}/${BASH_MAX_TIMEOUT_MS-<unset>}"
+} > "$AGENT_ENV_FILE"
+printf '{"result":"ok","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+STUB
+chmod +x "$AGENT_DIR/bin/claude"
+AGENT_CALLER="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$AGENT_DIR/env" \
+  GH_TOKEN=caller-token GITHUB_TOKEN=caller-token2 SSH_AUTH_SOCK=/tmp/caller.sock \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=kept-by-env bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  AGENT_TIMEOUT=900 AGENT_TRANSCRIPT_DIR="$2/calls" agent_run build sonnet "Read" acceptEdits "p"
+  AGENT_TIMEOUT=900 AGENT_TRANSCRIPT_DIR="$2/calls" agent_run verify_agent haiku "Read" acceptEdits "p"
+  echo "$GH_TOKEN|$SSH_AUTH_SOCK|${GH_CONFIG_DIR-<unset>}|$GIT_CONFIG_COUNT"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+AGENT_ENV="$(cat "$AGENT_DIR/env" 2>/dev/null)"
+grep -qx 'BASH_TIMEOUTS=900000/900000' <<<"$AGENT_ENV" \
+  && ok "the model's Bash tool may run a command as long as the call itself (AGENT_TIMEOUT → BASH_*_TIMEOUT_MS)" \
+  || note "Bash tool timeouts in the call: $(grep BASH_TIMEOUTS <<<"$AGENT_ENV")"
+[[ -f "$AGENT_DIR/calls/001-build.md" && -f "$AGENT_DIR/calls/002-verify_agent.md" ]] \
+  && grep -q '^ok$' "$AGENT_DIR/calls/001-build.md" && head -1 "$AGENT_DIR/calls/001-build.md" | grep -q 'build · model sonnet · exit 0' \
+  && ok "AGENT_TRANSCRIPT_DIR keeps each call's reply as <seq>-<phase>.md" \
+  || note "transcripts: $(ls "$AGENT_DIR/calls" 2>/dev/null | tr '\n' ' ')"
+AGENT_SEQ2="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE=/dev/null bash -c '
+  . "$1/skills/autopilot/agent.sh"; AGENT_TRANSCRIPT_DIR="$2/calls" agent_run plan opus "Read" acceptEdits "p"
+  ls "$2/calls" | tr "\n" " "' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+[[ "$AGENT_SEQ2" == "001-build.md 002-verify_agent.md 003-plan.md " ]] \
+  && ok "a new process continues the numbering instead of overwriting earlier replies" \
+  || note "transcript numbering across processes: '$AGENT_SEQ2'"
+grep -qx 'GH_TOKEN=<unset>' <<<"$AGENT_ENV" && grep -qx 'GITHUB_TOKEN=<unset>' <<<"$AGENT_ENV" \
+  && grep -qx 'SSH_AUTH_SOCK=<unset>' <<<"$AGENT_ENV" && grep -qx 'GH_CONFIG_DIR_EMPTY=yes' <<<"$AGENT_ENV" \
+  && ok "the model call sees no gh token, no ssh agent and an empty gh config dir (ADR-0007)" \
+  || note "model call env: $(tr '\n' ' ' <<<"$AGENT_ENV")"
+grep -qx 'LAST_HELPER=\[\]' <<<"$AGENT_ENV" && grep -qx 'GIT_SSH_COMMAND=false' <<<"$AGENT_ENV" \
+  && grep -qx 'GIT_TERMINAL_PROMPT=0' <<<"$AGENT_ENV" && grep -qx 'GIT_ASKPASS=false' <<<"$AGENT_ENV" \
+  && grep -qx 'USER_NAME=kept-by-env' <<<"$AGENT_ENV" \
+  && ok "git in the model call has its credential helpers cleared, no prompt, no ssh — earlier GIT_CONFIG_* entries kept" \
+  || note "model call git env: $(tr '\n' ' ' <<<"$AGENT_ENV")"
+[[ "$AGENT_CALLER" == "caller-token|/tmp/caller.sock|<unset>|1" ]] \
+  && ok "the caller keeps its own credentials after the call" \
+  || note "caller env after the call: '$AGENT_CALLER'"
+# If the private gh dir cannot be made, credentials cannot be withheld: both
+# entry points must refuse (125) and run nothing.
+rm -f "$AGENT_DIR/env" "$AGENT_DIR/ran"
+AGENT_REFUSE="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_ENV_FILE="$AGENT_DIR/env" \
+  TMPDIR="$AGENT_DIR/does-not-exist" bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  agent_run build sonnet "Read" acceptEdits "p"; a=$?
+  agent_run_without_forge_credentials touch "$2/ran"; b=$?; r1="$AGENT_REFUSED"
+  unset TMPDIR; agent_run_without_forge_credentials bash -c "exit 125"; c=$?; r2="$AGENT_REFUSED"
+  echo "$a|$b|$AGENT_LAST_RC|${AGENT_LAST_RESULT}|$r1|$c|$r2"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+[[ "$AGENT_REFUSE" == "125|125|125||1|125|0" && ! -e "$AGENT_DIR/env" && ! -e "$AGENT_DIR/ran" ]] \
+  && ok "no private dir → both entry points refuse (125, AGENT_REFUSED=1) and run nothing; a command's own 125 is not a refusal" \
+  || note "refusal path: '$AGENT_REFUSE', model ran: $([[ -e "$AGENT_DIR/env" ]] && echo yes || echo no), command ran: $([[ -e "$AGENT_DIR/ran" ]] && echo yes || echo no)"
+AGENT_CLEAN="$(cd "$AGENT_DIR" && bash -c '
+  . "$1/skills/autopilot/agent.sh"; agent_noforge_dir; d="$AGENT_NOFORGE_DIR"; agent_cleanup
+  [[ -n "$d" && ! -e "$d" ]] && echo removed' _ "$AGENT_REPO")"
+[[ "$AGENT_CLEAN" == "removed" ]] && ok "agent_cleanup removes the private dir" || note "agent_cleanup left the dir"
+rm -rf "$AGENT_DIR"
 
 # ---------------------------------------------------------------------------
 section "code-map renders repo-map"

@@ -9,7 +9,7 @@ Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code
 | **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `grilling`, `handoff`, `improve-codebase-architecture`, `prototype`, `research`, `resolving-merge-conflicts`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
 | **Skills (Vercel Labs)** | `find-skills` |
 | **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
-| **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `repo-map` (queryable import graph), `code-map` |
+| **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `deliver` (a Map issue → per-issue autopilot runs → one integration PR), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `repo-map` (queryable import graph), `code-map` |
 | **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 17-shortcuts gate, haiku) |
 | **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` + `session-log` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks); all parse stdin JSON via `hooks/lib.sh` |
 | **Own verify** | `scripts/verify.sh` — the harness's own gate: check-consistency, a stdin-JSON hook test matrix, fault-injection sweeps for the repo-map generator and the hooks, an end-to-end autopilot loop test, and a `bash -n` floor. Run before every PR. |
@@ -75,7 +75,7 @@ The skills assume:
 - **Issue tracker**: GitHub Issues (uses `gh` CLI). Skills like `to-issues`, `triage`, `next`, `implement-issue` call `gh issue ...`.
 - **Domain language**: `CLAUDE.md` at repo root + `CONTEXT.md` (optional) + `docs/adr/` for architectural decisions.
 - **Build / verify**: `npm run verify` or `pnpm verify`. Hooks read `tmp/.last-verify-status` for freshness.
-- **Branch model**: feature branches off `main`. Pre-bash hook blocks `git push` from `main`/`master`.
+- **Branch model**: feature branches off `main`. Pre-bash hook blocks `git push` from `main`/`master`. `/deliver` adds an integration level: `integration/<slug>` off `main`, per-issue branches off it, and one final integration PR into `main` (see `skills/deliver/SKILL.md`).
 
 If your project doesn't match these, you can still install the plugin and ignore individual skills. Hooks can be disabled per-project via project `settings.json`.
 

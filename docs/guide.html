@@ -251,6 +251,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
     <a href="#anatomy">Anatomy</a>
     <a href="#install">Install</a>
     <a href="#workflows">Workflows</a>
+    <a href="#deliver">Deliver</a>
     <a href="#autopilot">Autopilot</a>
     <a href="#models">Models</a>
     <a href="#practices">Best practices</a>
@@ -267,11 +268,11 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section class="hero" id="thesis" style="border-top:none">
     <div class="hero-grid">
       <div>
-        <p class="eyebrow">Claude Code plugin · v0.5.1</p>
+        <p class="eyebrow">Claude Code plugin · v0.6.0</p>
         <h1>A harness for safe, cost-conscious autonomous development.</h1>
         <p class="lead">Curated skills, two review agents, and git/dev guard hooks — plus a loop engine that runs long unattended sessions behind hard verify gates and real cost caps. Install once; every project gets the same disciplined toolkit.</p>
         <div class="pillrow">
-          <span class="pill"><b>34</b> skills</span>
+          <span class="pill"><b>35</b> skills</span>
           <span class="pill"><b>2</b> agents</span>
           <span class="pill"><b>6</b> hooks</span>
           <span class="pill">fresh-context <b>loops</b></span>
@@ -350,7 +351,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
     <div class="bucket">
       <span class="label">Skills · own — autonomy &amp; infrastructure</span>
       <div class="chips">
-        <span class="chip own"><span class="k">/</span>autopilot</span><span class="chip own"><span class="k">/</span>cost-discipline</span>
+        <span class="chip own"><span class="k">/</span>autopilot</span><span class="chip own"><span class="k">/</span>deliver</span><span class="chip own"><span class="k">/</span>cost-discipline</span>
         <span class="chip own"><span class="k">/</span>usage-report</span><span class="chip own"><span class="k">/</span>project-infra</span>
         <span class="chip own"><span class="k">/</span>openapi-sync</span><span class="chip own"><span class="k">/</span>repo-map</span>
         <span class="chip own"><span class="k">/</span>code-map</span>
@@ -382,7 +383,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 
     <div class="card" style="margin-top:24px">
       <h3>Verify &amp; verification tiers</h3>
-      <p style="margin-bottom:0">The harness has its own gate, <code>scripts/verify.sh</code> — check-consistency + a stdin-JSON hook test matrix + a <code>bash&nbsp;-n</code> floor — run before every PR and by autopilot as its machine-verify. Verification is <b>reminders by default</b> (the Stop hooks always exit&nbsp;0); for unattended runs you can opt into a <b>hard gate</b>, <code>templates/require-verify-before-stop.sh</code>, which blocks the turn (exit&nbsp;2) until verify is a fresh <code>ok</code>. Opt-in only, never wired by default (ADR-0002).</p>
+      <p style="margin-bottom:0">The harness has its own gate, <code>scripts/verify.sh</code> — check-consistency, a stdin-JSON hook test matrix, a <code>bash&nbsp;-n</code> floor, fault-injection sweeps and the autopilot / <code>/deliver</code> end-to-end tests — run before every PR and by autopilot as its machine-verify. Verification is <b>reminders by default</b> (the Stop hooks always exit&nbsp;0); for unattended runs you can opt into a <b>hard gate</b>, <code>templates/require-verify-before-stop.sh</code>, which blocks the turn (exit&nbsp;2) until verify is a fresh <code>ok</code>. Opt-in only, never wired by default (ADR-0002).</p>
     </div>
   </section>
 
@@ -491,6 +492,74 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
     </div>
   </section>
 
+  <!-- ===================================================== DELIVER -->
+  <section id="deliver">
+    <p class="eyebrow">Deliver a map</p>
+    <h2>From a Map issue to one integration PR.</h2>
+    <p class="sec-intro">When the work is a set of issues rather than one, <code>/deliver</code> walks a <b>Map</b> — a <code>map</code>-labelled issue listing the slices and their blocking edges — builds each issue on its own branch off an <code>integration/&lt;slug&gt;</code> branch, and opens a single final PR into the repo's default branch.</p>
+    <div class="flow">
+
+      <div class="card">
+        <p class="scenario">1) Write the Map</p>
+        <h3>Slices with blocking edges</h3>
+        <p>Let <code>/to-issues</code> (or <code>/start-feature</code>) publish the issues and the Map that ties them together.</p>
+        <ul class="steps">
+          <li><code>/to-issues</code> — vertical slices, each declaring what blocks it</li>
+          <li>the <code>map</code> issue lists every slice as a task</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <p class="scenario">2) Pre-flight</p>
+        <h3>Check before spending</h3>
+        <p><code>/deliver #&lt;map&gt;</code> first runs the plan-only pre-flight: which issues are ready, which are blocked, which base branch and verify command apply.</p>
+        <ul class="steps">
+          <li><code>/deliver #12</code> — plan, confirm flags, then launch</li>
+          <li><code>--create-integration</code> or <code>--allow-main</code> — choose the base branch</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <p class="scenario">3) tmux run</p>
+        <h3>Unattended, one issue at a time</h3>
+        <p>The run starts detached in a <code>deliver-&lt;N&gt;</code> tmux session. Each issue gets an autopilot build loop, a full verify, an independent review, the CI wait, and a squash-merge into the integration branch.</p>
+        <ul class="steps">
+          <li><code>tmux has-session -t deliver-12</code> — is it alive?</li>
+          <li><code>deliver.sh --map 12 --resume</code> — continue an interrupted run</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <p class="scenario">4) Monitor</p>
+        <h3>Watch the event stream</h3>
+        <p>Progress is appended to <code>tmp/deliver/&lt;run-id&gt;/events.jsonl</code>; the session surfaces each phase as it happens.</p>
+        <ul class="steps">
+          <li><code>deliver.sh --map 12 --status</code> — the run's headline, as one JSON line</li>
+          <li><code>deliver.sh --map 12 --stop</code> — graceful stop at the next phase boundary (exit&nbsp;6, resumable)</li>
+          <li><code>tmux kill-session -t deliver-12</code> — hard stop</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <p class="scenario">5) When an issue does not make it</p>
+        <h3>Fix rounds, then park</h3>
+        <p>A review that requests changes, or a red CI check, gets a fix round on the same PR. Both draw on one budget per issue, <code>--max-fix-rounds</code> (default&nbsp;2). An issue that still fails is <b>parked</b>: it gets the <code>needs-human</code> label, its PR goes back to draft and a comment explains why. Issues that wait on it are skipped, independent ones continue, and the run exits&nbsp;2.</p>
+        <ul class="steps">
+          <li><code>deliver.sh --map 12 --resume --retry '#7'</code> — discard a parked attempt and start it fresh</li>
+          <li><code>--budget-usd</code> / <code>--max-minutes</code> — caps for the whole run (exit&nbsp;4 / 3, resumable)</li>
+          <li><code>--max-turns 200</code> / <code>--review-max-turns 80</code> — turns per model call</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <p class="scenario">6) Final integration PR</p>
+        <h3>One review, one merge</h3>
+        <p>When the run ends, whether done or partial, the runner opens one PR from the integration branch into the default branch, or updates the one already open. Its body carries a <code>Closes #N</code> for each delivered issue, and <code>Closes #&lt;map&gt;</code> once every line of the Map is ticked. You review it and merge it with a merge commit; nothing is pushed to the default branch directly. Under <code>--allow-main</code> there is no final PR: each issue PR closes its own issue.</p>
+      </div>
+
+    </div>
+  </section>
+
   <!-- ===================================================== AUTOPILOT -->
   <section id="autopilot">
     <p class="eyebrow">Autopilot · the loop engine</p>
@@ -592,7 +661,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 
 <footer>
   <div class="wrap">
-    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.5.1 · MIT</span>
+    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.6.0 · MIT</span>
     <span class="muted">press <span class="kbd">t</span> to flip theme</span>
   </div>
 </footer>

@@ -112,9 +112,53 @@ blamed on the slice), and (e) holdout — Given/When/Then scenarios from an
 optional `HOLDOUT.md` (outside the worktree, never read by BUILD) inlined into
 the verifier prompt only. A slice that keeps failing climbs a five-rung stuck
 ladder tracked per-slice in `slices.json`: retry → escalate (`--escalate-model`,
-rung 2) → park (rung 3, a sibling runs instead) → one replan once everything
+rung 2; skipped when the last failure was a turn limit) → park (rung 3, a sibling runs instead) → one replan once everything
 unblocked is parked (rung 4, unparks everything) → abort on the next failure
 (rung 5). See `skills/autopilot/LOOP-PROTOCOL.md` and `docs/model-policy.md`.
+
+## Two-level model: `/deliver` over per-issue autopilot
+
+Delivery is two nested loops, each with one owner:
+
+```
+/deliver  (skills/deliver/deliver.sh)     ← outer: a Map of issues → merged PRs
+  └─ per issue: skills/autopilot/loop.sh  ← inner: one issue's plan → slices → checkpoints
+        └─ agent_run (skills/autopilot/agent.sh) → `claude -p`
+```
+
+- **Outer — the `/deliver` runner.** Walks a **Map** (a `map`-labelled issue,
+  ADR-0008) in blocking-edge order. Per issue it branches off the integration
+  branch, runs the inner loop with the issue as charter, verifies the exact head
+  (merging a moved base in first), pushes, opens the PR, runs an independent
+  review, waits for CI, squash-merges (falling back to `--merge` when the repo
+  forbids squash) and ticks the Map line. A review that requests changes or a
+  red check gets a fix round on the same PR, from one per-issue budget
+  (`--max-fix-rounds`). A failing issue is parked (`needs-human`) and its
+  dependents skipped.
+  When the walk ends it opens the integration → default PR for a human to merge.
+- **Inner — autopilot.** Unchanged from § autopilot state model: slices, gates,
+  stuck ladder. It knows nothing about GitHub.
+- **ADR-0007 — the runner may open and merge PRs; the model may not.** Every
+  forge mutation (push, `gh pr create`, comments, `gh pr merge`, issue and label
+  edits) lives in the bash runner (`skills/deliver/forge.sh`, called only by
+  `deliver.sh`). No model phase — PLAN, BUILD, verifier, reviewer — gets `gh` or
+  `git push`, and BUILD does not commit either: the runner owns checkpoints.
+- **`agent.sh` — the shared model-call core.** `skills/autopilot/agent.sh` is the
+  one place a model is called (`claude -p` under a timeout, JSON parsed into
+  globals). `loop.sh` and `deliver.sh` both source it, and it starts every call
+  with forge credentials stripped, so ADR-0007 holds at the call site, not only
+  through tool allowlists.
+
+Conventions of a Delivery run:
+
+| Convention | Detail |
+|---|---|
+| tmux session | `deliver-<N>` for Map `#N`; `tmux has-session -t deliver-<N>` tells whether the run is alive, `tmux kill-session -t deliver-<N>` is the hard stop |
+| labels | `map` (the contract issue), `prd` (the PRD it comes from), `ready-for-agent` (eligible), `needs-human` (parked), `needs-triage` (follow-ups filed by review) |
+| integration branches | `integration/<map-slug>` off `main`; per-issue branches off it; issue PRs squash-merge into it; `main`/`master` is refused as a target unless `--allow-main` |
+
+See `skills/deliver/SKILL.md` for the operator view and `docs/prd/0003-deliver.md`
+for the design.
 
 ## Decomposition doctrine (when to reach for subagents)
 

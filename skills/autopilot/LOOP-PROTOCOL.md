@@ -13,10 +13,28 @@ model pinning. autopilot keeps the insight and adds the enforcement.
 **Fresh context each iteration.** `loop.sh` never passes the CLI `--resume`/
 `--continue` — every `claude -p` starts clean. The `--resume-run` *flag on
 loop.sh* is different: it re-reads `tmp/autopilot/` disk state, adopting the
-most recent `run-<id>.jsonl`'s run id, iteration count and summed `cost_usd`
-(R1), so a killed run picks up its identity and both clocks instead of
-silently starting a new run at iteration 0 / cost 0. Continuity comes from
-disk, not from a growing window.
+most recent `run-<id>.jsonl`'s run id, iteration count, summed `cost_usd` and
+start time (R1), so a killed run picks up its identity and both clocks
+instead of silently starting a new run at iteration 0 / cost 0 / now.
+Continuity comes from disk, not from a growing window.
+
+`--resume-run`'s restore, precisely:
+
+- **id / iter** — the prior log's `run_id`, and its highest `iter`.
+- **cost** — `jq -s '[.[] | select(.phase!="iteration") | .cost_usd // 0] |
+  add // 0'` over the prior log: only per-call rows are summed, never the
+  `phase:"iteration"` summary rows (§ Log format) those calls were rolled up
+  into, so resuming can't double the total.
+- **start time** — the earliest parseable `ts` in the prior log (`jq -s 'map(.ts
+  | fromdateiso8601?) | map(select(. != null)) | min'`), used as `START_EPOCH`
+  instead of the current clock, so `--max-minutes` keeps counting from the
+  run's original start rather than resetting on every resume. An unreadable or
+  implausible restored value (not a plausible epoch, or later than the current
+  clock) falls back to the current clock with a logged notice — never to `0`
+  — and a fresh run, or a resume with no prior log at all, behaves exactly as
+  before this restore existed. R1's reload (below) carries its own
+  already-resolved `START_EPOCH` across the `exec` via `AUTOPILOT_START_EPOCH`,
+  so a mid-run reload doesn't reset the clock either.
 
 ### Runner self-reload (R1)
 
@@ -31,14 +49,21 @@ against the hash taken at startup. On a mismatch it logs a `runner_reload`
 line, writes `status.json`, and `exec`s itself with the original argv plus
 `--resume-run` — `exec` keeps the PID, so the concurrency lock and the
 dirty-tree guard must not re-trip on the process's own prior state.
-`RUN_ID`/iteration count/accumulated cost hand across via
+`RUN_ID`/iteration count/accumulated cost/start time hand across via
 `AUTOPILOT_RUN_ID`/`AUTOPILOT_ITER`/`AUTOPILOT_TOTAL_COST`/
-`AUTOPILOT_LOCK_OWNED`, which the startup block adopts ahead of the
-`--resume-run` disk-based path above. At most one reload happens per
-iteration — the new process computes its own baseline hash fresh at startup,
-so an unchanged file can never spin.
+`AUTOPILOT_START_EPOCH`/`AUTOPILOT_LOCK_OWNED`, which the startup block adopts
+ahead of the `--resume-run` disk-based path above — so a reload never
+re-derives the start time from the log and never resets `--max-minutes`'s
+clock. At most one reload happens per iteration — the new process computes its
+own baseline hash fresh at startup, so an unchanged file can never spin.
 
-## State files (`tmp/autopilot/`)
+## State files (`tmp/autopilot/`, or `--state-dir`)
+
+Every path below is derived from one state directory, `tmp/autopilot/` unless
+`--state-dir <dir>` names another (relative paths resolve against the repo
+root, so an R1 reload lands in the same place). The runner refuses a state
+dir inside the repo that git does not ignore: checkpoint commits are
+`git add -A`, and would otherwise commit the run's own state.
 
 | File | Role |
 |---|---|
@@ -49,6 +74,7 @@ so an unchanged file can never spin.
 | `status.json` | Live run state, iterations done, accumulated cost, HEAD sha, plus S3B's per-run aggregates. |
 | `run-<id>.jsonl` | Structured per-phase log (see below). |
 | `lock` | `PID run_id` — concurrency guard with stale-PID detection. |
+| `calls/<seq>-<phase>.md` | Every model call's reply, in order (PLAN, BUILD, verifier, replan), with its exit code and duration — the only record of *why* an iteration did what it did. Runner-written; never read by a prompt. |
 | `slices.json` | Per-slice retry/park ladder state (S4A, `slices.sh`). Runner-owned; never named in any prompt. Missing = nothing has failed yet. |
 
 `HOLDOUT.md` (optional, S2) is deliberately **not** one of these — it lives
@@ -69,16 +95,33 @@ loop:
        fingerprint plan_dag, straight to replan — bypasses the ladder below
   BUILD           sonnet (or --escalate-model on rung 2)   acceptEdits + explicit --allowedTools
     └─ exactly the selected plan item, TDD (red-green-refactor), ADR if
-       architectural, run verify, tick box, append MEMORY, set STATUS
+       architectural, run verify, tick box, append MEMORY, set STATUS —
+       does NOT `git add`/`git commit` (not in its allowlist): the runner
+       stages the whole iteration (`git add -A`) after BUILD and before the
+       gates below, which all read that index against `ITER_BASE_SHA` (HEAD
+       as recorded right before this BUILD call); it commits the checkpoint
+       itself only after the gates settle, in whichever outcome the
+       iteration ends with (green / unmeasured / progress / wip)
   GATE b  machine verify   runner    executes the verify command itself
-  GATE c  secret scan      runner    greps the diff for keys/tokens
-  GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict
+  GATE c  secret scan      runner    greps the added lines of
+                                      `git diff --cached ITER_BASE_SHA`
+                                      for keys/tokens — covers everything
+                                      staged since ITER_BASE_SHA, including
+                                      new untracked files and anything BUILD
+                                      would otherwise have committed itself
+  GATE d  semantic verify  haiku     agents/verifier.md, adversarial, JSON verdict;
+                                      told to run `git diff --cached ITER_BASE_SHA`
+                                      (not `git diff HEAD`) — same base as gate c,
+                                      so a same-iteration BUILD commit is still
+                                      in view
   GATE e  holdout          haiku     same call as gate d — HOLDOUT.md's content
                                       inlined into the verifier prompt only, if any
   then, gates green:
     STATUS: done          → checkpoint, exit 0
     more boxes ticked     → checkpoint "progress", continue (NOT a failure)
-    nothing moved         → no-progress failure
+    nothing moved         → no-progress failure (turn-limit when BUILD's call
+                            ended on --max-turns: its partial work is
+                            checkpointed and FEEDBACK says to continue it)
   any gate red            → FEEDBACK.md, reset sentinel, checkpoint WIP, maybe replan
 ```
 
@@ -167,7 +210,8 @@ runner-owned — written and read only by `loop.sh`, never named in any prompt:
 
 ```json
 {"plan_sig": "<cksum of the ordered unticked slice ids>",
- "slices": {"S2": {"fails": 3, "escalated": false, "parked": true}}}
+ "slices": {"S2": {"fails": 3, "escalated": false, "parked": true,
+                    "last_turn_limit": false}}}
 ```
 
 Every iteration reconciles this against the CURRENT plan before selecting: an
@@ -216,6 +260,17 @@ instead of `--build-model`; the very next BUILD call for a *different* slice,
 or for this same slice once it ticks and `slices_retire()` drops its record,
 is back on `--build-model` — there is no separate "de-escalate" step, only
 the absence of a `fails >= 2` record to escalate against.
+
+**Except after a turn limit (#101).** When the slice's most recent failure
+was a BUILD that ran out of `--max-turns` (`last_turn_limit` in
+`slices.json`, set by that iteration's `turn_limit`), rung 2 stays on
+`--build-model`: the item is too large for one call, not too hard for the
+model, and a stronger model hits the same cap. The runner logs a
+`{"phase":"escalation","model":"-","verdict":"skipped-turn-limit"}` row and appends a
+FEEDBACK note telling BUILD to continue the checkpointed work; the rest of
+the ladder is unchanged, so a third failure still parks the slice and the
+park/replan rungs split it. Any later failure that is not a turn limit clears
+the flag, and escalation applies again as usual.
 
 Escalation is **never applied to the verifier** — `--verify-model` is
 untouched regardless of what BUILD ran on; the cheap adversarial tier is the
@@ -291,6 +346,19 @@ exit code. The build model's *claim* that verify passed is never trusted —
 shortcut #5 (modifying the verify command) and #10 ("done" without running it)
 are exactly the failures a self-reported gate misses.
 
+Absent `--verify-cmd`, `loop.sh` sources `allowlist.sh`'s `detect_verify_cmd`
+to pick that command, trying project types in order and falling through on a
+miss at each step: a `package.json` with a `scripts.verify` entry (`pnpm
+verify` if `pnpm-lock.yaml` exists, else `npm run verify`, unchanged from
+0.4.0) → `scripts/verify.sh` (`bash scripts/verify.sh`) → a
+`Makefile`/`makefile`/`GNUmakefile` with a `^verify:` target line (`make
+verify`). No match is empty output and a non-zero return, which is the
+existing "no verify command found" startup error, not a new failure mode.
+`verify_grants` (also `allowlist.sh`) allows exactly the detected command —
+`bash`/`make`/`npm`/`pnpm` are interpreters there, so the grant is always the
+literal `Bash(<detected cmd>)`, never a `Bash(bash:*)`/`Bash(make:*)` prefix
+that would also admit unrelated commands.
+
 When a run's own target repo is this harness, gate (b) is `bash
 scripts/verify.sh`, which runs `scripts/check-consistency.sh` as one of its
 sections (S0) — including that script's `.github/workflows/verify.yml`
@@ -359,6 +427,13 @@ with write access is a safety and consistency hole. The loop never uses
 `--dangerously-skip-permissions`; plugin hooks fire in headless mode, so
 push-from-main and `.env`/secret guards stay live.
 
+Every call — PLAN, BUILD, replan, the verifier — goes through `agent_run()` in
+`agent.sh`, the single model-call seam shared with `/deliver` (and the one a
+second backend would plug into, #42). It prints nothing and leaves the answer
+and its cost in `AGENT_LAST_*`, so no caller can drop a call's cost by
+capturing its output in a `$(...)` subshell — the way the verifier's cost used
+to go missing from the budget.
+
 ## Caps & stuck detection
 
 - `--max-iterations` (default 10), `--max-minutes` (120), `--budget-usd` (10).
@@ -367,6 +442,18 @@ push-from-main and `.env`/secret guards stay live.
 - `--per-call-timeout` (1200s) wraps every `claude -p` and the verify command in
   `timeout`, so one hung call can't defeat `--max-minutes` (which is only checked
   between phases).
+- `--verify-at-completion` (with optional `--iteration-verify-cmd`) moves gate
+  (b)'s full verify to the iteration that completes the plan — `STATUS: done`
+  or every box ticked; other iterations log `verify_cmd` as `deferred` (or run
+  the cheap iteration command). The completing iteration is still gated: a red
+  verify there resets `STATUS` and feeds back like any failure. Meant for a
+  charter that another gate stands behind (`/deliver`'s final verify, review,
+  CI); a bare autopilot run keeps verifying every iteration.
+- `--stop-file <path>` is a graceful stop, not a cap: checked before PLAN and at
+  the top of every iteration (ahead of the caps), so a stop requested mid-BUILD
+  lets that iteration's gates and checkpoint finish, then exits **6** with state
+  `stopped`. The file belongs to its creator — the runner never removes it, so
+  resuming with it still present stops again immediately.
 - **Stuck detection (S4A):** on an annotated plan, driven by a per-slice
   `fails` counter (retry → park at 3 → replan once all candidates are parked
   or blocked → abort on the next failure) — see § The stuck ladder above. On
@@ -384,14 +471,15 @@ which is enough to tell them apart (`phase:"iteration"` vs. anything else).
 Per-call row:
 
 ```json
-{"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload",
+{"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload|escalation",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
- "exit_code":0,"verdict":"pass|fail|no_verdict|","holdout_failed":0,
- "turns":6,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"violations":[]}
+ "exit_code":0,"verdict":"pass|fail|no_verdict|turn-limit|skipped-turn-limit|","holdout_failed":0,
+ "turns":6,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"violations":[],
+ "cost_unknown":false}
 ```
 
 `runner_reload` (R1) is logged once, immediately before the `exec` that
-re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh` — it costs nothing and
+re-loads a changed `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh` — it costs nothing and
 carries no tokens, but marks exactly where a run's identity carried across a
 process replacement, which matters when reading `iter` back out as a
 monotonic sequence.
@@ -413,11 +501,17 @@ run, in addition to (not instead of) the per-call rows above:
 ```json
 {"ts":"…","run_id":"…","iter":3,"phase":"iteration","model":"-",
  "verdict":"done|unmeasured|progressed|fail","slice_id":"S3A","ticked_delta":1,
- "gate_failed":"verify_cmd|secret|verify_agent|holdout|plan_dag|no_verdict|none",
+ "gate_failed":"verify_cmd|stage|secret|verify_agent|holdout|plan_dag|no_verdict|no-progress|turn-limit|none",
  "wall_s":180,"cost_usd":0.42,"files_changed":4,"verify_s":12,"dag_width":2,
- "parked_count":0,"escalated":false,"repo_map":true}
+ "parked_count":0,"escalated":false,"repo_map":true,"turn_limit":false}
 ```
 
+`turn_limit` is true when that iteration's BUILD call ended on `--max-turns`
+(its reply's `subtype` is `error_max_turns`, #96); the call's own row then
+carries `"verdict":"turn-limit"`. It is the authoritative flag:
+`gate_failed` reads `turn-limit` only when every gate passed and nothing was
+ticked — a turn-limited BUILD whose half-done work fails verify keeps
+`verify_cmd`, with the turn limit named in FEEDBACK.
 `slice_id` is the id `select_next_slice()` assigned that iteration (S1B), or
 `""` on an unannotated plan. `gate_failed` mirrors the fingerprint the stuck
 ladder tracked for that iteration, or `"none"` when every gate passed —
@@ -439,13 +533,14 @@ map), so it answers "did BUILD see one," not "was the flag on."
 
 ### Per-run aggregates (S3B)
 
-`write_status()` recomputes seven aggregates from the run's own JSONL log on
+`write_status()` recomputes eight aggregates from the run's own JSONL log on
 *every* call (not accumulated in a bash variable across the run), and merges
 them into `status.json`:
 
 ```json
 {"iterations":3,"gate_fail_rate":0.667,"cost_per_ticked_slice":3,
- "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1}
+ "replans":0,"mean_dag_width":1,"parked_total":0,"escalations":1,
+ "verify_deferred":0}
 ```
 
 - `iterations` — count of `phase:"iteration"` rows so far.
@@ -463,6 +558,13 @@ them into `status.json`:
   slice parked, unparked by a replan, and parked again as two separate
   incidents; the peak answers "how bad did it get."
 - `escalations` — count of iterations with `escalated:true`.
+- `cost_unknown_calls` — count of call rows with `cost_unknown:true`: a call
+  cut off by `--per-call-timeout` reports no cost, so it is logged as unknown
+  rather than $0, and every cost total is a lower bound while this is > 0 (#84).
+- `verify_deferred` — count of iterations whose gate (b) was deferred under
+  `--verify-at-completion` (ADR-0009). Those iterations can never fail gate
+  (b), so a run with deferrals has a structurally lower `gate_fail_rate`;
+  compare it only with runs that deferred the same way.
 
 A missing or empty run log (before the first `log_iteration()` call, or a
 0.4.0-era `tmp/autopilot/` with no log at all) yields all-zero aggregates and
@@ -488,14 +590,15 @@ whichever side has no data in the logs given renders as `—`, not an error.
 
 ## Recovery
 
-A killed run leaves `tmp/autopilot/` intact and the lock is stale-detected on the
-next start. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
-iteration count and accumulated cost from its `run-<id>.jsonl` instead of starting
-a new run at iteration 0 / cost 0 — a missing log behaves like a fresh run
-(contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let
+A killed run leaves its state dir intact and the lock is stale-detected on the
+next start. A stopped run (exit 6) is the same, minus the stale lock: remove the
+stop file and `--resume-run`. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
+iteration count, accumulated cost and start time from its `run-<id>.jsonl`
+instead of starting a new run at iteration 0 / cost 0 / now — a missing log
+behaves like a fresh run (contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let
 you `git reset` to any clean point. On abort, `FEEDBACK.md` holds the last
 failure for a human to read.
 
-A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`
+A *live* run whose own BUILD phase fixes `loop.sh`/`plan.sh`/`allowlist.sh`/`slices.sh`/`agent.sh`
 does not need a manual restart at all — see Runner self-reload (R1) above; it
 re-execs itself under the same run id automatically.

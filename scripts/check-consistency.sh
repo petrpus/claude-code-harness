@@ -208,6 +208,140 @@ else
   ok "no src=/<link/@import/url(http) in docs/*.html"
 fi
 
+# ---------------------------------------------------------------------------
+section "Map format + front-half alignment (ADR-0008)"
+MAPF="skills/deliver/MAP-FORMAT.md"
+[[ -f "$MAPF" ]] && ok "$MAPF exists" || note "$MAPF is missing"
+for s in to-issues start-feature; do
+  grep -q 'MAP-FORMAT\.md' "skills/$s/SKILL.md" \
+    && ok "$s references MAP-FORMAT.md" || note "skills/$s/SKILL.md does not reference MAP-FORMAT.md"
+done
+grep -q '`prd`' skills/to-prd/SKILL.md \
+  && ok "to-prd labels the PRD prd" || note "to-prd does not apply the prd label"
+grep -q 'ready-for-agent' skills/start-feature/SKILL.md && grep -q '`prd`' skills/start-feature/SKILL.md \
+  && ok "start-feature uses prd / ready-for-agent" || note "start-feature lacks prd / ready-for-agent labels"
+grep -qi 'blocked by' skills/start-feature/SKILL.md \
+  && ok "start-feature uses a Blocked-by DAG" || note "start-feature lacks Blocked-by wording"
+grep -qiE 'no "?waits on' skills/start-feature/SKILL.md \
+  && note "start-feature still says 'no waits on #X'" || ok "start-feature has no 'no waits on' wording"
+grep -qF '/deliver #<map>' skills/start-feature/SKILL.md \
+  && ok "start-feature ends with /deliver #<map>" || note "start-feature does not point to /deliver #<map>"
+grep -q '/deliver' skills/next/SKILL.md \
+  && ok "next points to /deliver" || note "next does not point to /deliver"
+grep -E '^\| to-issues \|' docs/pocock-sync-log.md | grep -q 'Map-publishing' \
+  && ok "sync-log records the to-issues Map-publishing patch" || note "sync-log to-issues row lacks the Map-publishing local patch"
+grep -E '^\| to-prd \|' docs/pocock-sync-log.md | grep -q '`prd` label' \
+  && ok "sync-log records the to-prd prd-label patch" || note "sync-log to-prd row lacks the \`prd\` label local patch"
+
+# ---------------------------------------------------------------------------
+section "implement-issue follows the /deliver contract"
+II="skills/implement-issue/SKILL.md"
+ii_has() { grep -qE -- "$1" "$II" && ok "implement-issue: $2" || note "implement-issue lacks: $2"; }
+ii_has 'ready-for-agent' 'label ready-for-agent'
+ii_has '`--base`.*default branch|default branch.*`--base`|--base=<[^>]*>.*default branch' '--base defaults to the repo default branch'
+ii_has '[Vv]erify on the base' 'verify on the base'
+ii_has '[Cc]ommit before (the )?review|commit .*before .*review' 'commit before review'
+ii_has '--base=<base> --head=<branch>|--head=<' 'reviewer given --base / --head'
+ii_has 'git rev-parse --abbrev-ref HEAD' 'branch assertion around the review'
+ii_has 'last-verify-status' 'verify-status assertion around the review'
+ii_has 'gh pr create --base' 'gh pr create --base'
+ii_has 'needs-triage' 'out-of-scope findings filed as needs-triage issues'
+grep -q 'setup-matt-pocock-skills' CLAUDE.md && grep -qi 'known upstream mismatch' CLAUDE.md \
+  && ok "CLAUDE.md lists triage's /setup-matt-pocock-skills known upstream mismatch" \
+  || note "CLAUDE.md lacks the triage /setup-matt-pocock-skills known-mismatch note"
+
+# ---------------------------------------------------------------------------
+section "harness-init bootstraps the workflow labels"
+HI="skills/harness-init/SKILL.md"
+for l in map prd ready-for-agent needs-human needs-triage; do
+  grep -qE -- "gh label create $l( |\$)" "$HI" \
+    && ok "harness-init creates label $l" || note "harness-init does not create label $l"
+done
+grep -q -- '--force' "$HI" && ok "harness-init label creation is idempotent (--force)" \
+  || note "harness-init label creation is not idempotent (--force)"
+grep -qiE 'without .?gh|no .?gh|skip.*label' "$HI" \
+  && ok "harness-init degrades gracefully without gh/remote" \
+  || note "harness-init label step lacks a graceful-degradation note"
+
+# ---------------------------------------------------------------------------
+section "deliver.sh flags <-> skills/deliver/SKILL.md"
+DS="skills/deliver/deliver.sh"; DD="skills/deliver/SKILL.md"
+# Every --flag in deliver.sh's argument case must appear in SKILL.md ...
+RUNNER_FLAGS="$(awk '/^[[:space:]]*case "\$1" in/{c=1;next} c&&/^[[:space:]]*esac/{c=0} c' "$DS" \
+  | grep -oE '^[[:space:]]*(-[a-z],?\|?)?--[a-z][a-z-]*' | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+[[ -n "$RUNNER_FLAGS" ]] && ok "deliver.sh: found $(echo "$RUNNER_FLAGS" | wc -l | tr -d ' ') argument flags" \
+  || note "deliver.sh: could not extract argument flags"
+for f in $RUNNER_FLAGS; do
+  [[ "$f" == "--help" ]] && continue
+  grep -qE -- "${f}([^a-z-]|\$)" "$DD" && ok "SKILL.md mentions $f" || note "SKILL.md does not mention deliver.sh flag $f"
+done
+# ... and a flag in a SKILL.md deliver.sh command block must be one the runner accepts.
+DOC_FLAGS="$(awk '/^[[:space:]]*```/{if(b&&blk~/deliver\.sh/)printf "%s",blk; b=!b; blk=""; next} b{blk=blk $0 "\n"}' "$DD" \
+  | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+for f in $DOC_FLAGS; do
+  echo "$RUNNER_FLAGS" | grep -qx -- "$f" && ok "SKILL.md's $f is accepted by deliver.sh" \
+    || note "SKILL.md documents $f, which deliver.sh does not accept"
+done
+
+# ---------------------------------------------------------------------------
+section "harness-doctor names the deliver readiness checks"
+HD="skills/harness-doctor/SKILL.md"
+for pat in 'command -v tmux' 'setsid nohup' 'command -v jq' 'gh auth status' 'gh label list' 'git check-ignore -q tmp/'; do
+  grep -qF -- "$pat" "$HD" && ok "harness-doctor names '$pat'" || note "harness-doctor does not name '$pat'"
+done
+for l in map prd ready-for-agent needs-human needs-triage; do
+  grep -qF -- "\`$l\`" "$HD" && ok "harness-doctor names label $l" || note "harness-doctor does not name label $l"
+done
+
+# ---------------------------------------------------------------------------
+section "architecture docs describe the two-level model"
+AR="docs/architecture.md"
+for pat in 'agent.sh' 'ADR-0007' '/deliver'; do
+  grep -qF -- "$pat" "$AR" && ok "architecture.md mentions $pat" || note "architecture.md does not mention $pat"
+done
+# The Stop gate is not wired into loop.sh — SKILL.md must offer it as a manual
+# option, not describe the runner registering/removing the hook.
+if grep -qE 'autopilot MAY register|MUST remove that' skills/autopilot/SKILL.md; then
+  note "autopilot SKILL.md still presents the Stop gate as implemented"
+else
+  ok "autopilot SKILL.md no longer presents the Stop gate as implemented"
+fi
+grep -qi 'manual' <(sed -n '/Stop gate/,$p' skills/autopilot/SKILL.md) \
+  && ok "autopilot SKILL.md Stop gate paragraph is a manual option" \
+  || note "autopilot SKILL.md Stop gate paragraph does not say it is manual"
+
+# ---------------------------------------------------------------------------
+section "own-skill inventories list every non-vendored skill"
+SYNC="docs/pocock-sync-log.md"
+README_OWN="$(grep -E '^\| \*\*Skills \(own' README.md || true)"
+CLAUDE_OWN="$(awk '/^3\. \*\*Own\*\*/{b=1} b&&/Plus agents/{exit} b{print}' CLAUDE.md)"
+DOCTOR_OWN="$(awk '/^- Own:/{b=1} b&&/^$/{exit} b{print}' skills/harness-doctor/SKILL.md)"
+for d in skills/*/; do
+  n="$(basename "$d")"
+  grep -qE "^\| ${n} \|" "$SYNC" && continue   # vendored (Pocock or Vercel table)
+  for pair in "README:$README_OWN" "CLAUDE.md:$CLAUDE_OWN" "harness-doctor:$DOCTOR_OWN"; do
+    name="${pair%%:*}"; text="${pair#*:}"
+    grep -qF -- "\`$n\`" <<<"$text" && ok "$name lists own skill $n" || note "$name own-skill list omits $n"
+  done
+done
+grep -qF 'integration/<slug>' CLAUDE.md && ok "CLAUDE.md branch model covers integration branches" \
+  || note "CLAUDE.md branch model does not cover integration/<slug> branches"
+
+# ---------------------------------------------------------------------------
+section "user guide pages: version + Deliver path + no external assets"
+PV="$(jq -r .version .claude-plugin/plugin.json)"
+for f in docs/guide.html docs/index.html; do
+  grep -qF -- "v$PV" "$f" && ok "$f shows v$PV" || note "$f does not show plugin.json version v$PV"
+  if grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$f" | grep -vqxF "v$PV"; then note "$f mentions a stale version string"; fi
+  if grep -qE '<(script|img|iframe|link)[^>]*(src|href)=|rel="stylesheet"' "$f"; then
+    note "$f loads an external asset"
+  else
+    ok "$f loads no external assets"
+  fi
+done
+grep -qF 'id="deliver"' docs/guide.html && grep -qF '/deliver' docs/guide.html \
+  && ok "guide.html has a Deliver a map path" || note "guide.html lacks a Deliver a map path (id=\"deliver\")"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"

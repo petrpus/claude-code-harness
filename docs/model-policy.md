@@ -12,7 +12,7 @@ skeptical cheap model run many times than by one expensive pass.
 | **cheap** | `haiku` | Verification, adversarial gates, mechanical/greppable checks, lint triage, log parsing, secret-scans, classification. High volume, low judgement. |
 | **mid** | `sonnet` | Implementation, code review, refactoring, most day-to-day agent work. The default working tier. |
 | **top** | `opus` | Planning, architecture, decomposition (PRD → plan), domain modeling, grilling, resolving genuinely hard trade-offs. Low volume, high judgement. |
-| **escalation** | `--escalate-model` (default `opus`) | Rung 2 of autopilot's stuck ladder (S4B) — a slice's *next* BUILD attempt only, after it has failed twice on `--build-model`; the slice returns to `--build-model` once it ticks. `none` disables escalation outright. Never applied to the verifier — the cheap adversarial tier is the point. |
+| **escalation** | `--escalate-model` (default `opus`) | Rung 2 of autopilot's stuck ladder (S4B) — a slice's *next* BUILD attempt only, after it has failed twice on `--build-model`; the slice returns to `--build-model` once it ticks. Not after a turn limit: a slice whose last failure ran out of `--max-turns` stays on `--build-model`, since a stronger model hits the same cap (#101). `none` disables escalation outright. Never applied to the verifier — the cheap adversarial tier is the point. |
 
 `fable` is available as a fast planning-tier model where latency matters more
 than depth; treat it as an alternative top-tier for planning, not for
@@ -33,6 +33,23 @@ implementation.
 - **Subagent fanout** (`cost-discipline`): fan work out to the cheapest tier
   that fits; pin the model explicitly so a fanned-out fleet doesn't inherit an
   expensive main-session model.
+
+## Under `/deliver`
+
+`/deliver` (`skills/deliver/deliver.sh`) applies the same tiers per issue:
+
+- **Review on sonnet.** The independent review of each issue PR runs
+  `agents/code-reviewer.md` on `--review-model` (default `sonnet`), in a
+  throwaway worktree, cold — it never inherits the main session's model.
+- **Per-issue PLAN on opus.** Each issue's inner autopilot run does its own PLAN
+  pass at autopilot's default `--plan-model opus`. **Cost note:** that is one
+  opus planning call per issue, so a Map of N issues pays it N times, on top of
+  BUILD, the haiku verifier and the review. Bound it with `--issue-budget-usd`
+  and the run-wide caps.
+- **Turn caps.** `--max-turns` (default 200 under `/deliver`, 80 for plain
+  autopilot) caps each BUILD/PLAN/verifier call; `--review-max-turns` (default
+  80) caps the review. A turn-limited BUILD is not escalated to a stronger
+  model (#101): the cap, not the model, is what it ran into.
 
 ## The rule of thumb
 

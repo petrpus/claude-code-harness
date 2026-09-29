@@ -29,7 +29,8 @@ Check `.claude/skills/` for any of these (each shadows the plugin version):
   `to-prd`, `triage`, `write-a-skill`, `zoom-out`, `find-skills`
 - Own: `next`, `commit-agent`, `implement-issue`, `start-feature`,
   `migration-check`, `worklog`, `harness-init`, `harness-doctor`, `autopilot`,
-  `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`, `code-map`
+  `deliver`, `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`,
+  `repo-map`, `code-map`
 
 Each match → 🟠. Suggest `rm -rf .claude/skills/<name>/`.
 
@@ -114,6 +115,38 @@ or remove the reference."
 
 If no `CLAUDE.md` in repo root → 🟡: "Plugin's code-reviewer benefits from
 a project rule file."
+
+### 9. Plaintext forge credentials
+
+If `git config --get-all credential.helper` includes `store`, or
+`~/.git-credentials` exists → 🟠: "A plaintext forge token is readable by
+every process you run, model calls included. `/deliver` and autopilot
+withhold credential helpers from model calls, but a model can read this file
+directly (ADR-0007 § Three layers). Prefer `gh auth setup-git` (or an OS
+keychain helper), then remove the `store` helper and the file." Never print
+the file's content.
+
+If `~/.netrc` exists and has a `machine github.com` / `machine
+api.github.com` line (check with `grep -c`, never print the file) → 🟠 with
+the same reasoning: git's https transport reads it without any helper.
+
+### 10. `/deliver` readiness
+
+Each check is read-only; report, never fix.
+
+- **tmux**: `command -v tmux`. Missing → 🟡: "`/deliver` launches the runner in
+  a tmux session; without it, it falls back to `setsid nohup` (works, but no
+  attachable session). Install tmux for the better experience."
+- **jq**: `command -v jq` (see §5b). Missing → 🟠 for `/deliver`: "`deliver.sh`
+  needs jq to parse the Map and its run state; install jq."
+- **gh auth**: `gh auth status` must succeed. Failing → 🟠: "Run `gh auth login`."
+- **Deliver labels**: `gh label list` must include all five of `map`, `prd`,
+  `ready-for-agent`, `needs-human`, `needs-triage`. Each missing one → 🟡:
+  "Run `/harness-init` (idempotent) to create the workflow labels." Skip with
+  a 🟡 notice if `gh` is unavailable or there is no GitHub remote.
+- **tmp/ ignored**: `git check-ignore -q tmp/` must exit 0 (run state and logs
+  live under `tmp/deliver/`). Otherwise → 🟠: "Add `tmp/` to `.gitignore`, or
+  run artifacts show up as uncommitted changes."
 
 ## Output
 
