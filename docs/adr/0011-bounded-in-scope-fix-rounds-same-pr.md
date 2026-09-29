@@ -12,7 +12,10 @@ issue's fault.
 1. **A fix round stays on the same branch and the same PR.** No new branch,
    no new issue, no new autopilot state dir — `loop.sh` runs again on the
    `--state-dir` it already used, so BUILD sees the same charter, memory and
-   feedback, and only the plan changed underneath it.
+   feedback, and only the plan changed underneath it. It is a fresh run, not
+   a `--resume-run`: a first run that spent most of `--issue-max-iterations`
+   would otherwise leave a fix round no room to work. (A CI fix round,
+   ADR-0010, does resume.)
 2. **Only in-scope `blocker` / `issue` findings become plan items.**
    `review_fix_items` (`skills/deliver/review.sh`) turns round `k`'s findings
    into `- [ ] R<k>.<j> — <severity> <file>:<line>: <note>` lines
@@ -38,10 +41,14 @@ issue's fault.
    against what it asked for last time, not cold. The round's PR comment
    names which of those ids the runner's parse marked `resolved`
    (`review_parse`, unchanged from #59).
-6. **Rounds are capped by `--review-rounds` (default 2).** Still requesting
-   changes after the cap parks the issue, naming the round count and the PR
-   — same outcome as a first-round park, just later and with more of the
-   finding named already fixed.
+6. **Rounds come out of the issue's `--max-fix-rounds` budget (default 2).**
+   It is the same per-issue counter (`round_budget_use`, `$dir/ROUNDS_USED`)
+   a red CI draws from (ADR-0010), so review and CI together can never cost
+   more than that many extra autopilot runs. A review still requesting
+   changes once the budget is gone parks the issue, naming the review count
+   and the PR — same outcome as a first-round park, just later and with more
+   of what the review named already fixed. `--max-fix-rounds 0` parks on the
+   first `changes_requested`, which is #58's original behaviour.
 7. **The PR body is rewritten from the plan after every fix round**
    (`write_pr_body` + the new `forge_pr_set_body`), so a human reading the PR
    sees the same checklist the runner is driving from, not the opening
@@ -64,5 +71,6 @@ already uses.
 A fix round costs one more autopilot run, one more full verify and one more
 review call than a plain approve — the same budget flags
 (`--issue-max-iterations`, `--issue-max-minutes`, `--issue-budget-usd`) meant
-for one run now cover up to `--review-rounds` of them, so a charter that was
-already tightly budgeted may need more headroom.
+for one run now cover up to `1 + --max-fix-rounds` of them, so a charter that
+was already tightly budgeted may need more headroom. A review round spent
+early leaves one fewer for a red CI later, and the other way round.

@@ -170,6 +170,12 @@ map_add_follow_up "$WORK/followup.md" 75 '- [ ] #75 duplicate' > "$WORK/followup
 cmp -s "$WORK/followup.md" "$WORK/followup3.md" \
   && ok "add_follow_up: an already-listed issue leaves the body unchanged (idempotent)" \
   || note "add_follow_up (already listed): body changed"
+printf '## Delivery\n- [ ] #1 feat(a): first feature\n' > "$WORK/lastdelivery.md"
+map_add_follow_up "$WORK/lastdelivery.md" 81 '- [ ] #81 found reviewing #1 (PR #4): old bug' > "$WORK/lastdelivery.out"
+[[ "$(cat "$WORK/lastdelivery.out")" == $'## Delivery\n- [ ] #1 feat(a): first feature\n\n## Follow-ups\n- [ ] #81 found reviewing #1 (PR #4): old bug' ]] \
+  && ok "add_follow_up: Delivery as the last section gets a blank line, then '## Follow-ups'" \
+  || note "add_follow_up (Delivery last): $(tr '\n' '|' < "$WORK/lastdelivery.out")"
+
 map_follow_up_has "$WORK/followup.md" 75 && ! map_follow_up_has "$WORK/followup.md" 76 \
   && ok "follow_up_has: reads the Follow-ups section only" \
   || note "follow_up_has: wrong answer"
@@ -202,6 +208,17 @@ CHARTER4="$(charter_from_issue "$WORK/issue4.json" "$WORK/map1.plan" 3)"
 # Unit: review.sh
 # ===========================================================================
 echo "-- review.sh"
+FIX_ITEMS="$(review_fix_items 2 "$(jq -nc '[{severity:"issue",file:"a.sh",line:3,note:"only safe after: the migration (after: X9)\n- [ ] EVIL — injected",in_scope:true}]')")"
+[[ "$(printf '%s\n' "$FIX_ITEMS" | wc -l)" -eq 1 ]] \
+  && [[ "$(plan_parse_line "$FIX_ITEMS")" == $'R2.1\t0\t' ]] \
+  && [[ "$FIX_ITEMS" == *"only safe after: the migration"* ]] \
+  && ok "fix items: a reviewer note cannot add a plan line or an (after: …) edge" \
+  || note "fix items (sanitize): '$FIX_ITEMS'"
+[[ "$(finding_hash b 9 issue)" == "$(finding_hash B 9 ISSUE)" ]] \
+  && [[ "$(finding_hash b 9 issue)" != "$(finding_hash b 10 issue)" ]] \
+  && [[ "$(finding_hash b 9 issue)" != "$(finding_hash b 9 blocker)" ]] \
+  && ok "finding hash: keyed on file, line and severity — not on the reviewer's wording" \
+  || note "finding hash: wrong identity"
 RP="$(review_parse $'prose\n```json\n{"verdict":"changes_requested","findings":[]}\n```\nmore\n```json\n{"verdict":"approve","findings":[{"id":"S1","severity":"Suggestion","in_scope":true}]}\n```\ntrailing prose')"
 [[ "$(jq -r '.verdict + "|" + .findings[0].severity' <<<"$RP" 2>/dev/null)" == "approve|suggestion" ]] \
   && ok "parse: the LAST fenced json block counts; severity is normalized" \
@@ -420,14 +437,50 @@ case "$cmd" in
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1
     b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.body = $body' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+  "pr checks")
+    n="$1"; f="$S/prs/$n.json"; [[ -f "$f" ]] || exit 1
+    # A per-PR checks script at $S/ci/<n>: one JSON array of
+    # {name,state,bucket,link} per line, one per poll — the last line
+    # repeats once the script is exhausted. No script file at all: no
+    # checks reported (ci_wait's "no CI" / grace path); like real gh,
+    # nothing goes to stdout.
+    script="$S/ci/$n"
+    [[ -f "$script" ]] || { echo "no checks reported on the '$n' branch" >&2; exit 8; }
+    cnt="$(( $(cat "$S/ci/$n.count" 2>/dev/null || echo 0) + 1 ))"
+    echo "$cnt" > "$S/ci/$n.count"
+    total="$(wc -l < "$script" | tr -d ' ')"
+    [[ "$cnt" -gt "$total" ]] && cnt="$total"
+    sed -n "${cnt}p" "$script" ;;
+  "run view")
+    # forge_ci_failed_log (#60): the fake run's log lives at $S/runs/<id>.log;
+    # a run with no log on file (an id that never came from a /runs/ link in
+    # a fixture's checks script) prints nothing, like a real run whose log
+    # rotated away.
+    id="$1"; shift; has --log-failed "$@" || exit 64
+    f="$S/runs/$id.log"; [[ -f "$f" ]] && cat "$f"
+    exit 0 ;;
   "pr comment")
     f="$S/prs/$1.json"; [[ -f "$f" ]] || exit 1; b="$(arg --body-file "$@")" || exit 64
     jq --rawfile body "$b" '.comments = ((.comments // []) + [{body:$body}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
   "pr merge")
     n="$1"; shift; f="$S/prs/$n.json"; [[ -f "$f" ]] || exit 1
-    has --squash "$@" || { echo "fake gh: only --squash is modelled" >&2; exit 64; }
+    if has --squash "$@"; then strategy=squash
+    elif has --merge "$@"; then strategy=merge
+    else echo "fake gh: only --squash or --merge is modelled" >&2; exit 64
+    fi
     has --admin "$@" && { echo "fake gh: --admin used" >&2; exit 65; }
     sha="$(arg --match-head-commit "$@")"; subject="$(arg --subject "$@")"; b="$(arg --body-file "$@")"
+    # A repo mode: --squash is always refused (branch protection forbids it);
+    # forge_pr_merge is expected to notice and fall back to --merge itself.
+    if [[ "$strategy" == squash && -f "$S/no_squash" ]]; then
+      echo "GraphQL: Squash merges are not allowed on this repository" >&2; exit 1
+    fi
+    # A one-shot refusal: the first pr-merge call (whatever its strategy)
+    # fails, the next one succeeds — deliver.sh's final-verify retry.
+    if [[ -n "${FAKE_GH_MERGE_REFUSE_ONCE:-}" && ! -f "$S/.merge_refused_once" ]]; then
+      touch "$S/.merge_refused_once"
+      echo "merge refused (fake, once)" >&2; exit 1
+    fi
     base="$(jq -r .baseRefName "$f")"; head="$(jq -r .headRefName "$f")"
     remote="$(git remote get-url origin)"
     tmp="$(mktemp -d)"
@@ -438,8 +491,12 @@ case "$cmd" in
     fi
     [[ -n "${FAKE_GH_MERGE_FAIL:-}" ]] && { echo "merge refused (fake)" >&2; rm -rf "$tmp"; exit 1; }
     ( cd "$tmp/c" && git -c advice.detachedHead=false checkout -q "$base" \
-        && git merge -q --squash "origin/$head" >/dev/null \
-        && git -c user.email=gh@fake -c user.name=fake-gh commit -q -m "$subject" -m "$(cat "${b:-/dev/null}")" \
+        && if [[ "$strategy" == squash ]]; then
+             git merge -q --squash "origin/$head" >/dev/null \
+               && git -c user.email=gh@fake -c user.name=fake-gh commit -q -m "$subject" -m "$(cat "${b:-/dev/null}")"
+           else
+             git -c user.email=gh@fake -c user.name=fake-gh merge -q --no-ff -m "$subject" "origin/$head" >/dev/null
+           fi \
         && git push -q origin "$base" ) || { rm -rf "$tmp"; exit 1; }
     moid="$(git -C "$tmp/c" rev-parse HEAD)"; rm -rf "$tmp"
     if [[ -n "${FAKE_GH_AFTER_FIRST_MERGE_BODY:-}" && ! -f "$S/.edited" ]]; then
@@ -490,7 +547,8 @@ case "$prompt" in
       approve)    r="$(review_json approve '[{"id":"S1","severity":"suggestion","file":"a","line":1,"note":"nit","in_scope":true}]')" ;;
       blocker)    r="$(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"a","line":1,"note":"broken","in_scope":true}]')" ;;
       liar)       r="$(review_json approve '[{"id":"I1","severity":"issue","file":"a","line":1,"note":"real problem","in_scope":true}]')" ;;
-      outofscope) r="$(review_json approve '[{"id":"I1","severity":"issue","file":"b","line":9,"note":"old bug","in_scope":false,"issue_title":"fix: old bug"}]')" ;;
+      outofscope) # Worded differently on every call, as a fresh reviewer would.
+                  r="$(review_json approve "[{\"id\":\"I1\",\"severity\":\"issue\",\"file\":\"b\",\"line\":9,\"note\":\"old bug, take $$-$RANDOM\",\"in_scope\":false,\"issue_title\":\"fix: old bug\"}]")" ;;
       garbage)    r="I would need more context to review this. Could you clarify the scope?" ;;
       mutate)     ( cd "$(common_root)" && git switch -q -c scratch-by-reviewer )
                   r="$(review_json approve '[]')" ;;
@@ -518,6 +576,25 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
     emit '"planned"' ;;
   *"ONE iteration of an autonomous BUILD loop"*)
     [[ -n "${STUB_BUILD_SLEEP:-}" ]] && sleep "$STUB_BUILD_SLEEP"
+    # Simulate a concurrent push to the integration branch, mid-build, so
+    # final_verify meets a base that moved (#60): a separate clone commits
+    # to $STUB_ADVANCE_BASE_PATH and pushes it straight to origin/integration/x,
+    # once (a marker file, since BUILD can run more than once per issue).
+    if [[ -n "${STUB_ADVANCE_BASE_PATH:-}" && -n "${STUB_ADVANCE_BASE_MARKER:-}" && ! -f "$STUB_ADVANCE_BASE_MARKER" ]]; then
+      touch "$STUB_ADVANCE_BASE_MARKER"
+      adv_remote="$(git remote get-url origin 2>/dev/null)"
+      if [[ -n "$adv_remote" ]]; then
+        adv_tmp="$(mktemp -d)"
+        ( cd "$adv_tmp" && git clone -q "$adv_remote" c 2>/dev/null \
+            && cd c && git switch -q integration/x \
+            && mkdir -p "$(dirname "$STUB_ADVANCE_BASE_PATH")" \
+            && printf 'advanced by someone else\n' > "$STUB_ADVANCE_BASE_PATH" \
+            && git add "$STUB_ADVANCE_BASE_PATH" \
+            && git -c user.email=other@test.est -c user.name=other commit -q -m "advance base" \
+            && git push -q origin integration/x ) >/dev/null 2>&1
+        rm -rf "$adv_tmp"
+      fi
+    fi
     # A BUILD that tries the forge itself (ADR-0007): record what happened.
     if [[ -n "${STUB_FORGE_PROBE:-}" ]]; then
       gh auth status >/dev/null 2>&1; echo "gh=$?" >> "$STUB_FORGE_PROBE"
@@ -787,18 +864,13 @@ job_rvblockonce() {
 }
 job_rvblockrounds2() {
   new_fixture rvblockrounds2
-  run_deliver rvblockrounds2 STUB_REVIEW=blocker -- --review-rounds 2
+  run_deliver rvblockrounds2 STUB_REVIEW=blocker -- --max-fix-rounds 1
   echo $? > "$WORK/rvblockrounds2/rc"
 }
 job_rvblockrounds1() {
   new_fixture rvblockrounds1
-  run_deliver rvblockrounds1 STUB_REVIEW=blocker -- --review-rounds 1
+  run_deliver rvblockrounds1 STUB_REVIEW=blocker -- --max-fix-rounds 0
   echo $? > "$WORK/rvblockrounds1/rc"
-}
-job_reviewroundsbad() {
-  new_fixture reviewroundsbad
-  run_deliver reviewroundsbad -- --review-rounds 0
-  echo $? > "$WORK/reviewroundsbad/rc"
 }
 job_rvoos()     { new_fixture rvoos;      run_deliver rvoos      STUB_REVIEW=outofscope;                                               echo $? > "$WORK/rvoos/rc"; }
 job_rvgarbage() { new_fixture rvgarbage;  run_deliver rvgarbage  STUB_REVIEW=garbage STUB_REVIEW_LOG="$WORK/rvgarbage/review.log";      echo $? > "$WORK/rvgarbage/rc"; }
@@ -816,6 +888,97 @@ job_refused() {
   new_fixture refused
   run_deliver refused FAKE_GH_MERGE_FAIL=1
   echo $? > "$WORK/refused/rc"
+}
+job_refusedonce() {
+  new_fixture refusedonce
+  run_deliver refusedonce FAKE_GH_MERGE_REFUSE_ONCE=1
+  echo $? > "$WORK/refusedonce/rc"
+}
+job_squash() {
+  new_fixture squash
+  touch "$WORK/squash/gh/no_squash"
+  run_deliver squash
+  echo $? > "$WORK/squash/rc"
+}
+job_baseadv_clean() {
+  new_fixture baseadv
+  git -C "$WORK/baseadv/remote.git" rev-parse main > "$WORK/baseadv/main_before"
+  run_deliver baseadv STUB_ADVANCE_BASE_PATH=advanced.txt STUB_ADVANCE_BASE_MARKER="$WORK/baseadv/advance.marker"
+  echo $? > "$WORK/baseadv/rc"
+}
+job_baseadv_conflict() {
+  new_fixture baseadvconflict with4
+  run_deliver baseadvconflict STUB_ADVANCE_BASE_PATH=work/issue-1.txt STUB_ADVANCE_BASE_MARKER="$WORK/baseadvconflict/advance.marker" -- --issue-max-iterations 1
+  echo $? > "$WORK/baseadvconflict/rc"
+}
+
+# --- ci_wait (#60): PR #4 is always issue #1's, #5 issue #2's (deterministic
+# next_num order — see new_fixture). A fixture's $gh/ci/<pr> file is the fake
+# gh's per-PR checks script: one JSON array of {name,state,bucket,link} per
+# poll, repeating its last line once exhausted; no file at all is "no checks
+# reported" (ci_wait's grace / "no CI" path). --ci-poll-seconds 0 and
+# --ci-grace-seconds 0 keep the polling loop instant in tests.
+job_ci_none() {
+  new_fixture cinone
+  run_deliver cinone -- --ci-poll-seconds 0 --ci-grace-seconds 0
+  echo $? > "$WORK/cinone/rc"
+}
+job_ci_pending_green() {
+  new_fixture cigreen
+  mkdir -p "$WORK/cigreen/gh/ci"
+  printf '%s\n%s\n' \
+    '[{"name":"build","state":"IN_PROGRESS","bucket":"pending","link":"http://x/1"}]' \
+    '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"http://x/1"}]' \
+    > "$WORK/cigreen/gh/ci/4"
+  run_deliver cigreen -- --ci-poll-seconds 0 --ci-grace-seconds 0
+  echo $? > "$WORK/cigreen/rc"
+}
+job_ci_fail() {
+  # A checks script that stays FAILURE forever (its one line repeats): the
+  # fix round (#60) gets tried once — the stub `claude` "fixes" it, ticking
+  # C1 — but the CI script still says FAILURE on the second poll, so this is
+  # "CI red twice", parked without a third attempt, the second failure's log
+  # tail in the park comment.
+  new_fixture cifail
+  mkdir -p "$WORK/cifail/gh/ci" "$WORK/cifail/gh/runs"
+  printf '%s\n' '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/777/job/2"}]' \
+    > "$WORK/cifail/gh/ci/4"
+  printf 'assert failed: flaky_widget expected 3\n' > "$WORK/cifail/gh/runs/777.log"
+  run_deliver cifail -- --ci-poll-seconds 0 --ci-grace-seconds 0 --issue-max-iterations 2
+  echo $? > "$WORK/cifail/rc"
+}
+job_ci_fail_no_rounds() {
+  # --max-fix-rounds 0: the budget is gone before the first red check, so no
+  # fix round is attempted — parked straight away, with the log tail.
+  new_fixture cinoround
+  mkdir -p "$WORK/cinoround/gh/ci" "$WORK/cinoround/gh/runs"
+  printf '%s\n' '[{"name":"lint","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/888/job/3"}]' \
+    > "$WORK/cinoround/gh/ci/4"
+  printf 'lint: trailing whitespace in src/a.sh\n' > "$WORK/cinoround/gh/runs/888.log"
+  run_deliver cinoround -- --ci-poll-seconds 0 --ci-grace-seconds 0 --max-fix-rounds 0
+  echo $? > "$WORK/cinoround/rc"
+}
+job_ci_fail_then_green() {
+  # Red on the first poll, green on the second (the fix round's own ci_wait):
+  # the failed check's link names a run id the fake gh has a log for, so the
+  # fix round's plan item carries a real log tail.
+  new_fixture cifixgreen
+  mkdir -p "$WORK/cifixgreen/gh/ci" "$WORK/cifixgreen/gh/runs"
+  printf '%s\n%s\n' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/555/job/1"}]' \
+    '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"https://github.com/o/r/actions/runs/555/job/1"}]' \
+    > "$WORK/cifixgreen/gh/ci/4"
+  printf 'Error: something exploded\nBuild failed at step 3\n' > "$WORK/cifixgreen/gh/runs/555.log"
+  run_deliver cifixgreen -- --ci-poll-seconds 0 --ci-grace-seconds 0 --issue-max-iterations 2
+  echo $? > "$WORK/cifixgreen/rc"
+}
+job_ci_timeout() {
+  new_fixture citimeout
+  mkdir -p "$WORK/citimeout/gh/ci"
+  printf '%s\n' '[{"name":"build","state":"IN_PROGRESS","bucket":"pending","link":"http://x/1"}]' \
+    > "$WORK/citimeout/gh/ci/4"
+  run_deliver citimeout -- --ci-poll-seconds 1 --ci-timeout 1 --ci-grace-seconds 0
+  echo $? > "$WORK/citimeout/rc"
 }
 
 bg job_happy
@@ -845,7 +1008,6 @@ bg job_rvliar
 bg job_rvblockonce
 bg job_rvblockrounds2
 bg job_rvblockrounds1
-bg job_reviewroundsbad
 bg job_rvoos
 bg job_rvgarbage
 bg job_rvretry
@@ -856,6 +1018,16 @@ bg job_rvmutatevariant mutate-hook
 bg job_rvexample
 bg job_rvwronghead
 bg job_refused
+bg job_refusedonce
+bg job_squash
+bg job_baseadv_clean
+bg job_baseadv_conflict
+bg job_ci_none
+bg job_ci_pending_green
+bg job_ci_fail
+bg job_ci_fail_no_rounds
+bg job_ci_fail_then_green
+bg job_ci_timeout
 wait
 
 # ===========================================================================
@@ -1174,32 +1346,26 @@ RVBR2="$WORK/rvblockrounds2"
 RUNDIR_RVBR2="$(ls -d "$RVBR2"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
 ROWS_RVBR2="$(cat "$RUNDIR_RVBR2"run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .issue==1)] | length')"
 [[ "$RC" -eq 2 ]] && held rvblockrounds2 && [[ "$ROWS_RVBR2" -eq 2 ]] \
-  && jq -r '.comments[-1].body' "$RVBR2/gh/issues/1.json" | grep -q 'after 2 round(s) (PR #4)' \
-  && ok "fix rounds: an always-blocker verdict with --review-rounds 2 parks after exactly 2 reviews" \
-  || note "fix rounds --review-rounds 2: exit $RC, review rows=$ROWS_RVBR2"
+  && jq -r '.comments[-1].body' "$RVBR2/gh/issues/1.json" | grep -q 'after 2 review(s) and no fix rounds are left (--max-fix-rounds 1, PR #4)' \
+  && ok "fix rounds: an always-blocker verdict with --max-fix-rounds 1 parks after exactly 2 reviews" \
+  || note "fix rounds --max-fix-rounds 1: exit $RC, review rows=$ROWS_RVBR2"
 
 RC="$(cat "$WORK/rvblockrounds1/rc")"
 RVBR1="$WORK/rvblockrounds1"
 RUNDIR_RVBR1="$(ls -d "$RVBR1"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
 ROWS_RVBR1="$(cat "$RUNDIR_RVBR1"run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="review" and .issue==1)] | length')"
 [[ "$RC" -eq 2 ]] && held rvblockrounds1 && [[ "$ROWS_RVBR1" -eq 1 ]] \
-  && jq -r '.comments[-1].body' "$RVBR1/gh/issues/1.json" | grep -q 'after 1 round(s) (PR #4)' \
-  && ok "fix rounds: --review-rounds 1 parks after exactly one review" \
-  || note "fix rounds --review-rounds 1: exit $RC, review rows=$ROWS_RVBR1"
-
-RC="$(cat "$WORK/reviewroundsbad/rc")"
-[[ "$RC" -eq 1 ]] && grep -q 'review-rounds takes a positive whole number' "$WORK/reviewroundsbad/err" \
-  && [[ ! -s "$WORK/reviewroundsbad/gh/calls" ]] \
-  && ok "--review-rounds 0 is refused before any forge call" \
-  || note "--review-rounds 0: exit $RC"
+  && jq -r '.comments[-1].body' "$RVBR1/gh/issues/1.json" | grep -q 'after 1 review(s) and no fix rounds are left (--max-fix-rounds 0, PR #4)' \
+  && ok "fix rounds: --max-fix-rounds 0 parks after exactly one review" \
+  || note "fix rounds --max-fix-rounds 0: exit $RC, review rows=$ROWS_RVBR1"
 
 RC="$(cat "$WORK/rvoos/rc")"
 RVOOS="$WORK/rvoos"
-HASH_RVOOS="$(finding_hash b issue 'old bug')"
+HASH_RVOOS="$(finding_hash b 9 issue)"
 MAP_BODY_RVOOS="$(jq -r .body "$RVOOS/gh/issues/3.json" 2>/dev/null)"
 TRIAGE_COUNT="$(jq -s '[.[] | select([.labels[]?.name] | index("needs-triage"))] | length' "$RVOOS"/gh/issues/*.json 2>/dev/null)"
-# STUB_REVIEW=outofscope reports the same b:9 finding for both #1's and #2's
-# review — the fixture's own way of reprocessing the same finding twice —
+# STUB_REVIEW=outofscope reports the same b:9 finding, worded differently,
+# for both #1's and #2's review — the fixture's own way of reprocessing the same finding twice —
 # so the dedupe (forge_issue_search) is exercised without a second run.
 [[ "$RC" -eq 0 && "$(jq -r .state "$RVOOS/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$RVOOS/gh/prs/6.json")" == "MERGED" ]] \
   && [[ "$TRIAGE_COUNT" -eq 1 ]] \
@@ -1250,13 +1416,132 @@ RC="$(cat "$WORK/rvwronghead/rc")"
   && ok "review: a verdict for a different head is no verdict (parked)" \
   || note "review wrong-head: exit $RC"
 
-# --- a merge refused by the forge parks the issue -----------------------------
+# --- a merge refused twice by the forge parks the issue (#60) ----------------
 RC="$(cat "$WORK/refused/rc")"
 R="$WORK/refused"
 [[ "$RC" -eq 2 ]] && parked_one refused && [[ "$(jq -r .isDraft "$R/gh/prs/4.json")" == "true" ]] \
   && [[ "$(git -C "$R/remote.git" rev-parse integration/x)" == "$(git -C "$R/remote.git" rev-parse main)" ]] \
-  && jq -r '.comments[-1].body' "$WORK/refused/gh/issues/1.json" | grep -q 'the forge refused to merge PR #4' \
-  && ok "a merge refused by the forge parks the issue (PR back to draft, reason in the comment)" \
-  || note "refused merge: exit $RC"
+  && [[ "$(grep -c '^pr merge' "$R/gh/calls")" -eq 2 ]] \
+  && jq -r '.comments[-1].body' "$WORK/refused/gh/issues/1.json" | grep -q 'the forge refused to merge PR #4 twice' \
+  && ok "a merge refused twice by the forge (with a final-verify retry in between) parks the issue" \
+  || note "refused merge: exit $RC, pr merge calls: $(grep -c '^pr merge' "$R/gh/calls" 2>/dev/null)"
+
+# --- a merge refused once, then accepted after a final-verify retry (#60) ----
+RC="$(cat "$WORK/refusedonce/rc")"
+RO="$WORK/refusedonce"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$RO/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(grep -c '^pr merge 4' "$RO/gh/calls")" -eq 2 ]] \
+  && ok "a merge refused once retries through final-verify and then succeeds" \
+  || note "refused-once merge: exit $RC, pr merge calls for #4: $(grep -c '^pr merge 4' "$RO/gh/calls" 2>/dev/null)"
+
+# --- a repo that forbids squash merges gets a plain --merge instead (#60) ----
+RC="$(cat "$WORK/squash/rc")"
+SQ="$WORK/squash"
+MOID_SQ="$(jq -r '.mergeCommit.oid // ""' "$SQ/gh/prs/4.json" 2>/dev/null)"
+[[ "$RC" -eq 0 ]] && [[ -n "$MOID_SQ" ]] \
+  && grep -q '^pr merge 4 --squash' "$SQ/gh/calls" && grep -q '^pr merge 4 --merge' "$SQ/gh/calls" \
+  && [[ "$(git -C "$SQ/remote.git" rev-list --parents -n1 "$MOID_SQ" | wc -w)" -eq 3 ]] \
+  && ok "a repo that forbids squash merges gets a plain --merge instead, still pinned to the verified head" \
+  || note "squash fallback: exit $RC, calls: $(grep '^pr merge 4' "$SQ/gh/calls" 2>/dev/null | tr '\n' '|')"
+
+# --- final-verify folds in a base that moved, cleanly (#60) -------------------
+BA="$WORK/baseadv"
+RC="$(cat "$BA/rc")"
+MAIN_BEFORE_BA="$(cat "$BA/main_before" 2>/dev/null)"
+LOG_BA="$(git -C "$BA/remote.git" log --format=%s "$MAIN_BEFORE_BA..integration/x" 2>/dev/null)"
+[[ "$RC" -eq 0 ]] && [[ "$(grep -c . <<<"$LOG_BA")" -eq 3 ]] \
+  && grep -qx 'advance base' <<<"$LOG_BA" \
+  && grep -qx 'fix: second thing (#5)' <<<"$LOG_BA" && grep -qx 'feat(a): first feature (#4)' <<<"$LOG_BA" \
+  && ! grep -E '(^| )push( |$)' "$BA/git.calls" | grep -qE -- '(--force|--force-with-lease|(^| )-f( |$)|(^| )-[a-zA-Z]*f[a-zA-Z]*( |$))' \
+  && ok "a moved integration branch is merged into the issue branch, re-verified, pushed and merged (no force push)" \
+  || note "base-advance clean: exit $RC, log: $(tr '\n' '|' <<<"$LOG_BA")"
+
+# --- final-verify aborts on a conflicting base move; independent issues continue (#60) --
+BC="$WORK/baseadvconflict"
+RC="$(cat "$BC/rc")"
+C1_BC="$(jq -r '.comments[-1].body' "$BC/gh/issues/1.json" 2>/dev/null)"
+LOG_BC="$(git -C "$BC/remote.git" log --format=%s main..integration/x 2>/dev/null)"
+[[ "$RC" -eq 2 ]] \
+  && [[ "$(jq -r '[.labels[].name]|join(",")' "$BC/gh/issues/1.json")" == "needs-human" ]] \
+  && [[ "$C1_BC" == *"the base branch \`integration/x\` moved"* && "$C1_BC" == *"work/issue-1.txt"* ]] \
+  && ! grep -q '^pr create.*--head feat/1-' "$BC/gh/calls" \
+  && [[ "$(git -C "$BC/repo" branch --show-current)" == "integration/x" && -z "$(git -C "$BC/repo" status --porcelain)" ]] \
+  && [[ "$(jq -r .state "$BC/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && [[ "$(grep -c . <<<"$LOG_BC")" -eq 2 ]] && grep -qx 'advance base' <<<"$LOG_BC" \
+  && grep -qx 'feat: independent thing (#5)' <<<"$LOG_BC" \
+  && ok "a conflicting base move aborts the merge, parks the issue (no PR ever opened) and lets an independent issue still merge" \
+  || note "base-advance conflict: exit $RC, #1 comment: $(head -3 <<<"$C1_BC" | tr '\n' '|'), log: $(tr '\n' '|' <<<"$LOG_BC")"
+
+# --- ci_wait (#60) ------------------------------------------------------------
+# no checks reported at all: "no CI", both issues merge anyway.
+CN="$WORK/cinone"
+RC="$(cat "$CN/rc")"
+CN_RUNDIR="$(ls -d "$CN"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CN/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$CN/gh/prs/5.json")" == "MERGED" ]] \
+  && jq -r '.comments[-1].body' "$CN/gh/issues/1.json" | grep -qF 'CI: no CI reported.' \
+  && [[ "$(cat "$CN_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci" and .verdict=="none")] | length')" -eq 2 ]] \
+  && ok "CI: no checks reported at all merges anyway, recorded as 'no CI' in the run log and the merge comment" \
+  || note "ci none: exit $RC, PR states $(jq -r .state "$CN/gh/prs/4.json" 2>/dev/null)/$(jq -r .state "$CN/gh/prs/5.json" 2>/dev/null)"
+
+# pending then green merges, without a "no CI" note on that issue.
+CG="$WORK/cigreen"
+RC="$(cat "$CG/rc")"
+CG_RUNDIR="$(ls -d "$CG"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CG/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(grep -c '^pr checks 4' "$CG/gh/calls")" -ge 2 ]] \
+  && ! jq -r '.comments[-1].body' "$CG/gh/issues/1.json" | grep -qF 'CI:' \
+  && [[ "$(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci" and .verdict=="pass")] | length')" -ge 1 ]] \
+  && ok "CI: pending polled until green, then merged (no 'no CI' note once CI reported)" \
+  || note "ci pending->green: exit $RC, pr checks calls $(grep -c '^pr checks 4' "$CG/gh/calls" 2>/dev/null)"
+
+# a failed check gets one fix round (#60); still red after it parks the issue.
+CF="$WORK/cifail"
+RC="$(cat "$CF/rc")"
+CF_RUNDIR="$(ls -d "$CF"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 2 ]] && held cifail \
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qF 'CI failed again on PR #4 after fix round 1: build' \
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qxF 'assert failed: flaky_widget expected 3' \
+  && jq -r '.comments[-1].body' "$CF/gh/issues/1.json" | grep -qx '~~~~~' \
+  && grep -qF 'flaky_widget' "$CF_RUNDIR/issues/1/ci-fail-2.log" \
+  && grep -q '^- \[x\] C1 Fix red CI: build$' "$CF_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && ! grep -q 'C2 Fix red CI' "$CF_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && [[ "$(cat "$CF_RUNDIR/issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && [[ "$(cat "$CF_RUNDIR"/run-*.jsonl 2>/dev/null | jq -cs '[.[] | select(.phase=="ci" and .issue==1 and .verdict=="fail")] | map(.round) | sort')" == "[1,2]" ]] \
+  && ok "CI: a red check gets one fix round (the fix round itself ran, C1 ticked); still red after it parks with the log tail, fenced (PR back to draft, #2 skipped)" \
+  || note "ci fail twice: exit $RC, comment: $(jq -r '.comments[-1].body' "$CF/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
+
+# no fix rounds left: parked on the first red check, log tail in the comment,
+# no plan item appended and autopilot not resumed.
+CR="$WORK/cinoround"
+RC="$(cat "$CR/rc")"
+CR_RUNDIR="$(ls -d "$CR"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 2 ]] && held cinoround \
+  && jq -r '.comments[-1].body' "$CR/gh/issues/1.json" | grep -qF 'CI failed on PR #4: lint (no fix rounds left)' \
+  && jq -r '.comments[-1].body' "$CR/gh/issues/1.json" | grep -qxF 'lint: trailing whitespace in src/a.sh' \
+  && grep -q '^run view 888' "$CR/gh/calls" \
+  && ! grep -q 'Fix red CI' "$CR_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && ok "CI: a red check with no fix rounds left (--max-fix-rounds 0) parks at once, log tail in the park comment, no fix item" \
+  || note "ci fail, no rounds: exit $RC, comment: $(jq -r '.comments[-1].body' "$CR/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
+
+# red then green: the fix round's log tail lands in the plan, C1 gets ticked,
+# and the re-verified, re-pushed head merges once CI is green.
+CX="$WORK/cifixgreen"
+RC="$(cat "$CX/rc")"
+CX_RUNDIR="$(ls -d "$CX"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 0 ]] && [[ "$(jq -r .state "$CX/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$CX/gh/prs/5.json")" == "MERGED" ]] \
+  && grep -q '^- \[x\] C1 Fix red CI: build$' "$CX_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && grep -qF 'Build failed at step 3' "$CX_RUNDIR/issues/1/ci-fail-1.log" \
+  && [[ "$(cat "$CX_RUNDIR"/run-*.jsonl 2>/dev/null | jq -cs '[.[] | select(.phase=="ci" and .issue==1)] | map(.round) | sort')" == "[1,2]" ]] \
+  && ok "CI: a red check's fix round can turn CI green — merged, plan shows C1 ticked, run log records both CI polls" \
+  || note "ci fix round to green: exit $RC, plan: $(grep -c '\[x\]' "$CX_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" 2>/dev/null)"
+
+# CI stuck pending past the timeout parks the issue too, no fix round (it
+# never actually failed).
+CT="$WORK/citimeout"
+RC="$(cat "$CT/rc")"
+[[ "$RC" -eq 2 ]] && held citimeout \
+  && jq -r '.comments[-1].body' "$CT/gh/issues/1.json" | grep -qF 'CI still pending after 1s on PR #4' \
+  && ok "CI: still pending after --ci-timeout parks the issue" \
+  || note "ci timeout: exit $RC"
 
 finish

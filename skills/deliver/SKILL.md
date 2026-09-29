@@ -19,16 +19,24 @@ The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
 > **Status: in progress (map #68).** Built: the straight path (#57), the
-> independent review (#59), parking (#58), bounded fix rounds and follow-up
-> issues (#63). Not yet: CI wait, resume, the tmux launcher.
+> independent review (#59), parking (#58), final-verify's base-moved
+> handling and merge retry, the CI wait with its fix round (#60), and bounded
+> review fix rounds with follow-up issues (#63). Not yet: resume, the tmux
+> launcher.
 
 ## When an issue does not make it
 
 An issue that cannot reach its merge is **parked** and the run carries on:
 autopilot did not finish (stuck, or an iteration / time / budget cap), it
 finished without a commit, verify failed on its head, the review held its PR
-(changes requested, or no usable verdict twice), or the forge refused the
-merge. Parking:
+(changes requested, or no usable verdict twice), the integration branch moved
+into a conflict, CI failed or stayed pending past `--ci-timeout`, or the forge
+refused the merge twice. Before merging, **final-verify** re-fetches and, if
+the integration branch moved, merges it into the issue branch (a conflict
+parks the issue; a clean merge is re-verified and pushed); a merge the forge
+refuses goes back through final-verify once — a repo whose branch protection
+forbids squash merges gets a plain `--merge` instead, tried automatically,
+before that ever counts as a refusal. Parking:
 
 - labels the issue `needs-human` (created if the repo lacks it) and removes
   `ready-for-agent`;
@@ -53,9 +61,10 @@ issue's fault: it ends the run with exit 1, where it is.
    ```bash
    <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
-     [--review-model sonnet] [--review-rounds 2] [--extra-allowed-tools '<csv>'] \
-     [--per-call-timeout <s>] \
-     [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
+     [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
+     [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
+     [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120] \
+     [--max-fix-rounds 2]
    ```
 
    The verify command is detected like autopilot's (`package.json` `verify`
@@ -103,14 +112,16 @@ once, then holds the PR (fail closed). The report is posted as a PR comment
 (GitHub does not let the PR's author formally approve it) under a
 `<!-- deliver:review issue=N round=k head=<sha> -->` marker.
 
-## Fix rounds (`--review-rounds`, default 2)
+## Review fix rounds (`--max-fix-rounds`, default 2)
 
 A `changes_requested` verdict does not park the issue outright. Every
 in-scope `blocker` / `issue` finding of that round becomes a fresh plan item
 (`- [ ] R<k>.<j> — <severity> <file>:<line>: <note>`) appended to the issue's
 `IMPLEMENTATION_PLAN.md`, its `STATUS:` line is reopened to `in-progress`, and
 `loop.sh` runs again on the **same** `--state-dir` — so BUILD sees the same
-charter, memory and feedback, and only fixes what the review named.
+charter, memory and feedback, and only fixes what the review named. Each
+round is a fresh autopilot run with its own `--issue-max-*` caps; how many
+rounds an issue may spend is what `--max-fix-rounds` bounds.
 Out-of-scope findings and suggestions never become plan items — a suggestion
 never appears anywhere but the review's own PR comment.
 
@@ -124,9 +135,11 @@ PR body is rewritten from the current plan (`forge_pr_set_body`, `gh pr edit
 `k`'s findings inlined into the prompt so the reviewer can judge what was
 fixed — the round's PR comment lists the ids it marks `resolved`.
 
-After `--review-rounds` rounds still requesting changes, the issue parks with
-a reason naming the round count and the PR. Decision record:
-`docs/adr/0010-*.md`.
+Each fix round spends one round from the issue's `--max-fix-rounds` budget,
+the same counter a red CI draws from (below). A review still requesting
+changes once the budget is gone parks the issue, with a reason naming the
+review count and the PR; `--max-fix-rounds 0` parks on the first
+`changes_requested`. Decision record: `docs/adr/0011-*.md`.
 
 ## Out-of-scope findings become follow-up issues
 
@@ -135,7 +148,7 @@ followed up — they only ever appear in the review's PR comment) becomes a
 `needs-triage` issue instead of a plan item, in every round, whether that
 round approves or requests changes:
 
-- a **finding hash** (sha256 of its normalized `file`, `severity` and `note`)
+- a **finding hash** (sha256 of its normalized `file`, `line` and `severity` — not the note, which a fresh reviewer words differently every round)
   is its identity across rounds, autopilot re-runs and separate `/deliver`
   invocations. `forge_issue_search` looks for an open or closed issue already
   carrying `<!-- deliver:finding <hash> -->`; only when there is none does
@@ -152,6 +165,30 @@ round approves or requests changes:
 A follow-up is **recorded, never executed** by the run that found it: it
 never touches `## Delivery`, gets no branch and no autopilot run — adding it
 to a Map's Delivery section is a human decision made after triage.
+## The CI wait
+
+Once the review approves, `ci_wait` polls `gh pr checks` (`forge_pr_checks`)
+every `--ci-poll-seconds` (default 30) before the PR may merge:
+
+- **no check reported at all** once `--ci-grace-seconds` (default 120) has
+  passed is **"no CI"** — the runner logs it (`ci` phase, verdict `none`) and
+  merges anyway, noting `CI: no CI reported.` on the issue's merge comment;
+- **all reported checks pass** (nothing left `pending`): merges, logged with
+  verdict `pass`;
+- **any reported check fails**: spends one round from the issue's shared
+  `--max-fix-rounds` budget (default 2, shared with the review fix
+  rounds above). The fix round fetches the failed run's log tail
+  (`forge_ci_failed_log`, `gh run view <id> --log-failed`), appends a
+  `- [ ] C<round> Fix red CI: <check>` plan item with the log fenced as data,
+  reopens `STATUS: in-progress` and resumes autopilot (`loop.sh
+  --resume-run`); a clean finish goes back through final-verify and
+  `ci_wait`. No round left, autopilot not finishing the fix, or CI still red
+  after the round parks — with the failed checks' names in the reason and
+  the failed run's log tail in the park comment — logged with verdict
+  `fail`;
+- **still `pending` past `--ci-timeout`** (default 1800 s): parks ("CI still
+  pending after …"), no fix round (the check never actually failed); logged
+  with verdict `timeout`.
 
 **Pacing.** An issue is already one PR-sized slice, so by default autopilot
 gets `--plan-max-items 3` (a small plan; `--plan-max-items 0` lifts it) and

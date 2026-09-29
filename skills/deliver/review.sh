@@ -178,17 +178,21 @@ review_parse() {
 #   lines: "- [ ] R<round>.<j> — <severity> <file>:<line>: <note>", 1-based
 #   per round (#63). Out-of-scope findings and suggestions never appear here
 #   — they are only ever surfaced in the PR comment (review_comment below).
+#   Everything after the id is reviewer-authored text crossing into plan
+#   syntax, so it is flattened to one line (a newline could start a plan item
+#   of its own) and any `(after:` in it is defused — a trailing `(after: …)`
+#   is plan.sh's blocker clause, and a bogus one turns the plan into a DAG
+#   error mid-round.
 review_fix_items() {
   local round="$1" findings="$2"
   printf '%s' "$findings" | jq -r --arg round "$round" '
+    def plan_safe: tostring | gsub("[[:cntrl:]]+"; " ") | gsub("\\(\\s*after\\s*:"; "(after -"; "i");
     [ .[] | select(.in_scope and (.severity == "blocker" or .severity == "issue")) ] |
     to_entries[] |
-    "- [ ] R\($round).\(.key + 1) — \(.value.severity) \(.value.file // "?"):\(.value.line // "?"): \(.value.note // "")"'
+    "- [ ] R\($round).\(.key + 1) — " +
+    ("\(.value.severity) \(.value.file // "?"):\(.value.line // "?"): \(.value.note // "")" | plan_safe)'
 }
 
-# review_cleanup — remove the live throwaway worktree, if any. Safe to call
-# repeatedly; deliver.sh also calls it from its EXIT/INT/TERM traps, so a
-# killed run does not leave a worktree behind to confuse the next snapshot.
 # review_out_of_scope_items <findings_json>
 #   Every out-of-scope blocker/issue finding (suggestions are skipped, same
 #   rule as review_fix_items, #63) as TSV rows: file, line, severity, note,
@@ -199,11 +203,14 @@ review_out_of_scope_items() {
     [ (.file // "?"), ((.line // "?") | tostring), .severity, (.note // ""), (.issue_title // "") ] | @tsv'
 }
 
-# finding_hash <file> <severity> <note>
-#   sha256 of the finding's normalized file/severity/note — an out-of-scope
+# finding_hash <file> <line> <severity>
+#   sha256 of the finding's normalized file/line/severity — an out-of-scope
 #   finding's identity across review rounds, autopilot re-runs and repeated
 #   /deliver invocations against the same forge state (#63): unless an issue
 #   already carries `<!-- deliver:finding <hash> -->`, a fresh one is opened.
+#   The note is deliberately not part of it: every round is a fresh reviewer
+#   call that words the same defect differently. An out-of-scope finding sits
+#   in code the PR did not touch, so its line holds still between rounds.
 finding_hash() {
   local norm
   norm="$(printf '%s\x1f%s\x1f%s' "$1" "$2" "$3" \
@@ -211,6 +218,9 @@ finding_hash() {
   printf '%s' "$norm" | sha256sum | cut -d' ' -f1
 }
 
+# review_cleanup — remove the live throwaway worktree, if any. Safe to call
+# repeatedly; deliver.sh also calls it from its EXIT/INT/TERM traps, so a
+# killed run does not leave a worktree behind to confuse the next snapshot.
 review_cleanup() {
   [[ -n "$REVIEW_WT" ]] || return 0
   git worktree remove --force "$REVIEW_WT" 2>/dev/null || rm -rf "$REVIEW_WT"

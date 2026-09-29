@@ -5,32 +5,52 @@
 # blocking-edge order. docs/prd/0003-deliver.md, ADR-0007, ADR-0008.
 #
 # Every issue PR gets an independent review (agents/code-reviewer.md, in a
-# throwaway worktree, #59) before it may merge. An issue that cannot get there
-# — autopilot did not finish, verify failed on its head, the review held it,
-# the forge refused the merge — is PARKED (#58): labelled needs-human, its PR
-# back to draft, a comment saying why; issues that depend on it are skipped
-# and independent ones continue. A failure of the machinery itself (the forge
-# unreachable, a dirty checkout, a review that touched the checkout) ends the
-# run instead. Not built yet: CI wait, resume, the launcher.
+# throwaway worktree, #59) before it may merge. A review that requests changes
+# gets bounded fix rounds on the same PR (#63): its in-scope findings become
+# plan items, autopilot runs again on the same state dir, and the new head is
+# re-verified, pushed fast-forward and reviewed again; out-of-scope findings
+# become needs-triage follow-up issues listed on the Map. Before merging,
+# final_verify (#60) re-fetches and, if the integration branch moved, merges
+# it into the issue branch — a conflict parks the issue; a clean merge is
+# re-verified and pushed. A merge the forge refuses (repo forbids squash:
+# retried as a plain --merge; anything else) goes back through final_verify
+# once before giving up. An issue that cannot get there — autopilot did not
+# finish, verify failed on its head, the review still held it with no fix
+# rounds left, the base moved into a conflict, the forge refused the merge
+# twice, or CI failed or timed out — is PARKED (#58): labelled needs-human,
+# its PR back to draft, a comment saying why; issues that depend on it are
+# skipped and independent ones continue. Before merging, ci_wait (#60) polls
+# `gh pr checks` until nothing is pending or --ci-timeout passes; no checks at
+# all after --ci-grace-seconds is "no CI" and merges anyway. A red check gets
+# a fix round (#60): the failed run's log tail is appended to the issue's
+# plan as a new item, autopilot resumes to fix it, and the head goes back
+# through final_verify and ci_wait. Review and CI fix rounds draw from one
+# per-issue budget (--max-fix-rounds); no rounds left, a second red CI, or
+# autopilot not finishing a fix parks instead. A failure of the machinery
+# itself (the forge unreachable, a dirty checkout, a review that touched the
+# checkout) ends the run instead. Not built yet: resume, the launcher.
 #
 # Usage:
 #   deliver.sh --map <N> [--verify-cmd '<cmd>']
 #              [--issue-max-iterations 10] [--issue-max-minutes 120]
-#              [--issue-budget-usd 10] [--review-model sonnet] [--review-rounds 2]
+#              [--issue-budget-usd 10] [--review-model sonnet]
 #              [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>]
 #              [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>']
+#              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
+#              [--max-fix-rounds 2]
 #
 # Run it from a clean checkout of the integration branch (never main/master),
 # in sync with origin. Exit codes: 0 every Delivery line merged ·
 # 1 precondition or runner failure · 2 partial (an issue was parked; its
 # dependents were skipped).
 #
-# --review-rounds bounds in-scope fix rounds on the same PR (docs/adr/0010-*.md):
-# every in-scope blocker/issue finding of a changes_requested round becomes a
-# plan item (R<k>.<j>), autopilot runs again on the same issue state dir, the
-# new head is verified, pushed fast-forward only, and reviewed again with the
-# previous round's findings inlined. Still requesting changes after
-# --review-rounds rounds parks the issue, naming the round count and the PR.
+# --max-fix-rounds bounds the fix rounds one issue may spend, review and CI
+# alike (docs/adr/0010-*.md, docs/adr/0011-*.md): every in-scope blocker/issue
+# finding of a changes_requested round becomes a plan item (R<k>.<j>),
+# autopilot runs again on the same issue state dir, the new head is verified,
+# pushed fast-forward only, and reviewed again with the previous round's
+# findings inlined. A review still requesting changes with no round left
+# parks the issue, naming the review count and the PR.
 
 set -uo pipefail
 
@@ -53,7 +73,10 @@ PLAN_MAX_ITEMS=3       # 0: no size hint
 VERIFY_EVERY_ITERATION=0
 ITERATION_VERIFY_CMD=""
 REVIEW_MODEL=sonnet
-REVIEW_ROUNDS=2
+CI_POLL_SECONDS=30
+CI_TIMEOUT_SECONDS=1800
+CI_GRACE_SECONDS=120
+MAX_FIX_ROUNDS=2
 
 log()     { echo "deliver: $*" >&2; }
 die()     { log "$*"; exit 1; }
@@ -71,15 +94,21 @@ while [[ $# -gt 0 ]]; do
     --verify-every-iteration) VERIFY_EVERY_ITERATION=1; shift ;;
     --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
     --review-model)         REVIEW_MODEL="$2"; shift 2 ;;
-    --review-rounds)        REVIEW_ROUNDS="$2"; shift 2 ;;
-    -h|--help)              sed -n '2,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --ci-poll-seconds)      CI_POLL_SECONDS="$2"; shift 2 ;;
+    --ci-timeout)           CI_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --ci-grace-seconds)     CI_GRACE_SECONDS="$2"; shift 2 ;;
+    --max-fix-rounds)       MAX_FIX_ROUNDS="$2"; shift 2 ;;
+    -h|--help)              sed -n '2,37p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 [[ "$MAP" =~ ^[0-9]+$ ]] || die "--map <issue number> is required"
 [[ -z "$PER_CALL_TIMEOUT" || "$PER_CALL_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--per-call-timeout takes whole seconds"
 [[ "$PLAN_MAX_ITEMS" =~ ^[0-9]+$ ]] || die "--plan-max-items takes a whole number (0: no limit)"
-[[ "$REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "--review-rounds takes a positive whole number"
+[[ "$CI_POLL_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-poll-seconds takes whole seconds"
+[[ "$CI_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-timeout takes whole seconds"
+[[ "$CI_GRACE_SECONDS" =~ ^[0-9]+$ ]] || die "--ci-grace-seconds takes whole seconds"
+[[ "$MAX_FIX_ROUNDS" =~ ^[0-9]+$ ]] || die "--max-fix-rounds takes a whole number (0: no fix rounds)"
 [[ -z "$ITERATION_VERIFY_CMD" || "$VERIFY_EVERY_ITERATION" -eq 0 ]] \
   || die "--iteration-verify-cmd is for the default mode; drop it with --verify-every-iteration"
 
@@ -190,6 +219,7 @@ MAP_PLAN="$RUN_DIR/map.plan.md"
 MERGED=()   # issue numbers merged by this run
 PARKED=()   # issue refs (#N) parked by this run
 PARK_REASON=""   # set by deliver_issue before it returns 10
+PARK_LOG=""      # optionally, a log file whose tail the park comment carries (a red CI run's)
 CUR_PR=""        # the PR of the issue in flight, once opened
 CUR_BRANCH=""    # its branch, once created
 
@@ -262,7 +292,7 @@ process_out_of_scope_findings() {
   findings="$(jq -c '.findings' "$dir/review-$round.json" 2>/dev/null)" || return 0
   while IFS=$'\t' read -r file line sev note issue_title; do
     [[ -n "$file" ]] || continue
-    hash="$(finding_hash "$file" "$sev" "$note")"
+    hash="$(finding_hash "$file" "$line" "$sev")"
     marker="<!-- deliver:finding $hash -->"
     title="${issue_title:-fix: $sev at $file:$line}"
     fn="$(forge_issue_search "$hash")"
@@ -341,16 +371,210 @@ review_issue() {
 }
 
 # ---------------------------------------------------------------------------
+# final_verify <n> <dir> — the head that will be pushed and merged, verified
+# on top of the current base (#60). Runs on the issue branch (checked out by
+# the caller). Fetches; if origin/$BASE is not an ancestor of HEAD, merges it
+# in — a conflict aborts the merge and parks with the conflicting paths in
+# PARK_REASON. Verify always runs, in a clean tree, on the (possibly merged)
+# head; whenever HEAD ends up ahead of (or without) origin/$CUR_BRANCH — a
+# base merge, or a re-entry after a CI fix round committed new work — it is
+# pushed with forge_push_update. That covers the first call too (before the
+# branch is ever pushed — a push here quietly becomes the branch's first).
+# Returns 0 verified · 10 park (PARK_REASON set) · 1 stop the run.
+# ---------------------------------------------------------------------------
+final_verify() {
+  local n="$1" dir="$2" verify_rc merged=0 head_now conflicts
+  git fetch -q origin || { log "#$n: git fetch failed — stopping."; return 1; }
+  if ! git merge-base --is-ancestor "origin/$BASE" HEAD; then
+    if ! git merge -q --no-edit "origin/$BASE" > "$dir/base-merge.log" 2>&1; then
+      conflicts="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+      git merge --abort
+      PARK_REASON="the base branch \`$BASE\` moved and the merge conflicts on: ${conflicts:-(unknown paths)}"
+      return 10
+    fi
+    merged=1
+    log "#$n: \`$BASE\` moved — merged origin/$BASE into the issue branch ($(git rev-parse --short HEAD))"
+  fi
+  # Autopilot's BUILD may have edited what verify runs: no forge credentials.
+  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
+  verify_rc=$?
+  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
+    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
+    return 1
+  fi
+  head_now="$(git rev-parse HEAD)"
+  if [[ "$verify_rc" -ne 0 ]]; then
+    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
+    PARK_REASON="verify failed on the head autopilot finished with (\`${head_now:0:12}\`)"
+    return 10
+  fi
+  [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify changed the checkout — stopping."; return 1; }
+  if [[ "$merged" -eq 1 || "$(git rev-parse "origin/$CUR_BRANCH" 2>/dev/null)" != "$head_now" ]]; then
+    forge_push_update "$CUR_BRANCH" || { log "#$n: push failed — stopping."; return 1; }
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# ci_wait <n> <pr> <dir> <round> — between review and merge (#60). Polls
+# forge_pr_checks every $CI_POLL_SECONDS until no reported check is pending
+# or $CI_TIMEOUT_SECONDS passes. No checks reported at all once
+# $CI_GRACE_SECONDS has elapsed is "no CI" — logged (deliver_logline ci) and
+# merges anyway, same as all green; CI_NOTE is set for the merge comment. A
+# reported failure sets CI_FAILED_JSON (the failing checks, name+link) and
+# parks with their names — the caller may spend a fix round instead (#60);
+# still pending at the timeout parks too, with no fix round (the check never
+# actually failed). <round> is only for the run log, so a fix round's second
+# poll is told apart from the first.
+# Returns 0 merge (CI_NOTE, CI_RESULT set) · 10 park (PARK_REASON, CI_RESULT
+# set) · 1 stop the run.
+# ---------------------------------------------------------------------------
+CI_NOTE=""
+CI_RESULT=""
+CI_FAILED_JSON="[]"
+ci_wait() {
+  local n="$1" pr="$2" dir="$3" round="${4:-1}" start now elapsed checks pending failed
+  start="$(date +%s)"
+  CI_NOTE=""; CI_RESULT=""; CI_FAILED_JSON="[]"
+  while :; do
+    checks="$(forge_pr_checks "$pr")"
+    jq -e 'type == "array"' >/dev/null 2>&1 <<<"$checks" || checks="[]"
+    now="$(date +%s)"; elapsed=$(( now - start ))
+    if [[ "$(jq 'length' <<<"$checks")" -eq 0 ]]; then
+      if [[ "$elapsed" -ge "$CI_GRACE_SECONDS" ]]; then
+        log "#$n: no CI reported on PR #$pr after ${CI_GRACE_SECONDS}s — merging without it."
+        deliver_logline ci "$n" "$round" none
+        CI_NOTE="no CI reported"
+        CI_RESULT="none"
+        return 0
+      fi
+    else
+      pending="$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$checks")"
+      if [[ "$pending" -eq 0 ]]; then
+        CI_FAILED_JSON="$(jq -c '[.[] | select(.bucket == "fail")]' <<<"$checks")"
+        failed="$(jq -r '.[].name' <<<"$CI_FAILED_JSON" | tr '\n' ',' | sed 's/,$//')"
+        if [[ -n "$failed" ]]; then
+          deliver_logline ci "$n" "$round" fail
+          PARK_REASON="CI failed on PR #$pr: $failed"
+          CI_RESULT="fail"
+          return 10
+        fi
+        deliver_logline ci "$n" "$round" pass
+        log "#$n: CI is green on PR #$pr"
+        CI_RESULT="pass"
+        return 0
+      fi
+    fi
+    if [[ "$elapsed" -ge "$CI_TIMEOUT_SECONDS" ]]; then
+      deliver_logline ci "$n" "$round" timeout
+      PARK_REASON="CI still pending after ${CI_TIMEOUT_SECONDS}s on PR #$pr"
+      CI_RESULT="timeout"
+      return 10
+    fi
+    sleep "$CI_POLL_SECONDS"
+  done
+}
+
+# round_budget_use <dir> — spends one fix round against the issue's shared
+# budget (--max-fix-rounds, default 2; #63's review fix rounds draw from the
+# same counter, kept in $dir/ROUNDS_USED — plain state, not committed, like
+# the rest of the autopilot state dir). Echoes the round number just spent;
+# returns 1 without spending anything when the budget is already gone.
+round_budget_use() {
+  local dir="$1" used
+  used="$(cat "$dir/ROUNDS_USED" 2>/dev/null || echo 0)"
+  [[ "$used" =~ ^[0-9]+$ ]] || used=0
+  [[ "$used" -lt "$MAX_FIX_ROUNDS" ]] || return 1
+  used=$(( used + 1 ))
+  echo "$used" > "$dir/ROUNDS_USED"
+  printf '%s\n' "$used"
+}
+
+# ci_failed_log_fetch <dir> — the tail of the failed run's log for the first
+# failed check in CI_FAILED_JSON (ci_wait must have just set it), fetched with
+# forge_ci_failed_log from the run id in the check's link and written to
+# $dir/ci-fail-<k>.log, k counting this issue's red CI results (1, 2, …).
+# Echoes the file's path; the file is empty when the link names no run or the
+# log is gone — less context for whoever reads it, never a reason to stop.
+ci_failed_log_fetch() {
+  local dir="$1" k=1 link run_id logf
+  while [[ -e "$dir/ci-fail-$k.log" ]]; do k=$(( k + 1 )); done
+  logf="$dir/ci-fail-$k.log"
+  link="$(jq -r '.[0].link // empty' <<<"$CI_FAILED_JSON")"
+  run_id="$(grep -oE '/runs/[0-9]+' <<<"$link" | head -1 | grep -oE '[0-9]+')"
+  if [[ -n "$run_id" ]]; then
+    forge_ci_failed_log "$run_id" > "$logf" 2>/dev/null
+  else
+    : > "$logf"
+  fi
+  printf '%s\n' "$logf"
+}
+
+# ci_fix_round <n> <pr> <dir> <round> — one CI fix round (#60), spent by the
+# caller against round_budget_use before this runs. Runs on the issue branch
+# (checked out by the caller). Fetches the failed run's log tail
+# (ci_failed_log_fetch), appends a new `- [ ] C<round> Fix red CI: <check>`
+# item to the issue's IMPLEMENTATION_PLAN.md with the log fenced as data
+# (read by the model, not parsed as a plan line), re-opens `STATUS:
+# in-progress`, and resumes autopilot on the same state dir. A finished,
+# clean run is re-verified (final_verify) and pushed; anything else parks
+# with the log tail as PARK_LOG.
+# Returns 0 fixed, re-verified and pushed · 10 park (PARK_REASON set) · 1
+# stop the run.
+# ---------------------------------------------------------------------------
+ci_fix_round() {
+  local n="$1" pr="$2" dir="$3" round="$4"
+  local check logf plan="$dir/IMPLEMENTATION_PLAN.md" fence loop_rc status_state
+  check="$(jq -r '.[0].name // "CI"' <<<"$CI_FAILED_JSON")"
+  logf="$(ci_failed_log_fetch "$dir")"
+  fence="$(md_tilde_fence < "$logf")"
+  {
+    echo
+    echo "- [ ] C$round Fix red CI: $check"
+    echo
+    echo "CI check `$check` failed on PR #$pr. Tail of the failed run's log:"
+    echo
+    echo "$fence"
+    cat "$logf"
+    echo "$fence"
+  } >> "$plan"
+  sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$plan" 2>/dev/null && rm -f "$plan.bak"
+  log "#$n: CI failed on PR #$pr (`$check`) — fix round $round: appended plan item C$round, resuming autopilot."
+
+  run_autopilot "$dir" --resume-run; loop_rc=$?
+  status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
+  if [[ "$loop_rc" -eq 1 ]]; then
+    log "#$n: autopilot refused to resume for the CI fix round (exit 1) — stopping the run."
+    return 1
+  fi
+  if [[ -n "$(git status --porcelain)" ]]; then
+    log "#$n: autopilot left a dirty tree after the CI fix round — stopping."
+    return 1
+  fi
+  if [[ "$loop_rc" -ne 0 || "$status_state" != "done" ]]; then
+    PARK_REASON="the CI fix round for PR #$pr did not finish (autopilot ended '$status_state', exit $loop_rc); failed check: `$check`"
+    PARK_LOG="$logf"
+    return 10
+  fi
+
+  final_verify "$n" "$dir"
+  return $?
+}
+
+# ---------------------------------------------------------------------------
 # Shared by an issue's first autopilot run and every fix round (#63):
 # run_autopilot fires one loop.sh invocation with this run's flags;
-# autopilot_gates checks its outcome; final_verify re-verifies the exact head
-# with no forge credentials in reach; write_pr_body (re)builds the PR body
+# autopilot_gates checks its outcome; final_verify (above) re-verifies the
+# head with no forge credentials in reach; write_pr_body (re)builds the PR body
 # from the issue's current plan and latest autopilot status.
 # ---------------------------------------------------------------------------
 
-# run_autopilot <dir>
+# run_autopilot <dir> [loop.sh flag…] — a review fix round starts a fresh
+# loop.sh run on the same state dir (its own --issue-max-* caps; the number
+# of rounds is what --max-fix-rounds bounds); a CI fix round passes
+# --resume-run and continues the issue's run instead (#60).
 run_autopilot() {
-  local dir="$1"
+  local dir="$1"; shift
   local -a loop_timeout=() loop_pace=() loop_extra=()
   [[ -n "$PER_CALL_TIMEOUT" ]] && loop_timeout=(--per-call-timeout "$PER_CALL_TIMEOUT")
   [[ "$PLAN_MAX_ITEMS" -gt 0 ]] && loop_pace+=(--plan-max-items "$PLAN_MAX_ITEMS")
@@ -363,7 +587,7 @@ run_autopilot() {
   # pipe, and a run log behind `| tee` then stayed empty for half an hour.
   bash "$LOOP" --state-dir "$dir" --verify-cmd "$VERIFY_CMD" ${loop_extra[@]+"${loop_extra[@]}"} \
     --max-iterations "$ISSUE_MAX_ITERATIONS" --max-minutes "$ISSUE_MAX_MINUTES" \
-    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} \
+    --budget-usd "$ISSUE_BUDGET_USD" ${loop_timeout[@]+"${loop_timeout[@]}"} ${loop_pace[@]+"${loop_pace[@]}"} "$@" \
     2> >(while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done >&2)
 }
 
@@ -387,28 +611,6 @@ autopilot_gates() {
     PARK_REASON="autopilot reported done without a single commit"
     return 10
   fi
-  return 0
-}
-
-# final_verify <n> <dir>  — verifies the exact head about to be pushed/merged;
-# autopilot's BUILD may have edited what verify runs, so it never sees forge
-# credentials.
-final_verify() {
-  local n="$1" dir="$2" head_sha verify_rc
-  head_sha="$(git rev-parse HEAD)"
-  agent_run_without_forge_credentials bash -c "$VERIFY_CMD" > "$dir/final-verify.log" 2>&1
-  verify_rc=$?
-  if [[ "${AGENT_REFUSED:-0}" -eq 1 ]]; then
-    log "#$n: forge credentials could not be withheld for verify (no private temp dir) — stopping the run."
-    return 1
-  fi
-  if [[ "$verify_rc" -ne 0 ]]; then
-    [[ -z "$(git status --porcelain)" ]] || { log "#$n: verify failed and left the checkout dirty — stopping."; return 1; }
-    PARK_REASON="verify failed on the head autopilot finished with (\`${head_sha:0:12}\`)"
-    return 10
-  fi
-  [[ -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head_sha" ]] \
-    || { log "#$n: verify changed the checkout — stopping."; return 1; }
   return 0
 }
 
@@ -459,7 +661,8 @@ append_fix_round_items() {
 }
 
 # ---------------------------------------------------------------------------
-# One issue: branch → autopilot → push → PR → review → verify → merge → tick.
+# One issue: branch → autopilot → push → PR → review (+ fix rounds) → CI →
+# merge → tick.
 # ---------------------------------------------------------------------------
 # Returns 0 merged, 10 park (PARK_REASON says why), 11 already parked (left
 # alone, skipped with its dependents), 1 end the run.
@@ -472,7 +675,7 @@ deliver_issue() {
   mkdir -p "$dir"
   # Per-issue state starts empty: every early return below may park, and a
   # park must never name an earlier issue's PR or branch.
-  CUR_PR=""; CUR_BRANCH=""
+  CUR_PR=""; CUR_BRANCH=""; PARK_LOG=""
 
   forge_issue_json "$n" > "$dir/issue.json" || { log "#$n: cannot read the issue"; return 1; }
   state="$(jq -r '.state' "$dir/issue.json")"
@@ -516,8 +719,13 @@ deliver_issue() {
   autopilot_gates "$n" "$dir" "$prev_head" "$loop_rc"; gate_rc=$?
   [[ "$gate_rc" -eq 0 ]] || return "$gate_rc"
 
-  # --- verify the exact head that will be merged ---
-  final_verify "$n" "$dir" || return $?
+  # --- final-verify: the merged head that will be pushed and merged ---
+  final_verify "$n" "$dir"; local fv_rc=$?
+  case "$fv_rc" in
+    0)  ;;
+    10) return 10 ;;
+    *)  return 1 ;;
+  esac
   head_sha="$(git rev-parse HEAD)"
 
   # --- PR ---
@@ -547,8 +755,8 @@ deliver_issue() {
     # already set inside review_issue) and never gets a fix round; only a
     # parsed changes_requested verdict (review-<round>.json on disk) does.
     [[ -f "$dir/review-$round.json" ]] || return 10
-    if [[ "$round" -ge "$REVIEW_ROUNDS" ]]; then
-      PARK_REASON="the review still requests changes after $REVIEW_ROUNDS round(s) (PR #$pr)"
+    if ! round_budget_use "$dir" >/dev/null; then
+      PARK_REASON="the review still requests changes after $round review(s) and no fix rounds are left (--max-fix-rounds $MAX_FIX_ROUNDS, PR #$pr)"
       return 10
     fi
     findings="$(jq -c '.findings' "$dir/review-$round.json")"
@@ -572,12 +780,57 @@ deliver_issue() {
     round=$(( round + 1 ))
   done
 
-  # --- merge (from the base, so the forge never has the head checked out) ---
-  git switch -q "$BASE" || return 1
-  if ! forge_pr_merge "$pr" "$head_sha" "$title (#$pr)" "$dir/pr-body.md" > "$dir/merge.log" 2>&1; then
-    PARK_REASON="the forge refused to merge PR #$pr: $(tail -1 "$dir/merge.log")"
-    return 10
+  # --- wait for CI before merging, with one fix round for a red check (#60) ---
+  ci_wait "$n" "$pr" "$dir" 1; local ci_rc=$?
+  if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
+    local ci_round fix_rc
+    if ci_round="$(round_budget_use "$dir")"; then
+      ci_fix_round "$n" "$pr" "$dir" "$ci_round"; fix_rc=$?
+      case "$fix_rc" in
+        0) head_sha="$(git rev-parse HEAD)"
+           ci_wait "$n" "$pr" "$dir" "$(( ci_round + 1 ))"; ci_rc=$?
+           if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
+             PARK_REASON="CI failed again on PR #$pr after fix round $ci_round: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON")"
+             PARK_LOG="$(ci_failed_log_fetch "$dir")"
+           fi
+           ;;
+        10) ;;  # PARK_REASON / PARK_LOG already set inside ci_fix_round
+        *)  return 1 ;;
+      esac
+    else
+      PARK_REASON="CI failed on PR #$pr: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON") (no fix rounds left)"
+      PARK_LOG="$(ci_failed_log_fetch "$dir")"
+      ci_rc=10
+    fi
   fi
+  [[ "$ci_rc" -eq 0 ]] || return "$ci_rc"
+
+  # --- merge (from the base, so the forge never has the head checked out) ---
+  # A refusal (branch protection, a base that moved again, …) goes back
+  # through final_verify exactly once before parking (#60); forge_pr_merge
+  # already falls back to a plain --merge on its own when the repo forbids
+  # squash, so that case never reaches this retry at all.
+  git switch -q "$BASE" || return 1
+  local merge_retried=0
+  while :; do
+    if forge_pr_merge "$pr" "$head_sha" "$title (#$pr)" "$dir/pr-body.md" > "$dir/merge.log" 2>&1; then
+      break
+    fi
+    if [[ "$merge_retried" -eq 1 ]]; then
+      PARK_REASON="the forge refused to merge PR #$pr twice: $(tail -1 "$dir/merge.log")"
+      return 10
+    fi
+    merge_retried=1
+    log "#$n: merge of PR #$pr was refused — retrying once via final-verify: $(tail -1 "$dir/merge.log")"
+    git switch -q "$branch" || return 1
+    final_verify "$n" "$dir"; fv_rc=$?
+    case "$fv_rc" in
+      0)  head_sha="$(git rev-parse HEAD)" ;;
+      10) return 10 ;;
+      *)  return 1 ;;
+    esac
+    git switch -q "$BASE" || return 1
+  done
   [[ "$(forge_pr_state "$pr")" == "MERGED" ]] || { log "#$n: PR #$pr is not MERGED after merge — stopping."; return 1; }
 
   git fetch -q origin && git merge -q --ff-only "origin/$BASE" \
@@ -588,8 +841,11 @@ deliver_issue() {
 
   MERGED+=("$n")
   tick_map "$n" || log "#$n: could not tick map #$MAP (continuing; this run will not redeliver it)"
-  printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
-    "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP" > "$dir/issue-comment.md"
+  {
+    printf 'Merged into `%s` via #%s (`%s`) by `/deliver` run `%s`. Map #%s.\n' \
+      "$BASE" "$pr" "$merged_sha" "$RUN_ID" "$MAP"
+    [[ -n "$CI_NOTE" ]] && printf 'CI: %s.\n' "$CI_NOTE"
+  } > "$dir/issue-comment.md"
   forge_issue_comment "$n" "$dir/issue-comment.md" || true
   log "#$n: merged as $merged_sha"
   return 0
@@ -605,9 +861,12 @@ park_issue() {
   log "#$n: PARKED — $PARK_REASON"
   # Back to the base so the next issue starts clean; anything else means the
   # checkout is not in the state the runner left it, and parking stops there.
+  # final_verify's own `git fetch` may have moved origin/$BASE ahead of the
+  # local branch (the base moved, #60) — catching up is a fast-forward, not
+  # a foreign mutation, so it is folded in here rather than treated as one.
   [[ -z "$(git status --porcelain)" ]] || die "#$n: cannot park — the checkout is dirty."
   git switch -q "$BASE" || die "#$n: cannot park — cannot switch back to '$BASE'."
-  [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$BASE")" ]] \
+  git fetch -q origin && git merge -q --ff-only "origin/$BASE" \
     || die "#$n: cannot park — '$BASE' no longer matches origin/$BASE."
 
   forge_label_ensure needs-human d93f0b "Parked by /deliver: needs a human decision before an agent retries it"
@@ -629,6 +888,18 @@ park_issue() {
     fi
     echo "- Issues that wait on this one are skipped in this run; independent ones continue."
     echo "- To retry: resolve the cause, delete the issue branch${CUR_BRANCH:+ \`$CUR_BRANCH\`} (locally and on origin)${CUR_PR:+ and close PR #$CUR_PR}, remove \`needs-human\`, and run /deliver on map #$MAP again. While the label is on, /deliver leaves this issue alone."
+    if [[ -n "$PARK_LOG" && -s "$PARK_LOG" ]]; then
+      local log_fence
+      log_fence="$(md_tilde_fence < "$PARK_LOG")"
+      echo
+      echo "<details><summary>Failed CI log (tail)</summary>"
+      echo
+      echo "$log_fence"
+      cat "$PARK_LOG"
+      echo "$log_fence"
+      echo
+      echo "</details>"
+    fi
     if [[ -s "$dir/FEEDBACK.md" ]]; then
       local fence
       fence="$(tail -n 40 "$dir/FEEDBACK.md" | md_tilde_fence)"

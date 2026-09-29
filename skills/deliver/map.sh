@@ -178,9 +178,9 @@ map_add_follow_up() {
     awk -v line="$line" '
       { raw=$0; l=$0; sub(/\r$/, "", l) }
       in_delivery && l ~ /^##[[:space:]]/ && !inserted { print "## Follow-ups"; print line; print ""; inserted=1 }
-      { print raw }
+      { print raw; last=l }
       l ~ /^##[[:space:]]+Delivery[[:space:]]*$/ { in_delivery=1 }
-      END { if (!inserted) { print "## Follow-ups"; print line } }
+      END { if (!inserted) { if (NR > 0 && last !~ /^[[:space:]]*$/) print ""; print "## Follow-ups"; print line } }
     ' "$body"
   fi
 }
