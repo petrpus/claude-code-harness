@@ -69,12 +69,14 @@ issue's fault: it ends the run with exit 1, where it is.
 
 ## How to run (terminal)
 
-1. Be on a clean **integration branch** (never `main`/`master`), in sync with
-   `origin`, with `tmp/` gitignored.
+1. Be on a clean **integration branch** (`main`/`master` is refused unless you
+   pass `--allow-main` — per-issue PRs then merge straight into it and no final
+   PR is opened, ADR-0013; the flag is kept in `state.json` for `--resume`), in
+   sync with `origin`, with `tmp/` gitignored.
 2. Run the runner from the **installed plugin copy**:
 
    ```bash
-   <plugin>/skills/deliver/deliver.sh --map <N> [--verify-cmd '<cmd>'] \
+   <plugin>/skills/deliver/deliver.sh --map <N> [--allow-main] [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
      [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \

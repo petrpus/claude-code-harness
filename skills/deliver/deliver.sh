@@ -47,10 +47,12 @@
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
 #              [--max-fix-rounds 2] [--max-turns 200]
 #              [--budget-usd <n>] [--max-minutes <n>]
-#              [--resume [--retry '#N']]
+#              [--resume [--retry '#N']] [--allow-main]
 #
-# Run it from a clean checkout of the integration branch (never main/master),
-# in sync with origin. State lives under tmp/deliver/<run-id>/: state.json
+# Run it from a clean checkout of the integration branch, in sync with origin.
+# main/master is refused unless --allow-main (docs/adr/0013-*.md): per-issue
+# PRs then target that branch directly and no final PR is opened; the flag is
+# recorded in state.json, so --resume on main does not refuse again. State lives under tmp/deliver/<run-id>/: state.json
 # (resume truth), events.jsonl, status.json, run-<run-id>.jsonl (this
 # runner's own model calls, loop.sh's schema, so /usage-report reads it) and
 # a lock file holding this process's pid, removed on exit. A STOP file at
@@ -120,6 +122,7 @@ MAX_TURNS=200          # per model call in every loop.sh run (#96): loop.sh's
 BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
+ALLOW_MAIN=0           # --allow-main: deliver straight into main/master (ADR-0013)
 RETRY_ISSUE=""         # set by --retry '#N'; only meaningful with --resume
 
 log()     { echo "deliver: $*" >&2; }
@@ -146,6 +149,7 @@ while [[ $# -gt 0 ]]; do
     --budget-usd)           BUDGET_USD="$2"; shift 2 ;;
     --max-minutes)          MAX_MINUTES="$2"; shift 2 ;;
     --resume)               RESUME=1; shift ;;
+    --allow-main)           ALLOW_MAIN=1; shift ;;
     --retry)                RETRY_ISSUE="${2#\#}"; shift 2 ;;
     -h|--help)              sed -n '2,90p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
@@ -228,6 +232,7 @@ if [[ "$RESUME" -eq 1 ]]; then
     rm -f "$RESUME_LOCK"
   fi
   RESUME_BASE="$(jq -r '.base' "$RESUME_STATE_JSON")"
+  [[ "$(jq -r '.allow_main // false' "$RESUME_STATE_JSON")" == "true" ]] && ALLOW_MAIN=1
   RESUME_CUR_BRANCH="$(git branch --show-current 2>/dev/null || true)"
   if [[ "$RESUME_CUR_BRANCH" != "$RESUME_BASE" ]]; then
     [[ -z "$(git status --porcelain 2>/dev/null)" ]] \
@@ -240,7 +245,8 @@ fi
 BASE="$(git branch --show-current 2>/dev/null || true)"
 case "$BASE" in
   "")          die "detached HEAD — check out the integration branch first." ;;
-  main|master) die "refusing to merge into '$BASE'. Check out an integration branch (ADR-0007)." ;;
+  main|master) [[ "$ALLOW_MAIN" -eq 1 ]] \
+                 || die "refusing to merge into '$BASE'. Check out an integration branch (ADR-0007), or pass --allow-main to deliver straight into it (ADR-0013)." ;;
 esac
 [[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "working tree is dirty. Commit or stash first."
 git check-ignore -q tmp/deliver/.probe 2>/dev/null \
@@ -324,6 +330,7 @@ if [[ "$RESUME" -eq 1 && -f "$RUN_DIR/state.json" ]]; then
   state_event "$RUN_DIR" "" resumed "plugin version $RESUME_OLD_VERSION -> $RUNNER_VERSION"
 else
   state_init "$RUN_DIR" "$MAP" "$BASE" "$RUN_ID" "$RUNNER_VERSION"
+  [[ "$ALLOW_MAIN" -eq 1 ]] && state_set_allow_main "$RUN_DIR"
 fi
 
 # active_seconds_now — this run's persisted active time plus this process's

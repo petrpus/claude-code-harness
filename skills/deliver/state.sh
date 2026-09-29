@@ -47,6 +47,12 @@ state_set_final_pr() {
      > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
 }
 
+# state_set_allow_main <run_dir>  — the run started with --allow-main
+# (ADR-0013); --resume reads it so a run on main is not refused again.
+state_set_allow_main() {
+  jq '.allow_main = true' "$1/state.json" > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
+}
+
 # state_event <run_dir> <issue_number_or_empty> <event> [reason]  — appended,
 # never rewritten; a run's events.jsonl is its own transition log.
 state_event() {

@@ -906,6 +906,12 @@ job_onmain() {
   run_deliver onmain
   echo $? > "$WORK/onmain/rc"
 }
+job_allowmain() {
+  new_fixture allowmain
+  git -C "$WORK/allowmain/repo" switch -q main
+  run_deliver allowmain -- --allow-main
+  echo $? > "$WORK/allowmain/rc"
+}
 job_dirty() {
   new_fixture dirty
   echo junk > "$WORK/dirty/repo/untracked.txt"
@@ -1261,6 +1267,7 @@ bg job_pace
 bg job_paceall
 bg job_pacebad
 bg job_onmain
+bg job_allowmain
 bg job_dirty
 bg job_nomap
 bg job_behind
@@ -1559,8 +1566,23 @@ RC="$(cat "$WORK/pacebad/rc")"
 # --- refusals ------------------------------------------------------------------
 RC="$(cat "$WORK/onmain/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "refusing to merge into 'main'" "$WORK/onmain/err" && [[ ! -s "$WORK/onmain/gh/calls" ]] \
-  && ok "refuses main (exit 1) before any forge call" \
+  && grep -q -- "--allow-main" "$WORK/onmain/err" \
+  && ok "refuses main (exit 1) before any forge call, naming --allow-main" \
   || note "on main: exit $RC, gh calls: $(tr '\n' '|' < "$WORK/onmain/gh/calls" 2>/dev/null)"
+
+# --allow-main (ADR-0013): both issues merge straight into main, no final PR.
+AM="$WORK/allowmain"
+[[ "$(cat "$AM/rc")" -eq 0 ]] \
+  && [[ "$(jq -r .baseRefName "$AM/gh/prs/4.json")" == "main" && "$(jq -r .baseRefName "$AM/gh/prs/5.json")" == "main" ]] \
+  && [[ "$(jq -r .state "$AM/gh/prs/4.json")" == "MERGED" && "$(jq -r .state "$AM/gh/prs/5.json")" == "MERGED" ]] \
+  && [[ "$(grep -c '^pr create' "$AM/gh/calls")" -eq 2 ]] \
+  && ! grep -q '^pr create.*--head main' "$AM/gh/calls" \
+  && [[ ! -e "$AM/gh/prs/6.json" ]] \
+  && ok "--allow-main: both PRs target and merge into main; no PR has head main; no final PR" \
+  || note "--allow-main: rc=$(cat "$AM/rc") creates: $(grep '^pr create' "$AM/gh/calls" | tr '\n' '|') err: $(tail -3 "$AM/err" | tr '\n' '|')"
+jq -e '.allow_main == true and .base == "main" and (.final_pr // null) == null' "$AM"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--allow-main: recorded in state.json (a --resume on main will not re-refuse)" \
+  || note "--allow-main: state.json is $(cat "$AM"/repo/tmp/deliver/*/state.json | tr '\n' ' ')"
 
 RC="$(cat "$WORK/dirty/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "working tree is dirty" "$WORK/dirty/err" && [[ ! -s "$WORK/dirty/gh/calls" ]] \
