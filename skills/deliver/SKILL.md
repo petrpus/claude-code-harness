@@ -18,12 +18,11 @@ tick the Map line.
 The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
-> **Status: in progress (map #68).** Built: the straight path (#57), the
-> independent review (#59), parking (#58), final-verify's base-moved
-> handling and merge retry, the CI wait with its fix round (#60), bounded
-> review fix rounds with follow-up issues (#63), and run state / resume /
-> stop / global caps (#61), and the final integration → default PR (#62,
-> below), and the one-command launcher (#65, next section).
+> **Shipped in 0.6.0** (maps #68 and #106): the straight path, independent
+> review, parking, final verify with the base-moved merge and merge retry,
+> the CI wait, bounded review and CI fix rounds with follow-up issues, run
+> state / resume / stop / global caps, the final integration → default PR
+> (below) and the one-command launcher (next section).
 
 ## The final PR
 
@@ -137,8 +136,9 @@ Monitor as above.
      [--max-turns 200] [--review-max-turns 80] [--resume [--retry '#N']]
    ```
 
-   The verify command is detected like autopilot's (`package.json` `verify`
-   script) unless `--verify-cmd` is given. The `--issue-*` caps and
+   The verify command is detected like autopilot's (`detect_verify_cmd`:
+   a `package.json` `verify` script, else `scripts/verify.sh`, else
+   `make verify`) unless `--verify-cmd` is given. The `--issue-*` caps and
    `--extra-allowed-tools` (appended to autopilot BUILD's allowlist — e.g.
    `'Bash(bash scripts/test-deliver.sh),Bash(jq:*)'` for a shell project) are
    passed to each issue's `loop.sh` run, and so is `--max-turns` (turns per
@@ -164,7 +164,9 @@ Monitor as above.
    refused outright. This is defence in depth, not the boundary, and cannot
    be complete: BUILD edits files and runs the verify command, and
    autopilot's own base allowlist already grants `npx`, `pnpm` and `node`. Keeping forge credentials away from model
-   phases is the boundary, and is tracked in #77 (map #68).
+   phases is the boundary: every model call runs with gh's tokens unset, an
+   empty `GH_CONFIG_DIR`, git's credential helpers cleared and no ssh agent
+   (`agent.sh`, #77).
 
 ## The review step
 
@@ -289,7 +291,9 @@ the default cut the first BUILD off after a couple of runs.
 **Stopping a run.** Ctrl-C in the terminal does not stop it: `timeout` runs
 each `claude -p` in its own process group, so the signal never reaches the
 call, and the runner waits for it. Instead, drop a `STOP` file at
-`tmp/deliver/<run-id>/STOP` (e.g. `touch tmp/deliver/*/STOP`) — it is checked
+`tmp/deliver/<run-id>/STOP` — `deliver.sh --map <N> --stop` touches only that
+Map's newest run (a bare `touch tmp/deliver/*/STOP` stops every run in the
+checkout) — it is checked
 between phases (before a branch, after a build, before a PR, before a
 review, on every poll of the CI wait, before a merge) and passed to every `loop.sh` call as `--stop-file`,
 so a build already in flight stops the same way. The run ends with exit
@@ -302,6 +306,9 @@ time is this run's accumulated `active_seconds`, which survives a
 `--resume`. Checked at the same phase boundaries as the STOP file. Tripping
 a cap ends the run with exit **4** (budget) or **3** (time), state
 `budget_exhausted` / `time_exhausted`, the in-flight issue left non-terminal.
+A call cut off by `--per-call-timeout` reports no cost; it is counted as
+`cost_unknown` (per call row) and `cost_unknown_calls` (`status.json`), not as
+$0, so a cap reached with timed-out calls in it is a lower bound (#84).
 Each issue's own `--issue-budget-usd` / `--issue-max-minutes` is clipped to
 whatever the global cap has left before that issue's `loop.sh` call, so no
 single issue can spend past the point the whole run is allowed to reach.
@@ -349,10 +356,13 @@ edits the script running it.
 ## What you get
 
 - One squash commit per issue on the integration branch, subject = the Map
-  line's conventional title (or `<type>: <issue title>`), `(#<pr>)` appended.
+  line's conventional title — a long one keeps its type and scope, its
+  description cut at a word to fit 72 bytes — or `<type>: <Map line title>`
+  (the issue title when the Map line has none), `(#<pr>)` appended.
 - The Map's Delivery lines ticked `[x]`, a comment on each merged issue.
   Issues stay open: GitHub closes them only when the final integration →
-  default-branch PR merges.
+  default-branch PR merges. Under `--allow-main` there is no final PR, so each
+  issue PR says `Closes #N` itself (ADR-0013).
 - Run state in `tmp/deliver/<run-id>/` — `state.json` (resume truth: map,
   base, runner version, active time, per-issue state/branch/PR/round/head),
   `events.jsonl` (one row per issue-state transition), `status.json` (the

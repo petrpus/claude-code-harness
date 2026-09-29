@@ -75,7 +75,7 @@ The skills assume:
 - **Issue tracker**: GitHub Issues (uses `gh` CLI). Skills like `to-issues`, `triage`, `next`, `implement-issue` call `gh issue ...`.
 - **Domain language**: `CLAUDE.md` at repo root + `CONTEXT.md` (optional) + `docs/adr/` for architectural decisions.
 - **Build / verify**: `npm run verify` or `pnpm verify`. Hooks read `tmp/.last-verify-status` for freshness.
-- **Branch model**: feature branches off `main`. Pre-bash hook blocks `git push` from `main`/`master`.
+- **Branch model**: feature branches off `main`. Pre-bash hook blocks `git push` from `main`/`master`. `/deliver` adds an integration level: `integration/<slug>` off `main`, per-issue branches off it, and one final integration PR into `main` (see `skills/deliver/SKILL.md`).
 
 If your project doesn't match these, you can still install the plugin and ignore individual skills. Hooks can be disabled per-project via project `settings.json`.
 

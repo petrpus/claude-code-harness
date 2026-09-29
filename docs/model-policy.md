@@ -46,6 +46,10 @@ implementation.
   opus planning call per issue, so a Map of N issues pays it N times, on top of
   BUILD, the haiku verifier and the review. Bound it with `--issue-budget-usd`
   and the run-wide caps.
+- **Turn caps.** `--max-turns` (default 200 under `/deliver`, 80 for plain
+  autopilot) caps each BUILD/PLAN/verifier call; `--review-max-turns` (default
+  80) caps the review. A turn-limited BUILD is not escalated to a stronger
+  model (#101): the cap, not the model, is what it ran into.
 
 ## The rule of thumb
 

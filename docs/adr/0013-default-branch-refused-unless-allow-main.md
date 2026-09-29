@@ -24,5 +24,6 @@ on a repo with no integration-branch workflow.
 ## Consequences
 
 - Opting in is explicit and per run; the safe behaviour stays the default.
-- Issues close through the Map/issue mechanics of the per-issue PRs alone —
-  there is no final `Closes #N` PR under `--allow-main`.
+- There is no final `Closes #N` PR under `--allow-main`, so each per-issue
+  PR's body says `Closes #N` itself (instead of `Refs #N`), and GitHub closes
+  the issue when that PR merges into the default branch.

@@ -471,10 +471,11 @@ which is enough to tell them apart (`phase:"iteration"` vs. anything else).
 Per-call row:
 
 ```json
-{"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload",
+{"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload|escalation",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
- "exit_code":0,"verdict":"pass|fail|no_verdict|","holdout_failed":0,
- "turns":6,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"violations":[]}
+ "exit_code":0,"verdict":"pass|fail|no_verdict|turn-limit|skipped-turn-limit|","holdout_failed":0,
+ "turns":6,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"violations":[],
+ "cost_unknown":false}
 ```
 
 `runner_reload` (R1) is logged once, immediately before the `exec` that
@@ -557,6 +558,9 @@ them into `status.json`:
   slice parked, unparked by a replan, and parked again as two separate
   incidents; the peak answers "how bad did it get."
 - `escalations` — count of iterations with `escalated:true`.
+- `cost_unknown_calls` — count of call rows with `cost_unknown:true`: a call
+  cut off by `--per-call-timeout` reports no cost, so it is logged as unknown
+  rather than $0, and every cost total is a lower bound while this is > 0 (#84).
 - `verify_deferred` — count of iterations whose gate (b) was deferred under
   `--verify-at-completion` (ADR-0009). Those iterations can never fail gate
   (b), so a run with deferrals has a structurally lower `gate_fail_rate`;

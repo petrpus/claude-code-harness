@@ -41,7 +41,7 @@ record the decisions.
    `deliver_issue` intercepts a `fail` result before parking and asks
    `round_budget_use` for a round against the issue's shared counter
    (`$dir/ROUNDS_USED`, budget `--max-fix-rounds`, default 2 — the same
-   counter #63's review fix rounds will draw from, so the two mechanisms
+   counter #63's review fix rounds draw from, so the two mechanisms
    cannot together give an issue more total fix attempts than the budget
    allows). If a round is available, `ci_fix_round`:
    - fetches the failed run's log tail via `forge_ci_failed_log`
@@ -91,8 +91,9 @@ head whose CI result was never actually observed, defeating the point of
 
 ## Consequences
 
-An issue can now cost up to `1 + MAX_FIX_ROUNDS` autopilot resumes instead of
-one, so the run log's `ci` lines carry a `<round>` field — a fix round's
+An issue can now cost up to `1 + MAX_FIX_ROUNDS` autopilot runs instead of
+one (fresh `loop.sh` runs since #61, ADR-0012 decision 7; a CI fix round is
+granted at most once per issue, `ci_fixed`), so the run log's `ci` lines carry a `<round>` field — a fix round's
 second poll must be told apart from the first when reading `run-*.jsonl`
 back. `ROUNDS_USED` lives in the issue's state dir, not committed, like the
 rest of autopilot's state; a run resumed from a different state dir starts
