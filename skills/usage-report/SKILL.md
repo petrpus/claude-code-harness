@@ -40,7 +40,10 @@ Each line is JSON with `ts, run_id, iter, phase, model, duration_s, cost_usd,
 input_tokens, output_tokens, exit_code, verdict`, plus S3A's `turns`,
 `cache_read_input_tokens`, `cache_creation_input_tokens`, `violations`, and
 (on `phase:"iteration"` rows) `slice_id`, `gate_failed`, `dag_width`,
-`parked_count`, `escalated`, `repo_map`. Filter lines with `ts` inside the
+`parked_count`, `escalated`, `repo_map`. Every model-call row also carries
+`cost_unknown` (`true` when `timeout` killed the call: its `cost_usd` of 0 means
+*unknown*, not free, so any sum is a lower bound; `status.json` counts these as
+`cost_unknown_calls`). Filter lines with `ts` inside the
 last X days, then sum `cost_usd`, `input_tokens`, `output_tokens` grouped by
 `(day, model)` and again by run. This source is exact for autopilot-driven
 work — it's the runner's own accounting, not an estimate.
@@ -61,6 +64,8 @@ It renders, straight from the JSONL logs found there:
 - a **per-shortcut violation histogram** across every run found — a criterion
   whose fail rate collapses without a spec change is verifier drift, not
   quality improvement, and this is the cheap way to notice;
+- a **calls with unknown cost** table per day and model ("N call(s) with
+  unknown cost") — timed-out calls whose spend the totals cannot include;
 - a **repo-map on/off comparison** of mean `input_tokens +
   cache_read_input_tokens + cache_creation_input_tokens` per BUILD call,
   keyed on S5's `repo_map` flag — whichever side has no data in the runs

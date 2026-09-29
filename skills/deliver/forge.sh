@@ -248,7 +248,7 @@ forge_ci_failed_log() {
 forge_grant_violations() {
   local csv="$1" rule inner cmd base next bad=0 depth=0 cur="" ch i
   local -a rules=() toks=()
-  local word='[A-Za-z0-9._/+=:@%,-]+'
+  local LC_ALL=C word='[A-Za-z0-9._/+=:@%,-]+'
   for (( i=0; i<${#csv}; i++ )); do
     ch="${csv:$i:1}"
     case "$ch" in

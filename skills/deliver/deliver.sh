@@ -225,6 +225,8 @@ done
 . "$SCRIPT_DIR/forge.sh"
 # shellcheck source=../autopilot/agent.sh
 . "$PLUGIN_ROOT/skills/autopilot/agent.sh"
+# shellcheck source=../autopilot/allowlist.sh
+. "$PLUGIN_ROOT/skills/autopilot/allowlist.sh"
 # shellcheck source=review.sh
 . "$SCRIPT_DIR/review.sh"
 # shellcheck source=state.sh
@@ -334,9 +336,7 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
       elif [[ "$(git rev-parse HEAD)" != "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not in sync with origin/$BASE — pull or push first"
       else pf base-synced ok "HEAD is origin/$BASE"; fi
     fi
-    if [[ -z "$VERIFY_CMD" && -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
-      if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
-    fi
+    [[ -n "$VERIFY_CMD" ]] || VERIFY_CMD="$(detect_verify_cmd || true)"
     if [[ -z "$VERIFY_CMD" ]]; then pf verify fail "no verify command found and --verify-cmd not given"
     elif bash -c "$VERIFY_CMD" >/dev/null 2>&1; then pf verify ok "'$VERIFY_CMD' is green on '${BASE:-HEAD}'"
     else pf verify fail "'$VERIFY_CMD' fails on '${BASE:-HEAD}'"; fi
@@ -520,10 +520,7 @@ git check-ignore -q tmp/deliver/.probe 2>/dev/null \
   || die "tmp/ is not gitignored — run state would be committed into issue branches."
 
 if [[ -z "$VERIFY_CMD" ]]; then
-  # Same detection as loop.sh (#56 moves both to allowlist.sh).
-  if [[ -f package.json ]] && jq -e '.scripts.verify' package.json >/dev/null 2>&1; then
-    if [[ -f pnpm-lock.yaml ]]; then VERIFY_CMD="pnpm verify"; else VERIFY_CMD="npm run verify"; fi
-  fi
+  VERIFY_CMD="$(detect_verify_cmd || true)"
 fi
 [[ -n "$VERIFY_CMD" ]] || die "no verify command found and --verify-cmd not given."
 
@@ -607,7 +604,7 @@ active_seconds_now() { echo $(( ACTIVE_SECONDS_BASE + ( $(date +%s) - START_EPOC
 # run_status <state> — refresh status.json with the run's current headline.
 run_status() {
   state_write_status "$RUN_DIR" "$1" "$CUR_ISSUE" "${#MERGED[@]}" "${#PARKED[@]}" \
-    "$(state_total_cost "$RUN_DIR")" "$(active_seconds_now)"
+    "$(state_total_cost "$RUN_DIR")" "$(active_seconds_now)" "$(state_cost_unknown_calls "$RUN_DIR")"
 }
 
 # stop_run <exit_code> <state_label> — a global cap or STOP tripped: persist
@@ -675,15 +672,16 @@ deliver_logline() {
   # review's cost twice — in /usage-report and in --budget-usd (#61).
   local model="$REVIEW_MODEL" dur="${AGENT_LAST_DURATION:-0}" cost="${AGENT_LAST_COST:-0}"
   local tin="${AGENT_LAST_IN_TOKENS:-0}" tout="${AGENT_LAST_OUT_TOKENS:-0}" rc="${AGENT_LAST_RC:-0}"
-  if [[ "$1" != "review" ]]; then model=""; dur=0; cost=0; tin=0; tout=0; rc=0; fi
+  local unknown="${AGENT_LAST_COST_UNKNOWN:-0}"
+  if [[ "$1" != "review" ]]; then model=""; dur=0; cost=0; tin=0; tout=0; rc=0; unknown=0; fi
   jq -cn --arg run "$RUN_ID" --arg phase "$1" --arg model "$model" \
      --argjson issue "$2" --argjson round "$3" --arg verdict "$4" \
      --argjson dur "$dur" --argjson cost "$cost" \
      --argjson in "$tin" --argjson out "$tout" \
-     --argjson rc "$rc" \
+     --argjson rc "$rc" --argjson unknown "$unknown" \
      '{ts:(now|todate),run_id:$run,iter:0,phase:$phase,model:$model,issue:$issue,round:$round,
        duration_s:$dur,cost_usd:$cost,input_tokens:$in,output_tokens:$out,exit_code:$rc,
-       verdict:$verdict,holdout_failed:0}' >> "$RUN_LOG" 2>/dev/null || true
+       verdict:$verdict,holdout_failed:0,cost_unknown:($unknown==1)}' >> "$RUN_LOG" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1350,6 +1348,7 @@ deliver_issue() {
   # park must never name an earlier issue's PR or branch.
   CUR_PR=""; CUR_BRANCH=""; PARK_LOG=""; CI_NOTE=""
   CUR_ISSUE="$n"
+  run_status running
   # A resumed issue keeps what an earlier attempt recorded (branch, PR,
   # review round) — state_issue_update merges, it never drops a field.
   state_issue_update "$RUN_DIR" "$n" '{"state":"preparing"}'
@@ -1485,6 +1484,7 @@ deliver_issue() {
   CUR_PR="$pr"
   log "#$n: PR #$pr open"
   state_issue_update "$RUN_DIR" "$n" "$(jq -cn --argjson p "$pr" --arg h "$head_sha" '{state:"pr-open", pr:$p, head:$h}')"
+  run_status running
   state_event "$RUN_DIR" "$n" pr-open ""
 
   # --- independent review, with bounded in-scope fix rounds (#63) ---
@@ -1523,6 +1523,7 @@ deliver_issue() {
     if [[ "$phase" == "review" ]]; then
       check_caps "before a review (#$n)"
       state_issue_update "$RUN_DIR" "$n" "$(jq -cn --argjson r "$round" --arg h "$head_sha" '{state:"reviewing", round:$r, head:$h}')"
+      run_status running
       review_issue "$n" "$pr" "$base_sha" "$head_sha" "$dir" "$round" "$prev_findings"
       review_rc=$?
       [[ "$review_rc" -eq 0 || "$review_rc" -eq 10 ]] || return "$review_rc"
@@ -1591,6 +1592,7 @@ deliver_issue() {
     ci_rc=10; CI_RESULT="fail"
   else
     state_issue_update "$RUN_DIR" "$n" '{"state":"ci-wait"}'
+    run_status running
     ci_wait "$n" "$pr" "$dir" 1; ci_rc=$?
   fi
   if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" && "$phase" != "ci-fix" ]] \
@@ -1635,6 +1637,7 @@ deliver_issue() {
   # squash, so that case never reaches this retry at all.
   check_caps "before a merge (#$n)"
   state_issue_update "$RUN_DIR" "$n" '{"state":"merging"}'
+  run_status running
   git switch -q "$BASE" || return 1
   local merge_retried=0
   while :; do

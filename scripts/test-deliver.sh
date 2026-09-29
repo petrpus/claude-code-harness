@@ -139,6 +139,16 @@ map_title_is_conventional "feat(deliver): tracer bullet" && map_title_is_convent
   && [[ "$(map_branch_name 3 'fix: ???')" == "fix/3-issue" ]] \
   && ok "branch name: <type>/<N>-<slug>" \
   || note "branch name: '$(map_branch_name 12 'feat(deliver): Park failing issues, skip dependents!')'"
+[[ "$(map_branch_name 56 'fix: resume fidelity and verify command detection')" == "fix/56-resume-fidelity-and-verify-command" ]] \
+  && ok "branch name: cut at a word boundary" \
+  || note "branch word cut: '$(map_branch_name 56 'fix: resume fidelity and verify command detection')'"
+if locale -a 2>/dev/null | grep -qix 'cs_CZ\.utf-\?8'; then
+  [[ "$(LC_ALL=cs_CZ.UTF-8 map_branch_name 7 'feat: architecture branch option')" == "feat/7-architecture-branch-option" ]] \
+    && ok "branch name: locale-safe under cs_CZ.UTF-8" \
+    || note "branch name under cs_CZ: '$(LC_ALL=cs_CZ.UTF-8 map_branch_name 7 'feat: architecture branch option')'"
+else
+  echo "  (skipped: cs_CZ.UTF-8 locale not installed)"
+fi
 
 printf -- '- [ ] #1 feat: a\n- [ ] #1 feat: again\n- [ ] #2 feat: b (after: #9)\n- [ ] #3 feat: c (after: S1)\n' > "$WORK/bad.plan"
 PROBLEMS="$(map_validate "$WORK/bad.plan")"; VRC=$?
@@ -724,6 +734,9 @@ $(review_json changes_requested '[{"id":"B1","severity":"blocker","file":"src/a.
       prev=""; for a in "$@"; do [[ "$prev" == "--allowedTools" ]] && printf '%s\n' "$a" >> "$STUB_BUILD_LOG"; prev="$a"; done
     fi
     n="$(printf '%s' "$plan" | grep -oE 'issues/[0-9]+' | cut -d/ -f2)"
+    # What status.json says the issue in flight is, while issue $n builds (#84).
+    [[ -n "${STUB_STATUS_SNAP:-}" ]] \
+      && printf 'building=%s current_issue=%s\n' "$n" "$(jq -r '.current_issue' tmp/deliver/*/status.json 2>/dev/null | head -1)" >> "$STUB_STATUS_SNAP"
     if [[ "${STUB_MODE:-progress}" == "progress" && ",${STUB_STALL_ISSUES:-}," != *",$n,"* ]]; then
       sel="$(printf '%s' "$prompt" | grep -oE 'plan item `[^`]+`' | head -1 | sed -E 's/plan item `([^`]+)`/\1/')"
       # A STOP that lands while BUILD works on plan item $STUB_STOP_ON_SLICE
@@ -1998,6 +2011,12 @@ CG_RUNDIR="$(ls -d "$CG"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && [[ "$(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci" and .verdict=="pass")] | length')" -ge 1 ]] \
   && ok "CI: pending polled until green, then merged (no 'no CI' note once CI reported)" \
   || note "ci pending->green: exit $RC, pr checks calls $(grep -c '^pr checks 4' "$CG/gh/calls" 2>/dev/null)"
+[[ "$(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -s '[.[] | select(.phase=="ci")] | (length >= 1) and all(.cost_unknown == false)')" == "true" ]] \
+  && ok "a ci row stays cost_unknown:false" \
+  || note "ci rows: $(cat "$CG_RUNDIR"/run-*.jsonl 2>/dev/null | jq -c 'select(.phase=="ci")' | head -2)"
+jq -e '.cost_unknown_calls==0' "$CG_RUNDIR/status.json" >/dev/null 2>&1 \
+  && ok "deliver status.json carries cost_unknown_calls" \
+  || note "deliver status.json: $(cat "$CG_RUNDIR/status.json" 2>/dev/null)"
 
 # a failed check gets one fix round (#60); still red after it parks the issue.
 CF="$WORK/cifail"
@@ -2308,6 +2327,25 @@ pf_fails() { # <fixture> <check> <what> <rc>
     && ok "plan-only: $3 fails the '$2' check (exit $4, other checks still reported)" \
     || note "plan-only $3: rc=$4 $2=$(pocheck "$1" "$2") out=$(head -c 200 "$WORK/$1/out")"
 }
+# verify detection is shared with autopilot (#84): a repo with only
+# scripts/verify.sh and no --verify-cmd passes the verify pre-flight.
+new_fixture pfvsh
+mkdir -p "$WORK/pfvsh/repo/scripts" && printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/pfvsh/repo/scripts/verify.sh"
+git -C "$WORK/pfvsh/repo" add -A && git -C "$WORK/pfvsh/repo" commit -q -m "add verify.sh" && git -C "$WORK/pfvsh/repo" push -q origin integration/x 2>/dev/null
+( cd "$WORK/pfvsh/repo" && env PATH="$BIN:$PATH" FAKE_GH_DIR="$WORK/pfvsh/gh" XDG_STATE_HOME="$WORK/pfvsh/state" \
+    bash "$DELIVER_ABS" --map 3 --plan-only --json >"$WORK/pfvsh/out" 2>"$WORK/pfvsh/err" ); RC=$?
+[[ "$RC" -eq 0 && "$(pocheck pfvsh verify)" == "ok" ]] \
+  && ok "plan-only: scripts/verify.sh alone (no package.json, no --verify-cmd) passes the verify pre-flight" \
+  || note "verify.sh detection: rc=$RC verify=$(pocheck pfvsh verify) out=$(head -c 300 "$WORK/pfvsh/out")"
+
+# status.json names the issue in flight while it builds (#84): the second
+# issue's BUILD sees current_issue == 2, not the first (or null).
+new_fixture cur
+run_deliver cur STUB_STATUS_SNAP="$WORK/cur/snap"; RC=$?
+[[ "$RC" -eq 0 ]] && grep -qx 'building=1 current_issue=1' "$WORK/cur/snap" && grep -qx 'building=2 current_issue=2' "$WORK/cur/snap" \
+  && ok "status.json current_issue names the issue in flight while it builds" \
+  || note "current_issue snapshots: rc=$RC $(tr '\n' '|' < "$WORK/cur/snap" 2>/dev/null)"
+
 new_fixture pfdirty; echo junk > "$WORK/pfdirty/repo/untracked.txt"
 run_deliver pfdirty -- --plan-only --json; pf_fails pfdirty clean-tree "a dirty tree" $?
 new_fixture pfign; : > "$WORK/pfign/repo/.gitignore"

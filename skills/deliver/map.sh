@@ -80,7 +80,7 @@ map_line_title() {
 }
 
 # map_title_is_conventional <title>
-map_title_is_conventional() { [[ "$1" =~ $MAP_CONVENTIONAL_RE ]]; }
+map_title_is_conventional() { local LC_ALL=C; [[ "$1" =~ $MAP_CONVENTIONAL_RE ]]; }
 
 # map_pr_title <map_title> <issue_title> <labels_csv>
 #   The squash subject (ADR-0008 decision 5): the Map line's title when it is
@@ -106,13 +106,19 @@ map_pr_title() {
 # map_branch_name <number> <pr_title>
 #   <type>/<N>-<slug>: the type from the conventional title, the slug from its
 #   description — lowercase, runs of anything but [a-z0-9] become one dash,
-#   at most 40 characters, no dash at either end.
+#   at most 40 characters cut on the last dash (a hard cut only when the first
+#   word alone is longer), no dash at either end. Byte-wise (LC_ALL=C), so
+#   ranges and case-folding do not depend on the caller's locale.
 map_branch_name() {
-  local n="$1" title="$2" type desc slug
+  local n="$1" title="$2" type desc slug cut
   type="${title%%[(:!]*}"
   desc="${title#*: }"
-  slug="$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//')"
-  slug="${slug:0:40}"; slug="${slug%%-}"
+  slug="$(printf '%s' "$desc" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//')"
+  if (( ${#slug} > 40 )) && [[ "${slug:40:1}" != "-" ]]; then
+    cut="${slug:0:40}"
+    if [[ "$cut" == *-* ]]; then slug="${cut%-*}"; else slug="$cut"; fi
+  fi
+  slug="${slug:0:40}"
   while [[ "$slug" == *- ]]; do slug="${slug%-}"; done
   printf '%s/%s-%s\n' "${type:-feat}" "$n" "${slug:-issue}"
 }
@@ -189,7 +195,7 @@ map_add_follow_up() {
 # (#62): lowercase, runs of non-alphanumerics become one dash, trimmed, at most
 # 40 characters (cut, then re-trimmed). Empty when nothing usable is left.
 map_integration_slug() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
-    | cut -c1-40 | sed -E 's/-+$//'
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | LC_ALL=C cut -c1-40 | LC_ALL=C sed -E 's/-+$//'
   echo
 }
