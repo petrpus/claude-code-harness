@@ -16,8 +16,11 @@ and you should not trust any claim of "done" — only the diff and the spec.
 
 - The task charter / spec: `PROMPT.md` (or the path you are given).
 - The plan: `IMPLEMENTATION_PLAN.md`, if present.
-- The diff to inspect: default `git diff` against the last checkpoint; when in
-  doubt, `git diff` and `git log --oneline -5`.
+- The diff to inspect: the exact command your prompt names — under autopilot,
+  `git diff --cached <base>`, where the runner staged the whole iteration and
+  `<base>` is HEAD from before BUILD ran. A bare `git diff` shows nothing
+  staged, so it is empty there. With no command named, use
+  `git diff --cached HEAD` plus `git diff`, and `git log --oneline -5`.
 
 ## What to do
 

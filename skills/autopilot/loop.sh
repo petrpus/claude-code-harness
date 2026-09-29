@@ -773,8 +773,11 @@ secret_scan() { # returns 0 clean, 1 hit; echoes hits
   # (git embeds a snippet of the nearest preceding line there as a
   # section-context hint, which reintroduces the exact same false positive
   # even under -U0). The "+++"/"---" file-path header lines are excluded too.
-  local diff hits
-  diff="$(git diff --cached "$ITER_BASE_SHA" 2>/dev/null | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' || true)"
+  # A diff git could not produce is not a clean one: returns 2 (fail closed)
+  # rather than let a broken index pass the gate as "no secrets" (#54 review).
+  local raw diff hits
+  raw="$(git diff --cached "$ITER_BASE_SHA" 2>&1)" || { echo "git diff --cached $ITER_BASE_SHA failed: $(printf '%s' "$raw" | tail -1)"; return 2; }
+  diff="$(printf '%s\n' "$raw" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' || true)"
   hits="$(printf '%s' "$diff" | grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[po]_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[bap]-[A-Za-z0-9-]+|(password|secret|token)\s*=\s*["'"'"'][^"'"'"']{6,}' 2>/dev/null || true)"
   [[ -z "$hits" ]] && return 0
   echo "$hits"; return 1
@@ -1001,8 +1004,10 @@ while :; do
   # including new untracked files, which a diff against HEAD alone would
   # never see. The state dir stays excluded, same as the checkpoint commits
   # below: it's gitignored (checked at startup), and `git add -A` never adds
-  # an ignored path.
-  git add -A
+  # an ignored path. A failed staging (index.lock held, an unreadable path)
+  # would leave the gates below reading a partial index, so it fails the
+  # iteration instead (fingerprint "stage") — the gates fail closed (#54).
+  STAGE_ERR="$(git add -A 2>&1)"; STAGE_RC=$?
 
   # S4B cost guard: escalation counts against --budget-usd like any other
   # call — there is no separate ceiling, a hard cap here would just move the
@@ -1020,6 +1025,10 @@ while :; do
 
   TICKED_AFTER="$(count_ticked)"
   FAIL_REASON=""; FP=""
+  if [[ "$STAGE_RC" -ne 0 ]]; then
+    FAIL_REASON="could not stage the iteration for the gates (git add -A): $(printf '%s' "$STAGE_ERR" | tail -1)"
+    FP="stage"
+  fi
 
   # GATE b: machine verify (runner runs it — no LLM trust).
   # Runs on every iteration by default. Under the old sentinel gate it was
@@ -1074,12 +1083,27 @@ while :; do
     FP="verify_cmd"
   fi
 
+  # Staged again after GATE b: the verify command can write files (generated
+  # output that is not gitignored) that the checkpoint commit would pick up
+  # with its own `git add -A` — the scan and the verifier must see them too.
+  if [[ -z "$FAIL_REASON" ]]; then
+    STAGE_ERR="$(git add -A 2>&1)" || {
+      FAIL_REASON="could not stage the iteration for the gates (git add -A): $(printf '%s' "$STAGE_ERR" | tail -1)"
+      FP="stage"
+    }
+  fi
+
   # GATE c: secret scan (zero-cost)
   if [[ -z "$FAIL_REASON" ]]; then
-    if SECRETS="$(secret_scan)"; then :; else
+    SECRETS="$(secret_scan)"; SCAN_RC=$?
+    if [[ "$SCAN_RC" -eq 1 ]]; then
       FAIL_REASON="possible secret in diff: $(printf '%s' "$SECRETS" | head -2 | tr '\n' ' ')"
       FP="secret"
       logline "secret_scan" "-" 0 0 0 0 1 "fail"
+    elif [[ "$SCAN_RC" -ne 0 ]]; then
+      FAIL_REASON="the secret scan could not read the staged diff: $SECRETS"
+      FP="secret"
+      logline "secret_scan" "-" 0 0 0 0 "$SCAN_RC" "fail"
     fi
   fi
 

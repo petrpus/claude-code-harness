@@ -134,6 +134,10 @@ case "$prompt" in
       printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret.txt
       git add secret.txt >/dev/null 2>&1
       git commit -q -m "build: oops" >/dev/null 2>&1
+    elif [[ "${STUB_SECRET_MODE:-}" == "lockindex" ]]; then
+      # A held index lock: the runner's own `git add -A` after BUILD fails.
+      printf 'work\n' > locked-work.txt
+      : > "$(git rev-parse --git-dir)/index.lock"
     elif [[ "${STUB_SECRET_MODE:-}" == "untracked" ]]; then
       printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' > secret_untracked.txt
     elif [[ "${STUB_SECRET_MODE:-}" == "nearby" ]]; then
@@ -1587,6 +1591,32 @@ GATE35="$(cat "$R35"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(
 [[ "$RC35" -eq 0 && "$GATE35" == "none" ]] \
   && ok "an edit merely near a pre-existing secret-looking line (diff context) does not fail the gate" \
   || note "edit near a pre-existing secret line: exit $RC35 (expected 0), gate_failed='$GATE35', FEEDBACK='$(cat "$R35/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 36. The gates fail closed when the runner cannot stage the iteration ---
+# (#54 review): a failed `git add -A` must not let the secret scan and the
+# verifier read a partial index as "clean".
+R36="$WORK/r36"; new_repo "$R36"
+( cd "$R36" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=lockindex \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r36.out" 2>"$WORK/r36.err" )
+GATE36="$(cat "$R36"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+rm -f "$R36/.git/index.lock"
+[[ "$GATE36" == "stage" ]] && grep -q 'could not stage the iteration' "$R36/tmp/autopilot/FEEDBACK.md" 2>/dev/null \
+  && ok "a failed git add -A fails the iteration (gate_failed=stage) instead of passing the gates on a partial index" \
+  || note "held index lock: gate_failed='$GATE36', FEEDBACK='$(cat "$R36/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 37. Files the verify command writes are scanned too ------------------------
+# The runner stages again after GATE b: a secret in generated, non-ignored
+# output would otherwise ride into the checkpoint commit unscanned.
+R37="$WORK/r37"; new_repo "$R37"
+( cd "$R37" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --verify-cmd 'printf "token = \"AKIAABCDEFGHIJKLMNOP\"\n" > generated.txt' \
+    --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r37.out" 2>"$WORK/r37.err" )
+GATE37="$(cat "$R37"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$GATE37" == "secret" ]] \
+  && ok "a secret the verify command wrote into a non-ignored file fails the secret gate" \
+  || note "verify-written secret: gate_failed='$GATE37'"
 
 # --- 40-43. Pacing for one PR-sized issue (#88) ------------------------------
 # /deliver hands autopilot an issue that is already a slice: a small plan, and
