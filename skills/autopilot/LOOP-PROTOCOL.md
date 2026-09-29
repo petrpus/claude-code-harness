@@ -494,7 +494,10 @@ run, in addition to (not instead of) the per-call rows above:
 
 `turn_limit` is true when that iteration's BUILD call ended on `--max-turns`
 (its reply's `subtype` is `error_max_turns`, #96); the call's own row then
-carries `"verdict":"turn-limit"`.
+carries `"verdict":"turn-limit"`. It is the authoritative flag:
+`gate_failed` reads `turn-limit` only when every gate passed and nothing was
+ticked — a turn-limited BUILD whose half-done work fails verify keeps
+`verify_cmd`, with the turn limit named in FEEDBACK.
 `slice_id` is the id `select_next_slice()` assigned that iteration (S1B), or
 `""` on an unannotated plan. `gate_failed` mirrors the fingerprint the stuck
 ladder tracked for that iteration, or `"none"` when every gate passed —

@@ -1245,6 +1245,10 @@ while :; do
       "$ITER_WALL" "$ITER_COST" "$FILES_CHANGED" "$VERIFY_S" "$DAG_WIDTH" "$PARKED_COUNT" "$ESCALATED_THIS_ITER" "$REPO_MAP_USED"
     log_err "✓ iteration $ITER progressed ($TICKED_BEFORE → $TICKED_AFTER of $TOTAL_BOXES items)"
     : > "$FEEDBACK_FILE"
+    # Progress, but BUILD still ran out of turns (#96): whatever it had
+    # started past the ticked item is in this checkpoint, unticked — say so.
+    [[ "$BUILD_TURN_LIMIT" == "true" ]] && append_feedback "turn-limit" \
+      "BUILD ran out of turns (--max-turns $MAX_TURNS) after ticking an item; any further work it had started is in this iteration's checkpoint commit — continue it rather than redo it."
     LAST_FP=""; REPEAT=0; PARK_REPLAN_DONE=0
     continue
   fi
@@ -1253,7 +1257,7 @@ while :; do
   # is what the stuck detector should be counting.
   if [[ -z "$FAIL_REASON" ]]; then
     if [[ "$BUILD_TURN_LIMIT" == "true" ]]; then
-      FAIL_REASON="BUILD ran out of turns (--max-turns $MAX_TURNS) before finishing${SELECTED_ID:+ plan item $SELECTED_ID}: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked. Its partial work is committed below — continue from it, do not start the item over."
+      FAIL_REASON="BUILD ran out of turns (--max-turns $MAX_TURNS) before finishing${SELECTED_ID:+ plan item $SELECTED_ID}: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked. Its partial work is kept in this iteration's WIP checkpoint commit — continue from it, do not start the item over."
       FP="turn-limit"
     else
       FAIL_REASON="no progress: $TICKED_AFTER of $TOTAL_BOXES item(s) ticked, unchanged this iteration, and STATUS is not done"

@@ -76,8 +76,13 @@ issue's fault: it ends the run with exit 1, where it is.
    `claude -p` call, default **200** here against `loop.sh`'s own 80: a
    /deliver plan item is a third of an issue and BUILD runs its covering
    tests itself, so it routinely needs 70+ turns; #96). A BUILD that still
-   runs out is logged as `turn-limit` and told to continue its partial work. The check fails closed (ADR-0007:
-   no model phase holds a forge operation): a `Bash(...)` rule is accepted
+   runs out is logged as `turn-limit` and told to continue its partial work.
+   `--max-turns` applies to the `loop.sh` calls only; the independent
+   review keeps agent.sh's default of 80, since it reads a diff and runs no
+   tests.
+
+   The `--extra-allowed-tools` check fails closed (ADR-0007: no model phase
+   holds a forge operation): a `Bash(...)` rule is accepted
    only as a **plain command** — words of `[A-Za-z0-9._/+=:@%,-]`, optionally
    ending in `:*` or ` *` — whose program (by basename, any letter case) is
    not a forge CLI (`gh`, `gh-*`, `git`, `hub`, `glab`, `lab`), not a program
