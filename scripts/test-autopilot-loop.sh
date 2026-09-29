@@ -156,6 +156,10 @@ case "$prompt" in
       # text (rather than only its +/- lines) can't tell "shown as context"
       # from "added".
       sed -i 's/^unrelated line$/unrelated line, edited by BUILD/' config.txt
+    elif [[ "${STUB_SECRET_MODE:-}" == "removed" ]]; then
+      # #94: BUILD deletes an already-committed secret-looking line (a `-`
+      # line in the diff) and edits next to it — it added nothing.
+      sed -i -e '/AKIA/d' -e 's/^unrelated line$/unrelated line, edited by BUILD/' config.txt
     fi
     # S2 (issue #54): simulate a BUILD that commits a (non-secret) change
     # itself, moving HEAD before the runner's own `git add -A`/checkpoint —
@@ -1598,6 +1602,24 @@ GATE35="$(cat "$R35"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(
 [[ "$RC35" -eq 0 && "$GATE35" == "none" ]] \
   && ok "an edit merely near a pre-existing secret-looking line (diff context) does not fail the gate" \
   || note "edit near a pre-existing secret line: exit $RC35 (expected 0), gate_failed='$GATE35', FEEDBACK='$(cat "$R35/tmp/autopilot/FEEDBACK.md" 2>/dev/null)'"
+
+# --- 35b. secret_scan() ignores removed lines too (#94) -------------------
+R35B="$WORK/r35b"; new_repo "$R35B"
+printf -- '- [ ] slice 1\n\nSTATUS: in-progress\n' > "$R35B/tmp/autopilot/IMPLEMENTATION_PLAN.md"
+# The fixture key is assembled at runtime so this test file's own added lines
+# don't trip the very secret scan it exercises.
+FAKE35B="AKIA""ABCDEFGHIJKLMNOP"
+printf 'unrelated line\ntoken = "%s"\nunrelated line\n' "$FAKE35B" > "$R35B/config.txt"
+git -C "$R35B" add config.txt >/dev/null 2>&1
+git -C "$R35B" -c user.email=t@t.est -c user.name=test commit -q -m "add config.txt fixture"
+( cd "$R35B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_SECRET_MODE=removed \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r35b.out" 2>"$WORK/r35b.err" )
+RC35B=$?
+GATE35B="$(cat "$R35B"/tmp/autopilot/run-*.jsonl 2>/dev/null | jq -rs 'map(select(.phase=="iteration"))[0].gate_failed' 2>/dev/null)"
+[[ "$RC35B" -eq 0 && "$GATE35B" == "none" ]] \
+  && ok "removing a pre-existing secret-looking line (a '-' diff line) does not fail the gate" \
+  || note "removed secret line: exit $RC35B (expected 0), gate_failed='$GATE35B'"
 
 # --- 36. The gates fail closed when the runner cannot stage the iteration ---
 # (#54 review): a failed `git add -A` must not let the secret scan and the

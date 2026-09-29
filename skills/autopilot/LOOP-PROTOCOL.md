@@ -103,7 +103,8 @@ loop:
        itself only after the gates settle, in whichever outcome the
        iteration ends with (green / unmeasured / progress / wip)
   GATE b  machine verify   runner    executes the verify command itself
-  GATE c  secret scan      runner    greps `git diff --cached ITER_BASE_SHA`
+  GATE c  secret scan      runner    greps the added lines of
+                                      `git diff --cached ITER_BASE_SHA`
                                       for keys/tokens — covers everything
                                       staged since ITER_BASE_SHA, including
                                       new untracked files and anything BUILD

@@ -771,18 +771,17 @@ secret_scan() { # returns 0 clean, 1 hit; echoes hits
   # untracked file are both in the index and both covered — `git diff HEAD`
   # missed both (a same-iteration commit moves HEAD to match the working
   # tree; an untracked file never appears in a diff against HEAD at all).
-  # Only the actual +/- content lines, never unified-diff context (default 3
-  # lines reprints unchanged lines around a real change — an edit that
-  # merely lands near an already-committed secret-looking line would
-  # otherwise pull it into the diff text) nor the "@@ ... @@" hunk header
-  # (git embeds a snippet of the nearest preceding line there as a
-  # section-context hint, which reintroduces the exact same false positive
-  # even under -U0). The "+++"/"---" file-path header lines are excluded too.
+  # Added lines only (`^+`, not `+++`); context, "@@ ... @@" hunk headers and
+  # removed lines are ignored. Context (default 3 lines reprints unchanged
+  # lines around a real change) and the hunk header (git embeds a snippet of
+  # the nearest preceding line there, even under -U0) would pull an
+  # already-committed secret-looking line in; a removed line is text the
+  # iteration did not add. The scan judges what the iteration adds.
   # A diff git could not produce is not a clean one: returns 2 (fail closed)
   # rather than let a broken index pass the gate as "no secrets" (#54 review).
   local raw diff hits
   raw="$(git diff --cached "$ITER_BASE_SHA" 2>&1)" || { echo "git diff --cached $ITER_BASE_SHA failed: $(printf '%s' "$raw" | tail -1)"; return 2; }
-  diff="$(printf '%s\n' "$raw" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' || true)"
+  diff="$(printf '%s\n' "$raw" | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)"
   hits="$(printf '%s' "$diff" | grep -nE 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[po]_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[bap]-[A-Za-z0-9-]+|(password|secret|token)\s*=\s*["'"'"'][^"'"'"']{6,}' 2>/dev/null || true)"
   [[ -z "$hits" ]] && return 0
   echo "$hits"; return 1

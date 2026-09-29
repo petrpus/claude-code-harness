@@ -123,7 +123,7 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 
 1. `STATUS: done` sentinel in the plan.
 2. **Machine verify** (gate b) — the runner executes the verify command itself.
-3. **Secret scan** (gate c) — the iteration diff is grepped for keys/tokens/private keys.
+3. **Secret scan** (gate c) — the iteration diff's added lines are grepped for keys/tokens/private keys.
 4. **Semantic verify** (gate d) — haiku runs `agents/verifier.md` adversarially
    against the diff (the 17-shortcuts checklist).
 5. **Holdout** (gate e) — when `--holdout <path>` (or its default location) points
