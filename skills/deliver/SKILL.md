@@ -165,6 +165,7 @@ round approves or requests changes:
 A follow-up is **recorded, never executed** by the run that found it: it
 never touches `## Delivery`, gets no branch and no autopilot run — adding it
 to a Map's Delivery section is a human decision made after triage.
+
 ## The CI wait
 
 Once the review approves, `ci_wait` polls `gh pr checks` (`forge_pr_checks`)

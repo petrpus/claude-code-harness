@@ -771,8 +771,13 @@ deliver_issue() {
     [[ "$gate_rc" -eq 0 ]] || return "$gate_rc"
     final_verify "$n" "$dir" || return $?
     head_sha="$(git rev-parse HEAD)"
+    # final_verify may have merged a moved base in: review the next round
+    # against it, or its diff would count the base's new commits as the PR's.
+    base_sha="$(git rev-parse "origin/$BASE")"
     write_pr_body "$n" "$dir" "$head_sha"
-    # Fast-forward only — never forced: a rejected push means the branch
+    # final_verify pushes only when HEAD is ahead of origin's copy of the
+    # branch; this push is a no-op otherwise and keeps the round's push
+    # explicit. Fast-forward only — never forced: a rejected push means the branch
     # moved from under this run, and that is a reason to stop, not overwrite.
     forge_push_branch "$branch" || { log "#$n: push failed — stopping."; return 1; }
     forge_pr_set_body "$pr" "$dir/pr-body.md" || log "#$n: could not update PR #$pr's body (continuing)"

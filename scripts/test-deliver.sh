@@ -958,6 +958,18 @@ job_ci_fail_no_rounds() {
   run_deliver cinoround -- --ci-poll-seconds 0 --ci-grace-seconds 0 --max-fix-rounds 0
   echo $? > "$WORK/cinoround/rc"
 }
+job_ci_fail_after_review_round() {
+  # One shared budget: a review fix round spends --max-fix-rounds 1, so the
+  # red check that follows finds no round left and parks at once.
+  new_fixture cishared
+  mkdir -p "$WORK/cishared/gh/ci" "$WORK/cishared/gh/runs"
+  printf '%s\n' '[{"name":"lint","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/889/job/3"}]' \
+    > "$WORK/cishared/gh/ci/4"
+  printf 'lint: trailing whitespace in src/a.sh\n' > "$WORK/cishared/gh/runs/889.log"
+  run_deliver cishared STUB_REVIEW=blocker-once STUB_REVIEW_STATE="$WORK/cishared/review.state" \
+    -- --ci-poll-seconds 0 --ci-grace-seconds 0 --max-fix-rounds 1
+  echo $? > "$WORK/cishared/rc"
+}
 job_ci_fail_then_green() {
   # Red on the first poll, green on the second (the fix round's own ci_wait):
   # the failed check's link names a run id the fake gh has a log for, so the
@@ -1026,6 +1038,7 @@ bg job_ci_none
 bg job_ci_pending_green
 bg job_ci_fail
 bg job_ci_fail_no_rounds
+bg job_ci_fail_after_review_round
 bg job_ci_fail_then_green
 bg job_ci_timeout
 wait
@@ -1522,6 +1535,19 @@ CR_RUNDIR="$(ls -d "$CR"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
   && ! grep -q 'Fix red CI' "$CR_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
   && ok "CI: a red check with no fix rounds left (--max-fix-rounds 0) parks at once, log tail in the park comment, no fix item" \
   || note "ci fail, no rounds: exit $RC, comment: $(jq -r '.comments[-1].body' "$CR/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
+
+# shared budget: the review's fix round spent the only round, so the red
+# check after it parks straight away — R1.1 in the plan, no C1 item.
+CS="$WORK/cishared"
+RC="$(cat "$CS/rc")"
+CS_RUNDIR="$(ls -d "$CS"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC" -eq 2 ]] && held cishared \
+  && [[ "$(cat "$CS_RUNDIR/issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && grep -qE '^- \[x\] R1\.1' "$CS_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && ! grep -q 'Fix red CI' "$CS_RUNDIR/issues/1/IMPLEMENTATION_PLAN.md" \
+  && jq -r '.comments[-1].body' "$CS/gh/issues/1.json" | grep -qF 'CI failed on PR #4: lint (no fix rounds left)' \
+  && ok "fix rounds: review and CI share one budget — a review round spent it, the red check parks at once" \
+  || note "shared budget: exit $RC, rounds=$(cat "$CS_RUNDIR/issues/1/ROUNDS_USED" 2>/dev/null), comment: $(jq -r '.comments[-1].body' "$CS/gh/issues/1.json" 2>/dev/null | tr '\n' '|')"
 
 # red then green: the fix round's log tail lands in the plan, C1 gets ticked,
 # and the re-verified, re-pushed head merges once CI is green.

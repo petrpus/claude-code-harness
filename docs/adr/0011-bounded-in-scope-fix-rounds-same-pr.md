@@ -48,7 +48,9 @@ issue's fault.
    changes once the budget is gone parks the issue, naming the review count
    and the PR — same outcome as a first-round park, just later and with more
    of what the review named already fixed. `--max-fix-rounds 0` parks on the
-   first `changes_requested`, which is #58's original behaviour.
+   first `changes_requested`, which is #58's original behaviour. The reverse
+   does not hold: a CI fix round's head is re-verified and waits for CI
+   again, but is not reviewed again (ADR-0010).
 7. **The PR body is rewritten from the plan after every fix round**
    (`write_pr_body` + the new `forge_pr_set_body`), so a human reading the PR
    sees the same checklist the runner is driving from, not the opening
