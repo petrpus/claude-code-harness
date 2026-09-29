@@ -1076,6 +1076,22 @@ job_stopciresume() {
   run_deliver stopci STUB_REVIEW_LOG="$WORK/stopci/review.log" -- --resume
   echo $? > "$WORK/stopci/rc"
 }
+job_stopcifixresume() {
+  # A STOP while BUILD works on CI fix item C1 (CI red, then green): --resume
+  # must finish that CI fix round — no second round, C1 once, then merge.
+  new_fixture stopcifix
+  mkdir -p "$WORK/stopcifix/gh/ci" "$WORK/stopcifix/gh/runs"
+  printf '%s\n%s\n' \
+    '[{"name":"build","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/556/job/1"}]' \
+    '[{"name":"build","state":"SUCCESS","bucket":"pass","link":"https://github.com/o/r/actions/runs/556/job/1"}]' \
+    > "$WORK/stopcifix/gh/ci/4"
+  printf 'Error: red\n' > "$WORK/stopcifix/gh/runs/556.log"
+  run_deliver stopcifix STUB_STOP_ON_SLICE=C1 STUB_STOP_MARKER="$WORK/stopcifix/stop.marker" -- --issue-max-iterations 2
+  echo $? > "$WORK/stopcifix/rc1"
+  cp "$(ls -d "$WORK"/stopcifix/repo/tmp/deliver/*/ | head -1)state.json" "$WORK/stopcifix/state1.json" 2>/dev/null
+  run_deliver stopcifix STUB_REVIEW_LOG="$WORK/stopcifix/review.log" -- --resume --issue-max-iterations 2
+  echo $? > "$WORK/stopcifix/rc"
+}
 job_retrynotparked() {
   # --retry on an issue the run left in flight (PR open, not parked) must be
   # refused, and must not close the PR or delete the branch (#61 review I1).
@@ -1237,6 +1253,7 @@ bg job_retry
 bg job_retrynotparked
 bg job_stopfixresume
 bg job_stopciresume
+bg job_stopcifixresume
 bg job_refusedonce
 bg job_squash
 bg job_baseadv_clean
@@ -1975,6 +1992,18 @@ RC1="$(cat "$SC/rc1")"; RC="$(cat "$SC/rc")"
   && grep -q -- '--resume continuing at: ci' "$SC/err" \
   && ok "resume: a STOP during the CI wait resumes at CI — the approved head is not reviewed again (2 reviews for 2 issues)" \
   || note "stop in CI: rc1=$RC1 rc=$RC reviews=$(wc -l < "$SC/review.log" 2>/dev/null) — $(tail -3 "$SC/err" | tr '\n' '|')"
+
+SX="$WORK/stopcifix"
+RC1="$(cat "$SX/rc1")"; RC="$(cat "$SX/rc")"
+SXRUNDIR="$(ls -d "$SX"/repo/tmp/deliver/*/ 2>/dev/null | head -1)"
+[[ "$RC1" -eq 6 && "$(jq -r '.issues["1"].fix // empty' "$SX/state1.json" 2>/dev/null)" == "ci" ]] \
+  && [[ "$RC" -eq 0 && "$(jq -r .state "$SX/gh/prs/4.json")" == "MERGED" ]] \
+  && [[ "$(cat "${SXRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null)" == "1" ]] \
+  && [[ "$(grep -c '^- \[.\] C1 Fix red CI: build$' "${SXRUNDIR}issues/1/IMPLEMENTATION_PLAN.md")" -eq 1 ]] \
+  && grep -q -- '--resume continuing at: ci-fix' "$SX/err" \
+  && [[ "$(wc -l < "$SX/review.log" 2>/dev/null)" -eq 1 ]] \
+  && ok "resume: a STOP mid-CI-fix-round (state fix=ci) is finished on --resume — one round, C1 once, no second review of #1, merged" \
+  || note "stop mid-CI-fix: rc1=$RC1 fix=$(jq -r '.issues["1"].fix // "-"' "$SX/state1.json" 2>/dev/null) rc=$RC rounds=$(cat "${SXRUNDIR}issues/1/ROUNDS_USED" 2>/dev/null) reviews=$(wc -l < "$SX/review.log" 2>/dev/null) — $(tail -3 "$SX/err" | tr '\n' '|')"
 
 # --- #61 review I1: --retry refuses an issue that is not parked -----------------
 RC="$(cat "$WORK/retrynotparked/rc")"

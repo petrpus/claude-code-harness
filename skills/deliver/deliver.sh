@@ -67,8 +67,9 @@
 # walking the graph exactly as a fresh run would: an issue whose branch this
 # run's own state.json still names is continued (a pushed head without a PR
 # gets one; an open PR is re-entered for review — round 1's dedupe marker,
-# #61 S2, keeps that from posting twice — then merged; a local-only branch
-# resumes autopilot with loop.sh --resume-run); any other leftover branch is
+# #61 S2, keeps that from posting twice — then merged, an unfinished fix
+# round finished first; a local-only branch gets a fresh loop.sh run on its
+# state dir); any other leftover branch is
 # still parked, unchanged from #58. --retry '#N' (with --resume) forgets a
 # parked issue's recorded branch/PR, closes/deletes what it left behind,
 # drops needs-human, and gives it a fresh inner run.
@@ -797,12 +798,23 @@ ci_wait() {
 # same counter, kept in $dir/ROUNDS_USED — plain state, not committed, like
 # the rest of the autopilot state dir). Echoes the round number just spent;
 # returns 1 without spending anything when the budget is already gone.
+# <key> names what the round is for (`review-<k>`, `ci@<head>`): asking again
+# for a key already spent returns that round's number without spending
+# another, so a run killed between spending and recording the fix round on
+# state.json does not pay twice when --resume gets back there (#61).
 round_budget_use() {
-  local dir="$1" used
+  local dir="$1" key="$2" used k=0 line
   used="$(cat "$dir/ROUNDS_USED" 2>/dev/null || echo 0)"
   [[ "$used" =~ ^[0-9]+$ ]] || used=0
+  if [[ -f "$dir/ROUNDS_KEYS" ]]; then
+    while IFS= read -r line; do
+      k=$(( k + 1 ))
+      [[ "$line" == "$key" ]] && { printf '%s\n' "$k"; return 0; }
+    done < "$dir/ROUNDS_KEYS"
+  fi
   [[ "$used" -lt "$MAX_FIX_ROUNDS" ]] || return 1
   used=$(( used + 1 ))
+  printf '%s\n' "$key" >> "$dir/ROUNDS_KEYS"
   echo "$used" > "$dir/ROUNDS_USED"
   printf '%s\n' "$used"
 }
@@ -840,9 +852,11 @@ ci_fix_prepare() {
   local n="$1" pr="$2" dir="$3" round="$4"
   local check logf plan="$dir/IMPLEMENTATION_PLAN.md" fence
   check="$(jq -r '.[0].name // "CI"' <<<"$CI_FAILED_JSON")"
+  state_issue_update "$RUN_DIR" "$n" \
+    "$(jq -cn --argjson r "$round" --arg h "$(git rev-parse HEAD)" '{state:"fixing", fix:"ci", ci_round:$r, fix_base:$h}')"
   logf="$(ci_failed_log_fetch "$dir")"
   fence="$(md_tilde_fence < "$logf")"
-  {
+  grep -qE "^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]+C$round([[:space:]]|$)" "$plan" 2>/dev/null || {
     echo
     echo "- [ ] C$round Fix red CI: $check"
     echo
@@ -853,9 +867,7 @@ ci_fix_prepare() {
     echo "$fence"
   } >> "$plan"
   sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$plan" 2>/dev/null && rm -f "$plan.bak"
-  state_issue_update "$RUN_DIR" "$n" \
-    "$(jq -cn --argjson r "$round" --arg c "$check" --arg l "$logf" --arg h "$(git rev-parse HEAD)" \
-         '{state:"fixing", fix:"ci", ci_round:$r, fix_check:$c, fix_log:$l, fix_base:$h}')"
+  state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg c "$check" --arg l "$logf" '{fix_check:$c, fix_log:$l}')"
   log "#$n: CI failed on PR #$pr (\`$check\`) — fix round $round: appended plan item C$round, resuming autopilot."
 }
 
@@ -871,7 +883,11 @@ ci_fix_build() {
   local n="$1" pr="$2" dir="$3" check logf loop_rc status_state
   check="$(jq -r --arg n "$n" '.issues[$n].fix_check // "CI"' "$RUN_DIR/state.json")"
   logf="$(jq -r --arg n "$n" '.issues[$n].fix_log // empty' "$RUN_DIR/state.json")"
-  run_autopilot "$dir" --resume-run; loop_rc=$?
+  # A fresh loop.sh run on the same state dir, like a review fix round — not
+  # --resume-run, which would restore the first run's clock: a long build
+  # plus a long CI wait (or a --resume after a pause) then tripped
+  # --issue-max-minutes at once and parked the issue (#61 review).
+  run_autopilot "$dir"; loop_rc=$?
   status_state="$(jq -r '.state // "?"' "$dir/status.json" 2>/dev/null || echo '?')"
   if [[ "$loop_rc" -eq 1 ]]; then
     log "#$n: autopilot refused to resume for the CI fix round (exit 1) — stopping the run."
@@ -899,24 +915,11 @@ ci_fix_build() {
 # from the issue's current plan and latest autopilot status.
 # ---------------------------------------------------------------------------
 
-# loop_run_so_far <dir> — "<cost> <whole minutes>" of the latest loop.sh run
-# in <dir>, measured the way loop.sh --resume-run restores them: cost of
-# every non-iteration row, minutes since the run log's earliest ts. "0 0"
-# when there is no run log yet.
-loop_run_so_far() {
-  local latest
-  latest="$(ls -t "$1"/run-*.jsonl 2>/dev/null | head -1)"
-  [[ -n "$latest" ]] || { echo "0 0"; return; }
-  jq -rs --argjson now "$(date +%s)" '
-    ([.[] | select(.phase != "iteration") | .cost_usd // 0] | add // 0) as $c |
-    ([.[] | .ts | fromdateiso8601?] | map(select(. != null)) | min // $now) as $s |
-    "\($c) \((($now - $s) / 60) | floor)"' "$latest" 2>/dev/null || echo "0 0"
-}
-
-# run_autopilot <dir> [loop.sh flag…] — a review fix round starts a fresh
-# loop.sh run on the same state dir (its own --issue-max-* caps; the number
-# of rounds is what --max-fix-rounds bounds); a CI fix round passes
-# --resume-run and continues the issue's run instead (#60).
+# run_autopilot <dir> [loop.sh flag…] — every call is a fresh loop.sh run on
+# the issue's state dir (plan, memory, feedback and commits carry over): the
+# first build, a resumed build, and every review or CI fix round, each with
+# its own --issue-max-* caps clipped to the global remainder; how many fix
+# rounds there are is what --max-fix-rounds bounds.
 run_autopilot() {
   local dir="$1"; shift
   local n="${dir##*/}" issue_budget_eff issue_minutes_eff loop_rc
@@ -933,22 +936,6 @@ run_autopilot() {
   # --resume can see what this attempt was actually bounded by.
   issue_budget_eff="$(clipped_issue_budget)"
   issue_minutes_eff="$(clipped_issue_minutes)"
-  if [[ " $* " == *" --resume-run "* ]]; then
-    # loop.sh --resume-run restores the latest inner run's spend and its
-    # first start time and checks its caps against those totals. The global
-    # remainder above already excludes that spend, so without adding it back
-    # a resumed run would trip its own cap at once — and then park instead of
-    # running (#61 review).
-    local prior_cost prior_min
-    read -r prior_cost prior_min < <(loop_run_so_far "$dir")
-    if [[ -n "$BUDGET_USD" ]]; then
-      issue_budget_eff="$(state_clip_num "$(jq -n --argjson a "$issue_budget_eff" --argjson p "$prior_cost" '$a + $p')" "$ISSUE_BUDGET_USD")"
-    fi
-    if [[ -n "$MAX_MINUTES" ]]; then
-      issue_minutes_eff=$(( issue_minutes_eff + prior_min ))
-      (( issue_minutes_eff > ISSUE_MAX_MINUTES )) && issue_minutes_eff="$ISSUE_MAX_MINUTES"
-    fi
-  fi
   state_issue_update "$RUN_DIR" "$n" \
     "$(jq -cn --argjson b "$issue_budget_eff" --argjson m "$issue_minutes_eff" \
          '{state:"building", issue_budget_usd:$b, issue_max_minutes:$m}')"
@@ -1032,6 +1019,11 @@ append_fix_round_items() {
   local plan="$1" round="$2" findings="$3" items
   items="$(review_fix_items "$round" "$findings")"
   [[ -n "$items" ]] || return 1
+  # Already appended (a --resume that gets back here): only reopen the plan.
+  if grep -qE "^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]+R$round\.1([[:space:]]|$)" "$plan" 2>/dev/null; then
+    sed -i.bak 's/^STATUS: done/STATUS: in-progress/' "$plan" 2>/dev/null && rm -f "$plan.bak"
+    return 0
+  fi
   { grep -v '^STATUS:' "$plan" 2>/dev/null; printf '%s\n' "$items"; echo; echo 'STATUS: in-progress'; } \
     > "$plan.tmp" && mv "$plan.tmp" "$plan"
 }
@@ -1210,7 +1202,14 @@ deliver_issue() {
       && prev_findings="$(jq -c '.findings' "$dir/review-$((round - 1)).json")"
     case "$(jq -r '.fix // empty' <<<"$entry")" in
       review) phase="review-fix" ;;
-      ci)     phase="ci-fix"; ci_round="$(jq -r '.ci_round // 1' <<<"$entry")" ;;
+      # A CI round recorded but not fully prepared (no check name yet) is
+      # simply waited for again: the same red head asks for the same
+      # budget key, so no second round is spent.
+      ci)     if [[ -n "$(jq -r '.fix_check // empty' <<<"$entry")" ]]; then
+                phase="ci-fix"; ci_round="$(jq -r '.ci_round // 1' <<<"$entry")"
+              else
+                phase="ci"
+              fi ;;
       *)      [[ "$(jq -r '.approved_head // empty' <<<"$entry")" == "$head_sha" ]] && phase="ci" ;;
     esac
     [[ "$phase" == "review" ]] || log "#$n: --resume continuing at: $phase (review round $round)"
@@ -1238,22 +1237,21 @@ deliver_issue() {
       # already set inside review_issue) and never gets a fix round; only a
       # parsed changes_requested verdict (review-<round>.json on disk) does.
       [[ -f "$dir/review-$round.json" ]] || return 10
-      if ! round_budget_use "$dir" >/dev/null; then
+      if ! round_budget_use "$dir" "review-$round" >/dev/null; then
         PARK_REASON="the review still requests changes after $round review(s) and no fix rounds are left (--max-fix-rounds $MAX_FIX_ROUNDS, PR #$pr)"
         return 10
       fi
-      findings="$(jq -c '.findings' "$dir/review-$round.json")"
-      append_fix_round_items "$dir/IMPLEMENTATION_PLAN.md" "$round" "$findings" || {
-        PARK_REASON="round $round's review requested changes but named no in-scope blocker or issue to fix (PR #$pr)"
-        return 10
-      }
       state_issue_update "$RUN_DIR" "$n" \
         "$(jq -cn --argjson r "$round" --arg h "$(git rev-parse HEAD)" '{state:"fixing", fix:"review", round:$r, fix_base:$h}')"
       log "#$n: round $round requested changes — fix round $((round + 1)) on the same PR #$pr"
     else
-      findings="$(jq -c '.findings' "$dir/review-$round.json" 2>/dev/null || echo '[]')"
       log "#$n: --resume finishing the fix round after review round $round on PR #$pr"
     fi
+    findings="$(jq -c '.findings' "$dir/review-$round.json" 2>/dev/null || echo '[]')"
+    append_fix_round_items "$dir/IMPLEMENTATION_PLAN.md" "$round" "$findings" || {
+      PARK_REASON="round $round's review requested changes but named no in-scope blocker or issue to fix (PR #$pr)"
+      return 10
+    }
     # The fix round's "no commit" gate is measured from where the round
     # began, which a resumed round only knows from state.json.
     prev_head="$(jq -r --arg n "$n" '.issues[$n].fix_base // empty' "$RUN_DIR/state.json" 2>/dev/null)"
@@ -1291,12 +1289,15 @@ deliver_issue() {
     ci_wait "$n" "$pr" "$dir" 1; ci_rc=$?
   fi
   if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
-    if [[ "$phase" == "ci-fix" ]] || ci_round="$(round_budget_use "$dir")"; then
+    if [[ "$phase" == "ci-fix" ]] || ci_round="$(round_budget_use "$dir" "ci@$head_sha")"; then
       [[ "$phase" == "ci-fix" ]] || ci_fix_prepare "$n" "$pr" "$dir" "$ci_round"
       ci_fix_build "$n" "$pr" "$dir"; fix_rc=$?
       case "$fix_rc" in
         0) head_sha="$(git rev-parse HEAD)"
-           state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$head_sha" '{state:"ci-wait", fix:null, fix_base:null, head:$h}')"
+           # A CI fix head is not reviewed again (ADR-0010); recording it as
+           # approved keeps a --resume from the next CI wait or the merge
+           # from reviewing it after all.
+           state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$head_sha" '{state:"ci-wait", fix:null, fix_base:null, head:$h, approved_head:$h}')"
            ci_wait "$n" "$pr" "$dir" "$(( ci_round + 1 ))"; ci_rc=$?
            if [[ "$ci_rc" -eq 10 && "$CI_RESULT" == "fail" ]]; then
              PARK_REASON="CI failed again on PR #$pr after fix round $ci_round: $(jq -r '[.[].name] | join(",")' <<<"$CI_FAILED_JSON")"
@@ -1336,7 +1337,8 @@ deliver_issue() {
     git switch -q "$branch" || return 1
     final_verify "$n" "$dir"; fv_rc=$?
     case "$fv_rc" in
-      0)  head_sha="$(git rev-parse HEAD)" ;;
+      0)  head_sha="$(git rev-parse HEAD)"
+          state_issue_update "$RUN_DIR" "$n" "$(jq -cn --arg h "$head_sha" '{head:$h, approved_head:$h}')" ;;
       10) return 10 ;;
       *)  return 1 ;;
     esac

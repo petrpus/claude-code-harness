@@ -52,8 +52,10 @@ record the decisions.
      wider tilde-fence than any fence already in the log, so nothing in the
      log can close it early) — data for the model to read, never a plan
      line the runner itself parses,
-   - re-opens `STATUS: in-progress` and resumes autopilot on the same state
-     dir (`loop.sh --resume-run`, #53's seam),
+   - re-opens `STATUS: in-progress` and runs autopilot again on the same
+     state dir — a fresh `loop.sh` run since #61 (ADR-0012 decision 7): a
+     `--resume-run` restored the first run's clock, so a long build plus a
+     long CI wait tripped `--issue-max-minutes` before the fix even began,
    - and, once autopilot ends `done` on a clean tree, goes back through
      `final_verify` → `forge_push_update` → `ci_wait` — the fix is just
      another change to the head, and it gets the same verify-then-CI

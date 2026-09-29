@@ -182,8 +182,8 @@ every `--ci-poll-seconds` (default 30) before the PR may merge:
   rounds above). The fix round fetches the failed run's log tail
   (`forge_ci_failed_log`, `gh run view <id> --log-failed`), appends a
   `- [ ] C<round> Fix red CI: <check>` plan item with the log fenced as data,
-  reopens `STATUS: in-progress` and resumes autopilot (`loop.sh
-  --resume-run`); a clean finish goes back through final-verify and
+  reopens `STATUS: in-progress` and runs autopilot again on the same state
+  dir (a fresh `loop.sh` run, like a review fix round); a clean finish goes back through final-verify and
   `ci_wait`. No round left, autopilot not finishing the fix, or CI still red
   after the round parks — with the failed checks' names in the reason and
   the failed run's log tail in the park comment — logged with verdict
@@ -247,10 +247,9 @@ of the branch ahead of origin with no fix round pending is re-verified and
 pushed first; one that diverged stops the run. A local-only branch gets a
 fresh `loop.sh` run on the same state dir (plan, memory and commits carry
 over; a `--resume-run` would restore the old run's clock and trip
-`--issue-max-minutes` after any long pause). A CI fix round's own
-`--resume-run` call gets back what that run already spent on top of the
-global caps' remainder, so it is not cut off by spend the caps already
-counted. A leftover branch this run's state does *not* know about is
+`--issue-max-minutes` after any long pause). A fix round's budget spend is
+keyed (`review-<k>`, `ci@<head>`), so a run killed between spending a round
+and recording it never pays for the same round twice. A leftover branch this run's state does *not* know about is
 still parked, unchanged from #58 — `--resume` only continues a branch its
 own run started.
 

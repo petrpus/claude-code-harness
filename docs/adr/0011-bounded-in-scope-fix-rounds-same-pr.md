@@ -15,7 +15,7 @@ issue's fault.
    feedback, and only the plan changed underneath it. It is a fresh run, not
    a `--resume-run`: a first run that spent most of `--issue-max-iterations`
    would otherwise leave a fix round no room to work. (A CI fix round,
-   ADR-0010, does resume.)
+   ADR-0010, now runs the same way — ADR-0012 decision 7.)
 2. **Only in-scope `blocker` / `issue` findings become plan items.**
    `review_fix_items` (`skills/deliver/review.sh`) turns round `k`'s findings
    into `- [ ] R<k>.<j> — <severity> <file>:<line>: <note>` lines
