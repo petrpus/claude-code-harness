@@ -35,14 +35,22 @@ has since been reviewed, merged and had its branch deleted by hand.
    friends, #61 S2) are what make re-entering a phase safe once GitHub has
    won: a resumed run re-does the *check*, not the *write*, so a review or a
    park/merge comment that already landed is never posted twice.
-5. An open PR is re-entered at the review round `state.json` recorded
-   (`round`), with the previous round's findings inlined as usual, so a
-   resume in the middle of #63's fix rounds neither restarts at round 1
-   nor skips one; the per-issue fix-round budget (`ROUNDS_USED`, ADR-0010)
-   lives in the issue's state dir and survives the resume with it. The
-   checked-out branch must match origin: a local copy ahead of it (a fix
-   round that committed but never pushed) is re-verified and pushed first,
-   one that diverged stops the run for a human.
+5. An open PR is re-entered where `state.json` says it was. A fix round
+   (review, ADR-0011, or CI, ADR-0010) records itself as `fix` with the
+   head it started from (`fix_base`) before its build; a resume that finds
+   one finishes it — its local commits kept, its already-spent round
+   (`ROUNDS_USED`) not spent again — instead of re-reviewing an unfixed head
+   or dropping the plan item. Otherwise the review resumes at its recorded
+   `round` with the previous round's findings inlined, or, once
+   `approved_head` is the PR's head, skips straight to the CI wait. A local
+   branch ahead of origin with no fix pending is re-verified and pushed
+   first; one that diverged stops the run for a human.
+7. A resumed build never restores an interrupted inner run's clock. The
+   `building` point gets a fresh `loop.sh` run on the same state dir (plan,
+   memory, commits carry over); a CI fix round's `--resume-run` call has
+   the inner run's own spend and minutes added back onto the clipped global
+   remainder, so a stop overnight or a global cap does not park the issue
+   the moment it resumes.
 6. `--retry '#N'` discards only an attempt this run recorded as `parked`.
    Anything else is work in flight or already settled, and closing its PR
    and deleting its branch would throw live work away — `--retry` refuses

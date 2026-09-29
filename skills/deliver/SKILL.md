@@ -236,18 +236,27 @@ state still calls non-terminal against GitHub — **GitHub wins**
 merged, the issue closed settles it as closed-externally, `needs-human`
 settles it as parked. Anything else resumes exactly where this run's own
 `state.json` left it: a pushed head without a PR gets one; an open PR is
-re-entered at the review round `state.json` recorded (the round's marker —
-issue, round, head — keeps a review the interrupted attempt already posted
-from being posted twice), with fix rounds, the CI wait and the merge after it
-as usual; a local copy of the branch ahead of origin (a fix round that
-committed but never pushed) is re-verified and pushed first, one that
-diverged stops the run; a local-only branch resumes autopilot with `loop.sh
---resume-run`. A leftover branch this run's state does *not* know about is
+re-entered where `state.json` says it was: at the review round it recorded
+(the round's marker — issue, round, head — keeps a review the interrupted
+attempt already posted from being posted twice); inside a review or CI fix
+round that was left unfinished (`fix`), which is finished — its local
+commits kept, no second round spent — rather than redone or skipped; or
+straight at the CI wait once `approved_head` is the PR's head, so a resume
+from the CI wait or the merge never pays for a second review. A local copy
+of the branch ahead of origin with no fix round pending is re-verified and
+pushed first; one that diverged stops the run. A local-only branch gets a
+fresh `loop.sh` run on the same state dir (plan, memory and commits carry
+over; a `--resume-run` would restore the old run's clock and trip
+`--issue-max-minutes` after any long pause). A CI fix round's own
+`--resume-run` call gets back what that run already spent on top of the
+global caps' remainder, so it is not cut off by spend the caps already
+counted. A leftover branch this run's state does *not* know about is
 still parked, unchanged from #58 — `--resume` only continues a branch its
 own run started.
 
-`--retry '#N'` (with `--resume`, and only for an issue this run recorded as
-parked — anything else is refused, since it would discard live work) forgets a parked issue's recorded
+A parked issue stays parked across `--resume`, label or not. `--retry '#N'`
+(with `--resume`, and only for an issue this run recorded as parked —
+anything else is refused, since it would discard live work) forgets a parked issue's recorded
 branch/PR, closes/deletes what it left behind, drops `needs-human`, and
 gives it a fresh inner run — same as the park comment's own "To retry" line
 says.
