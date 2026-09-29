@@ -30,6 +30,14 @@ After `/harness-init` you'll typically want to:
 **Note:** the guard hooks parse tool input with `jq` and fail open without it —
 ensure `jq` is on `PATH` (`/harness-doctor` flags it if missing).
 
+## Before the first `/deliver`
+
+`/deliver` needs a little more than the rest of the harness: `gh` logged in
+(`gh auth status`), `jq`, bash ≥ 4.2, `tmp/` in `.gitignore`, and the five
+labels `map`, `prd`, `ready-for-agent`, `needs-human`, `needs-triage`
+(`/harness-init` creates them). `tmux` is optional; it runs the launcher
+detached. `/harness-doctor` checks all of it. See `skills/deliver/SKILL.md`.
+
 ## Updating
 
 When the harness repo changes:

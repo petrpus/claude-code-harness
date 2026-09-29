@@ -84,9 +84,11 @@ map_title_is_conventional() { local LC_ALL=C; [[ "$1" =~ $MAP_CONVENTIONAL_RE ]]
 
 # map_pr_title <map_title> <issue_title> <labels_csv>
 #   The squash subject (ADR-0008 decision 5): the Map line's title when it is
-#   already a conventional commit; otherwise <type>: <issue title>, where the
-#   type follows the issue's labels (bug → fix, documentation → docs, anything
-#   else → feat). The description is cut to 72 characters.
+#   already a conventional commit (a long one keeps its type, description cut
+#   at a word to 72 bytes, #111); otherwise <type>: <title>, where <title> is
+#   the Map line's title (the issue title when the line has none) and the
+#   type follows the issue's labels (bug → fix, documentation → docs,
+#   anything else → feat). The description is cut to 72 characters.
 # map_conventional_split <title> — for a title that is a conventional commit
 # apart from its length, sets MAP_CONV_HEAD ("fix(deliver): ") and
 # MAP_CONV_DESC (the rest); returns 1 for anything else. Matched under

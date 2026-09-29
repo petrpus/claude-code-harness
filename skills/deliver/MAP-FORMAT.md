@@ -31,14 +31,18 @@ Free text — ASCII DAG, decisions. Ignored by the parser.
 - **`after:` is the edge list** — the Map's edges are the source of truth. Each
   ref must be an issue ref (`#N`) that is itself listed in Delivery; anything
   else is a pre-flight error. Each child issue's `## Blocked by` stays as the
-  human-facing mirror; pre-flight warns on a mismatch and the Map wins.
+  human-facing mirror; the runner reads only the Map, so keep the two in step
+  by hand — on a mismatch the Map wins.
 - **Each issue appears once.** A duplicate is a pre-flight error; cycles are
   rejected too.
 - **`[x]` means delivered** (by the runner or by hand); the runner skips
   ticked lines. Mark pre-existing work `[x]`.
 - **The title is the squash subject** when it is a conventional commit
-  (`type(scope): description`, description ≤ 72 chars); otherwise the runner
-  derives `<type>: <issue title>` from the issue's labels.
+  (`type(scope): description`). A description over 72 bytes keeps its type and
+  scope and is cut at a word boundary. Any other title becomes
+  `<type>: <title>`, with the type taken from the issue's labels (bug → fix,
+  documentation → docs, else feat); `<title>` is the Map line's own title, or
+  the issue's when the line has none.
 - **The runner edits the body in exactly two ways:** ticking one Delivery line
   and appending under `## Follow-ups`. Progress goes into comments. Follow-ups
   are `needs-triage` issues; adding them to Delivery is a human decision.

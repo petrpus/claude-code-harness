@@ -23,7 +23,7 @@
 # `gh pr checks` until nothing is pending or --ci-timeout passes; no checks at
 # all after --ci-grace-seconds is "no CI" and merges anyway. A red check gets
 # a fix round (#60): the failed run's log tail is appended to the issue's
-# plan as a new item, autopilot resumes to fix it, and the head goes back
+# plan as a new item, autopilot runs again to fix it, and the head goes back
 # through final_verify and ci_wait. Review and CI fix rounds draw from one
 # per-issue budget (--max-fix-rounds); no rounds left, a second red CI, or
 # autopilot not finishing a fix parks instead. A failure of the machinery
@@ -1288,7 +1288,13 @@ write_pr_body() {
   iters="$(jq -r '.iterations_done // 0' "$dir/status.json" 2>/dev/null || echo 0)"
   cost="$(jq -r '.total_cost_usd // 0' "$dir/status.json" 2>/dev/null || echo 0)"
   {
-    echo "Refs #$n · Part of map #$MAP"
+    # Into the default branch (--allow-main) there is no final PR to carry
+    # `Closes #N`, so each issue PR closes its own issue (ADR-0013).
+    if [[ "$ALLOW_MAIN" -eq 1 ]]; then
+      echo "Closes #$n · Part of map #$MAP"
+    else
+      echo "Refs #$n · Part of map #$MAP"
+    fi
     echo
     echo "## What"
     echo

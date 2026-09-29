@@ -128,9 +128,13 @@ Delivery is two nested loops, each with one owner:
 
 - **Outer — the `/deliver` runner.** Walks a **Map** (a `map`-labelled issue,
   ADR-0008) in blocking-edge order. Per issue it branches off the integration
-  branch, runs the inner loop with the issue as charter, verifies the exact head,
-  pushes, opens the PR, runs an independent review, squash-merges and ticks the
-  Map line. A failing issue is parked (`needs-human`) and its dependents skipped.
+  branch, runs the inner loop with the issue as charter, verifies the exact head
+  (merging a moved base in first), pushes, opens the PR, runs an independent
+  review, waits for CI, squash-merges (falling back to `--merge` when the repo
+  forbids squash) and ticks the Map line. A review that requests changes or a
+  red check gets a fix round on the same PR, from one per-issue budget
+  (`--max-fix-rounds`). A failing issue is parked (`needs-human`) and its
+  dependents skipped.
   When the walk ends it opens the integration → default PR for a human to merge.
 - **Inner — autopilot.** Unchanged from § autopilot state model: slices, gates,
   stuck ladder. It knows nothing about GitHub.
@@ -150,7 +154,7 @@ Conventions of a Delivery run:
 | Convention | Detail |
 |---|---|
 | tmux session | `deliver-<N>` for Map `#N`; `tmux has-session -t deliver-<N>` tells whether the run is alive, `tmux kill-session -t deliver-<N>` is the hard stop |
-| labels | `map` (the contract issue), `ready-for-agent` (eligible), `needs-human` (parked), `needs-triage` (follow-ups filed by review) |
+| labels | `map` (the contract issue), `prd` (the PRD it comes from), `ready-for-agent` (eligible), `needs-human` (parked), `needs-triage` (follow-ups filed by review) |
 | integration branches | `integration/<map-slug>` off `main`; per-issue branches off it; issue PRs squash-merge into it; `main`/`master` is refused as a target unless `--allow-main` |
 
 See `skills/deliver/SKILL.md` for the operator view and `docs/prd/0003-deliver.md`

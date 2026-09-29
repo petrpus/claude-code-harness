@@ -95,6 +95,10 @@ _Avoid_: skipped slice, deferred slice
 **Review round**:
 One independent review of an issue's PR, followed — if it finds in-scope blockers or issues — by one fix run. A Delivery run allows a bounded number per issue.
 
+**Fix round**:
+One more autopilot run on an issue's PR, to fix what a changes-requested review round named (its in-scope findings become plan items) or what a red CI check reported. Review and CI fix rounds draw from one per-issue budget; CI gets at most one.
+_Avoid_: retry, rework loop
+
 **Follow-up**:
 An out-of-scope review finding filed as a `needs-triage` issue and appended to the Map. Never executed by the run that found it.
 _Avoid_: TODO, tech debt ticket

@@ -1677,7 +1677,8 @@ AM="$WORK/allowmain"
   && [[ "$(grep -c '^pr create' "$AM/gh/calls")" -eq 2 ]] \
   && ! grep -q '^pr create.*--head main' "$AM/gh/calls" \
   && [[ ! -e "$AM/gh/prs/6.json" ]] \
-  && ok "--allow-main: both PRs target and merge into main; no PR has head main; no final PR" \
+  && jq -r .body "$AM/gh/prs/4.json" | grep -q '^Closes #1 ' \
+  && ok "--allow-main: both PRs target and merge into main; no PR has head main; no final PR; each PR closes its issue" \
   || note "--allow-main: rc=$(cat "$AM/rc") creates: $(grep '^pr create' "$AM/gh/calls" | tr '\n' '|') err: $(tail -3 "$AM/err" | tr '\n' '|')"
 jq -e '.allow_main == true and .base == "main" and (.final_pr // null) == null' "$AM"/repo/tmp/deliver/*/state.json >/dev/null \
   && ok "--allow-main: recorded in state.json (a --resume on main will not re-refuse)" \

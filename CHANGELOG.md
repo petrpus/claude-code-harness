@@ -2,10 +2,57 @@
 
 All notable changes to claude-code-harness. Semver via git tags.
 
-## [Unreleased]
+## [0.6.0] — 2026-09-29
+
+`/deliver`: a Map issue in, one merged PR per issue out, into an integration
+branch, with one final PR into `main` left for a human. Autopilot gets the
+seams and fixes that make it safe to run unattended. PRD
+`docs/prd/0003-deliver.md`, ADR-0007/0008 and ADR-0009…0012.
 
 ### Added
 
+- `/deliver` (`skills/deliver/deliver.sh`): walks a Map issue's Delivery
+  graph in blocking-edge order. Each issue becomes its own branch and an
+  autopilot `loop.sh` run, then a verify of the exact head with no forge
+  credentials, then a PR and an independent review. The runner squash-merges
+  it (`--match-head-commit`) and ticks the Map. Only the runner holds
+  forge operations (ADR-0007); the Map issue is the contract (ADR-0008).
+  (#57, #70)
+- Parking: an issue that cannot make it is labelled `needs-human`, its PR
+  goes back to draft and a comment says why. Its dependents are skipped and
+  independent issues continue. Exit 2 means partial. (#58, #73)
+- Independent review in a throwaway worktree (`code-reviewer`, no shell, no
+  write tool). The runner snapshots refs, config, hooks and `tmp/` around the
+  call, and any change ends the run. The runner recomputes the verdict from
+  the findings. (#59, #72; the `/deliver` half of #52)
+- Bounded fix rounds on the same PR: in-scope review findings become plan
+  items and autopilot runs again. Out-of-scope findings become deduplicated
+  `needs-triage` follow-up issues listed on the Map. (#63, #95; ADR-0011)
+- CI wait before merge (`gh pr checks`; "no CI" after a grace period), with
+  one fix round for a red check. Review and CI fix rounds share one
+  per-issue budget, `--max-fix-rounds` (default 2). A base that moved is
+  merged in and re-verified, and a refused merge is retried once. (#60, #97;
+  ADR-0010)
+- Final integration PR into the default branch with one `Closes #N` per
+  delivered issue, merged by a human with a merge commit. Base-branch
+  options include `--create-integration`. (#62, #99)
+- The `/deliver` skill: pre-flight, tmux launch and monitoring. `--plan-only`
+  and `--stop`. (#65, #103)
+- `--max-turns` (default 200 for `/deliver`) reaches every `loop.sh` run. A
+  BUILD that ends on the turn limit is logged as `turn-limit` (call row,
+  iteration row, FEEDBACK), and its next attempt is told to continue the
+  checkpointed work. (#96, #98)
+- `--extra-allowed-tools` reaches autopilot's BUILD allowlist. Forge-capable
+  rules are refused. (#75, #76)
+- Autopilot seams: `loop.sh --state-dir` and `--stop-file` (#53, #69); the
+  `agent.sh` model-call core (#55, #71); `--plan-max-items` and
+  `--verify-at-completion` / `--iteration-verify-cmd`, so an issue-sized plan
+  runs its full verify once (#88, #90; ADR-0009).
+- Every model call runs without forge credentials: gh tokens are unset, git
+  credential helpers cleared, no ssh agent. It also runs without MCP
+  servers. (#77, #80; #83, #85)
+- Docs: architecture, user guide (`docs/guide.html`) and glossary for
+  `/deliver`. (#66, #104)
 - `/deliver --review-max-turns <n>` (default 80): the independent review's
   own turn cap, separate from `--max-turns` (#102).
 - `/deliver` names a turn-limited review reply `turn-limit` in the run log and
@@ -46,6 +93,13 @@ All notable changes to claude-code-harness. Semver via git tags.
 
 ### Changed
 
+- Autopilot iteration gates see the whole iteration. BUILD no longer runs
+  `git add`/`git commit`. The runner stages everything before the gates
+  (`git diff --cached <pre-BUILD sha>`), fails closed when it cannot stage,
+  stages again after verify, and commits after the gates. `files_changed`
+  counts from the same base. (#54, #93)
+- The autopilot stuck ladder does not escalate a slice whose last failure was
+  a turn limit: a stronger model hits the same cap. (#101, #110)
 - `scripts/test-deliver.sh`: independent end-to-end fixtures now run in
   parallel — each already had its own `$WORK/<name>/` dir (remote, repo, gh
   store, XDG state), so every fixture's `new_fixture` + `run_deliver` launches
@@ -57,6 +111,30 @@ All notable changes to claude-code-harness. Semver via git tags.
   new check that the happy path's own run log shows `loop.sh` actually ran a
   `plan` and a `build` phase, closing the "real loop.sh at least once" gap).
   (#74)
+
+### Fixed
+
+- `loop.sh --resume-run` restores the run's iteration, cost and start time,
+  and `detect_verify_cmd` is shared by autopilot and `/deliver`. (#56, #89)
+- A failed clock read at start no longer reports a time cap. (#78, #81)
+- BUILD can see a verify command that outlasts the Bash tool's 2-minute
+  default. (#86, #87)
+- The secret scan judges only added lines, not unified-diff context. (#94,
+  #107)
+- `/deliver` tidy-ups from the live runs (#84, #109):
+  - a timed-out call's cost is recorded as unknown, not zero;
+  - branch slugs are cut at a word boundary and no longer mangled under a
+    Czech locale;
+  - `status.json` names the issue in flight;
+  - verify-command detection is shared.
+- A long conventional Map title keeps its own type instead of getting a
+  second one. The description is cut at a word boundary to fit 72 bytes.
+  (#111, #112)
+- `/deliver` no longer counts a review's cost twice (CI log rows).
+- `/deliver --allow-main`: each issue PR says `Closes #N` (there is no final
+  PR to close them), so delivered issues no longer stay open (ADR-0013).
+- e2e fixtures skip the 120 s "no CI" grace: `test-deliver.sh` takes about
+  1 minute again (#74, #91).
 
 ## [0.5.2] — 2026-09-13
 
