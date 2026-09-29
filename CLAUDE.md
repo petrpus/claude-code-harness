@@ -32,7 +32,8 @@ docs/                  # architecture.md, install.md, pocock-sync-log.md
 3. **Own** — authored here, no upstream. Workflow: `next`, `commit-agent`,
    `implement-issue`, `start-feature`, `migration-check`, `worklog`,
    `harness-init`, `harness-doctor`. Autonomy & infra: `autopilot` (loop engine),
-   `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`, `code-map`.
+   `deliver` (Map → integration PR), `cost-discipline`, `usage-report`,
+   `project-infra`, `openapi-sync`, `repo-map`, `code-map`.
    Plus agents `code-reviewer` (sonnet) + `verifier` (haiku). Loopkit ideas were
    re-engineered, not vendored (see sync-log's Loopkit section).
 
@@ -76,6 +77,8 @@ mismatch; leave it as vendored and do not "fix" it locally.
   `tmp/.last-verify-status` for freshness.
 - **Branch model**: feature branches off `main`. The pre-bash hook blocks
   `git push` from `main`/`master` and blocks force-push and broad `rm -rf`.
+  `/deliver` adds an integration level: `integration/<slug>` off `main`, per-issue
+  branches off the integration branch, and one final integration PR into `main`.
 
 ## Hooks model
 

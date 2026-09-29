@@ -310,6 +310,23 @@ grep -qi 'manual' <(sed -n '/Stop gate/,$p' skills/autopilot/SKILL.md) \
   && ok "autopilot SKILL.md Stop gate paragraph is a manual option" \
   || note "autopilot SKILL.md Stop gate paragraph does not say it is manual"
 
+# ---------------------------------------------------------------------------
+section "own-skill inventories list every non-vendored skill"
+SYNC="docs/pocock-sync-log.md"
+README_OWN="$(grep -E '^\| \*\*Skills \(own' README.md || true)"
+CLAUDE_OWN="$(awk '/^3\. \*\*Own\*\*/{b=1} b&&/Plus agents/{exit} b{print}' CLAUDE.md)"
+DOCTOR_OWN="$(awk '/^- Own:/{b=1} b&&/^$/{exit} b{print}' skills/harness-doctor/SKILL.md)"
+for d in skills/*/; do
+  n="$(basename "$d")"
+  grep -qE "^\| ${n} \|" "$SYNC" && continue   # vendored (Pocock or Vercel table)
+  for pair in "README:$README_OWN" "CLAUDE.md:$CLAUDE_OWN" "harness-doctor:$DOCTOR_OWN"; do
+    name="${pair%%:*}"; text="${pair#*:}"
+    grep -qF -- "\`$n\`" <<<"$text" && ok "$name lists own skill $n" || note "$name own-skill list omits $n"
+  done
+done
+grep -qF 'integration/<slug>' CLAUDE.md && ok "CLAUDE.md branch model covers integration branches" \
+  || note "CLAUDE.md branch model does not cover integration/<slug> branches"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "check-consistency: PASS"; else echo "check-consistency: FAIL"; fi
 exit "$FAIL"
