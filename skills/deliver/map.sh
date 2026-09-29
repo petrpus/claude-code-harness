@@ -87,10 +87,45 @@ map_title_is_conventional() { local LC_ALL=C; [[ "$1" =~ $MAP_CONVENTIONAL_RE ]]
 #   already a conventional commit; otherwise <type>: <issue title>, where the
 #   type follows the issue's labels (bug → fix, documentation → docs, anything
 #   else → feat). The description is cut to 72 characters.
+# map_conventional_split <title> — for a title that is a conventional commit
+# apart from its length, sets MAP_CONV_HEAD ("fix(deliver): ") and
+# MAP_CONV_DESC (the rest); returns 1 for anything else. Matched under
+# LC_ALL=C for the same reason as map_title_is_conventional.
+map_conventional_split() {
+  local LC_ALL=C
+  [[ "$1" =~ ^((feat|fix|docs|refactor|test|chore|perf|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?:\ )(.+)$ ]] || return 1
+  MAP_CONV_HEAD="${BASH_REMATCH[1]}"; MAP_CONV_DESC="${BASH_REMATCH[4]}"
+}
+
+# map_bytes <s> — the length of <s> in bytes, the unit MAP_CONVENTIONAL_RE's
+# `.{1,72}` counts in (it is matched under LC_ALL=C).
+map_bytes() { local LC_ALL=C; printf '%s' "${#1}"; }
+
+# map_fit_desc <desc> — <desc> trimmed and cut to at most 72 bytes: whole
+# words dropped from the end first, then (a single long word) characters,
+# one at a time in the caller's locale, so a multi-byte character is never
+# split under a UTF-8 locale. Echoes "" only for a blank <desc>.
+map_fit_desc() {
+  local d="$1"
+  d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
+  while (( $(map_bytes "$d") > 72 )) && [[ "$d" == *" "* ]]; do
+    d="${d% *}"; d="${d%"${d##*[![:space:]]}"}"
+  done
+  while (( $(map_bytes "$d") > 72 )); do d="${d%?}"; done
+  printf '%s' "$d"
+}
+
 map_pr_title() {
   local map_title="$1" issue_title="$2" labels=",$3," type desc
   if [[ -n "$map_title" ]] && map_title_is_conventional "$map_title"; then
     printf '%s\n' "$map_title"; return 0
+  fi
+  # Conventional but with a description past the 72-character cap (#111):
+  # keep its own type and scope, shorten only the description, at a word
+  # boundary — never treat it as prose and prefix a second type.
+  if [[ -n "$map_title" ]] && map_conventional_split "$map_title"; then
+    desc="$(map_fit_desc "$MAP_CONV_DESC")"
+    [[ -n "$desc" ]] && { printf '%s%s\n' "$MAP_CONV_HEAD" "$desc"; return 0; }
   fi
   case "$labels" in
     *,bug,*)           type=fix ;;
