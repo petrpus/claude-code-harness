@@ -1,11 +1,10 @@
 ---
 name: autopilot
 description: >-
-  Run a long, controlled autonomous coding session ("řízený běh") — a loop that
+  Run a long, controlled autonomous coding session ("řízený běh"): a loop that
   implements a plan slice by slice with hard verify gates, cost/iteration/time
-  caps, per-iteration git checkpoints, and a structured run log. Use for
-  unattended multi-step work derived from a PRD or GitHub issue. Triggers:
-  "spusť autopilota", "run the loop", "autonomní běh", "let it run until done".
+  caps, per-iteration git checkpoints and a JSONL run log. User-invoked only.
+disable-model-invocation: true
 ---
 
 # autopilot — controlled long autonomous runs

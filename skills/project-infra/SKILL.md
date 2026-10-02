@@ -1,6 +1,10 @@
 ---
 name: project-infra
-description: Provision and maintain a consumer project's Claude-session infrastructure and CI/CD — verify script, .env.example, GitHub Actions, devcontainer, branch protection. Modes via `/project-infra [audit|verify|env|ci|devcontainer|branch-protection|all]` (default audit). Triggers: "set up CI", "project has no verify command", "generate .env.example", "add a devcontainer", "protect the main branch".
+description: >-
+  Provision and maintain a consumer project's verify script, .env.example,
+  GitHub Actions CI, devcontainer and branch protection
+  (`/project-infra [audit|verify|env|ci|devcontainer|branch-protection|all]`).
+  Triggers: "set up CI", "no verify command", "add a devcontainer", "protect main".
 ---
 
 # Skill: /project-infra

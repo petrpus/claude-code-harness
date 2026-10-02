@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────┐
 │  L1: Anthropic built-in (CLI)           │   /update-config, /loop, /init, /review, …
-│  L2: claude-code-harness (this plugin)  │   Pocock + Vercel + own orchestration + generic hooks
+│  L2: code-harness (this plugin)         │   Pocock + Vercel + own orchestration + generic hooks
 │  L3: project .claude/ (per-repo)        │   only domain-specific skills/agents/hooks
 └─────────────────────────────────────────┘
 ```
@@ -15,7 +15,9 @@ L1 ships with Claude Code. L3 stays in each repo. L2 is this plugin — same har
 ## Plugin layout
 
 ```
-.claude-plugin/plugin.json     # manifest (name, description, author)
+.claude-plugin/plugin.json     # manifest (name `code-harness`, version, description, author)
+.claude-plugin/marketplace.json # self-marketplace `claude-code-harness`; `renames` map (ADR-0014)
+.claude/CLAUDE.md              # contributor context for THIS repo — not plugin context
 skills/<name>/SKILL.md         # auto-discovered by Claude Code
 agents/<name>.md               # auto-discovered
 hooks/hooks.json               # hook registration
@@ -26,6 +28,17 @@ docs/                          # this folder
 ```
 
 `${CLAUDE_PLUGIN_ROOT}` is the path to this plugin at runtime — used in `hooks.json` to reference hook scripts. Note it is set **only for hook processes**; a plain Bash script (e.g. `skills/autopilot/loop.sh`) must resolve its own location from `${BASH_SOURCE[0]}`, not from `$CLAUDE_PLUGIN_ROOT`.
+
+`hooks.json` registers each hook in shell form as `bash "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh"`:
+the placeholder is quoted (a plugin path with a space would otherwise split, and
+`claude plugin validate` warns), and the script runs through `bash` so a
+repackager that strips exec bits can't disable a guard. Exec form (`"args": [...]`)
+is deliberately not used: a Claude Code without `args` support would spawn a
+bare `bash` that reads the hook's stdin JSON as a script.
+
+The plugin root is the repo root (`"source": "./"`), so the contributor
+`CLAUDE.md` lives in `.claude/CLAUDE.md`: Claude Code never loads a `CLAUDE.md`
+at a plugin root as context, and `claude plugin validate` warns about one.
 
 ## Hook contract
 
@@ -217,8 +230,14 @@ If a project breaks a convention, the corresponding skill/hook gets less useful 
 - Tag `v0.x.0` on the **merge commit on `main`**, never on an unmerged feature
   branch. Push the tag together with `main`.
 - Pocock upstream sync is **manual + ad-hoc** — see `docs/pocock-sync-log.md`.
-- Breaking changes (removing a skill, renaming a hook event) get a major bump and
-  a CHANGELOG note.
+- Breaking changes (removing or renaming a skill, renaming the plugin, renaming a
+  hook event) bump the minor version while the plugin is 0.x (the major from 1.0)
+  and get a CHANGELOG migration note.
+- The plugin `name` must pass `claude plugin validate --strict`: nothing starting
+  with `claude-`/`anthropic-`, and no `claude` as a whole word (ADR-0014).
+  `scripts/check-consistency.sh` runs the validator when the `claude` CLI is on
+  `PATH`, and CI runs it through `npx`. A rename goes through the marketplace's
+  append-only `renames` map, never a silent `name` edit.
 
 ## CLAUDE_PLUGIN_ROOT vs CLAUDE_PROJECT_DIR (historical note)
 

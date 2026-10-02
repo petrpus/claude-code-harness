@@ -2,11 +2,15 @@
 #
 # This is deliberately NOT an instance of ci-workflow.template.yml (that
 # template targets an npm/pnpm consumer project). The harness's own verify
-# gate is a single dependency-free bash script (scripts/verify.sh); the only
-# non-builtin tool it needs is jq for the hook test matrix and JSON checks
-# (hooks/lib.sh fails open without it, per docs/architecture.md § Hook
-# contract — CI must not silently pass with the matrix skipped). No secrets,
-# no network calls, no pull_request_target.
+# gate is a single bash script (scripts/verify.sh); the only non-builtin tools
+# it needs are jq for the hook test matrix and JSON checks (hooks/lib.sh fails
+# open without it, per docs/architecture.md § Hook contract — CI must not
+# silently pass with the matrix skipped) and python3 + PyYAML for the
+# skill/agent frontmatter lint (required when CI=true). The verify itself makes
+# no network calls; the last step downloads Claude Code from npm only to run
+# its offline `claude plugin validate --strict` (ADR-0014), so a new platform
+# rule fails a PR here instead of a user's install. No secrets, no
+# pull_request_target.
 name: verify
 
 on:
@@ -21,8 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq and PyYAML
+        run: sudo apt-get update && sudo apt-get install -y jq python3-yaml
 
       - name: Run scripts/verify.sh
         run: bash scripts/verify.sh
@@ -34,3 +38,12 @@ jobs:
           name: last-verify-status
           path: tmp/.last-verify-status
           if-no-files-found: ignore
+
+      - name: claude plugin validate --strict
+        env:
+          DISABLE_AUTOUPDATER: "1"
+          DISABLE_TELEMETRY: "1"
+        run: |
+          for target in . .claude-plugin/plugin.json skills agents; do
+            npx --yes @anthropic-ai/claude-code plugin validate "$target" --strict
+          done

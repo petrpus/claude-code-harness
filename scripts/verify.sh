@@ -6,7 +6,9 @@
 # Offline layers, in the order they run (see the `section` headings below for
 # the current list — the ones worth calling out here):
 #   1. scripts/check-consistency.sh — structural invariants (skills, sync-log,
-#      version==changelog, hooks.json resolves, …).
+#      version==changelog, hooks.json form + resolution, skill/agent
+#      frontmatter lint and listing budget, plugin name + renames map, and
+#      `claude plugin validate --strict` when the CLI is on PATH, …).
 #   2. Hook test matrix — each guard hook is fed representative stdin-JSON and
 #      its exit code asserted (block cases exit 2, allow cases exit 0), per the
 #      stdin-JSON / exit-2 contract in docs/architecture.md § Hook contract.

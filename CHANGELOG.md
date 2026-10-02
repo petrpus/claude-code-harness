@@ -1,6 +1,97 @@
 # Changelog
 
-All notable changes to claude-code-harness. Semver via git tags.
+All notable changes to the harness (the `code-harness` plugin, named
+`claude-code-harness` up to 0.6.x). Semver via git tags.
+
+## [0.7.0] — 2026-10-02
+
+Housekeeping release: the plugin passes `claude plugin validate --strict` and
+the harness checks itself against it. The plugin is renamed (breaking), the paid
+runners start only on a human keystroke, and the vendor sync log is corrected.
+ADR-0014, ADR-0015.
+
+### Migration (breaking)
+
+- **The plugin is now `code-harness`**; the marketplace and the repo stay
+  `claude-code-harness`. Claude Code reserves plugin names that start with
+  `claude-`: `claude plugin validate` failed on the old name and `claude plugin
+  tag` refused it. The marketplace's new `renames` map migrates installs on
+  Claude Code ≥ 2.1.193 (it rewrites `enabledPlugins` / `pluginConfigs` in the
+  user, project and local scopes); run `/plugin install
+  code-harness@claude-code-harness` once per machine afterwards. Older Claude
+  Code: uninstall `claude-code-harness` and install the new id.
+  Steps: `docs/install.md` § Migrating.
+- **Namespaces change**: `/claude-code-harness:<skill>` → `/code-harness:<skill>`,
+  agents `code-harness:code-reviewer` / `code-harness:verifier`. Permission rules
+  such as `Skill(claude-code-harness:…)` must be renamed; `/harness-doctor` flags
+  leftovers.
+- **`autopilot`, `deliver` and `harness-init` are user-invoked only**
+  (`disable-model-invocation`, ADR-0015): "spusť autopilota" or "doruč mapu" no
+  longer starts a run — Claude answers with the command to type
+  (`/code-harness:deliver #<map>`).
+
+### Added
+
+- `scripts/check-consistency.sh`:
+  - a frontmatter lint for every skill and agent (python3 + PyYAML; required
+    in CI): the header must parse as YAML, `name` equals the directory and
+    matches the Agent Skills name rule, `description` ≤ 1024 characters, keys
+    are known Agent Skills / Claude Code fields, `disable-model-invocation`
+    only on ADR-0015's set, and the always-on skill descriptions fit
+    `LISTING_BUDGET` (7200 characters; 6849 at release);
+  - plugin name and marketplace checks: no reserved name form, the marketplace
+    entry matches `plugin.json`, the `renames` entry is kept (append-only), no
+    `CLAUDE.md` at the plugin root;
+  - `claude plugin validate --strict` on the marketplace, the plugin, `skills/`
+    and `agents/` when the `claude` CLI is on `PATH`;
+  - hooks.json commands must be `bash "${CLAUDE_PLUGIN_ROOT}/…"`.
+- CI (`.github/workflows/verify.yml`) installs PyYAML and runs
+  `claude plugin validate --strict` through `npx`, so a new platform rule
+  fails a PR instead of a user's install.
+- `harness-doctor`: §1b leftovers of the old plugin id and namespace, §1c
+  Claude Code older than 2.1.193, §3b Matt Pocock's `mattpocock-skills` plugin
+  enabled next to the harness (every shared skill loads twice); §8 accepts
+  `.claude/CLAUDE.md`.
+- `skills/deliver/SKILL.md` opens with an Invariants block (user-only start,
+  run-state files, stop/resume, exit codes, the human merges the final PR):
+  compaction re-attaches only a skill's first 5,000 tokens.
+- ADR-0014 (plugin renamed, marketplace kept), ADR-0015 (paid runners and the
+  bootstrap are user-invoked only).
+
+### Changed
+
+- `.claude-plugin/plugin.json` / `marketplace.json`: plugin `name`
+  `code-harness`, marketplace `renames` `{"claude-code-harness": "code-harness"}`.
+- `hooks/hooks.json`: every hook runs as `bash "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh"`
+  — quoted (the validator warned on all six unquoted placeholders; a space in the
+  plugin path split the command) and through `bash` (survives stripped exec
+  bits). Exec form (`args`) is deliberately not used: a Claude Code without it
+  would run a bare `bash` that reads the hook JSON as a script.
+- The contributor `CLAUDE.md` moved to `.claude/CLAUDE.md`: Claude Code never
+  loads a `CLAUDE.md` at a plugin root, and the validator warns about it.
+- Descriptions of `code-map`, `cost-discipline`, `openapi-sync`, `project-infra`
+  and `repo-map` cut to about 250 characters; `autopilot` and `deliver` lose
+  their trigger phrases. Always-on skill descriptions: ≈ 8,540 → 6,849
+  characters. `start-feature` and `next` hand `/deliver` to the user instead of
+  "calling" it.
+- `docs/pocock-sync-log.md`: survey @ `d81f3a1` (v1.3 content). "Vendored SHA"
+  values that were tree hashes (11 of 18) are now the commits that introduced
+  that content, with the tree kept as a checksum; corrected the `diagnose` (no
+  own additions), `grilling` (behaviour drift since `a4b2009`) and `to-prd` (two
+  undocumented local additions) rows; recorded upstream drift the earlier
+  surveys missed; `resolving-merge-conflicts` Frozen (removed upstream);
+  find-skills reviewed @ `18f96ea`, Loopkit @ `5ae033e`; the
+  `disable-model-invocation` question closed against the Claude Code docs. The
+  procedure now clones with `git clone --filter=blob:none` and records commit
+  SHAs. The `CONTEXT.md` → `GLOSSARY.md` rename is deferred to 0.8.0.
+- Hook messages, templates and docs say `code-harness`.
+
+### Fixed
+
+- `skills/project-infra/SKILL.md`: the frontmatter was not valid YAML (an
+  unquoted `: ` in the description). Claude Code still loaded it, but
+  `npx skills` skipped the skill (34 of 35 installed) and `skills-ref` rejected
+  it.
 
 ## [0.6.0] — 2026-09-29
 

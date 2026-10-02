@@ -1,4 +1,4 @@
-# claude-code-harness
+# code-harness
 
 Universal code-dev harness distributed as a Claude Code plugin. This context covers
 the vocabulary of the harness itself — how skills are sourced, guarded, verified,

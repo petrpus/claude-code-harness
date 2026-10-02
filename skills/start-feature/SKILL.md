@@ -83,10 +83,11 @@ skill. Default labels:
 
 ## After the skill
 
-Call `/deliver #<map>` to deliver the whole Map (one issue = one PR, in
-dependency order). To implement a single issue instead, call
-`/implement-issue <issue-number>`. Never more than one issue at a time on one
-branch — keep 1 issue = 1 PR.
+Hand over `/deliver #<map>` to deliver the whole Map (one issue = one PR, in
+dependency order): `/deliver` is user-invoked only (ADR-0015), so don't call it —
+tell the user to run `/code-harness:deliver #<map>` themselves. To implement a
+single issue instead, call `/implement-issue <issue-number>`. Never more than one
+issue at a time on one branch — keep 1 issue = 1 PR.
 
 ## Anti-patterns
 

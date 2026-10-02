@@ -1,6 +1,6 @@
 ---
 name: harness-doctor
-description: Sanity-check that a project is correctly set up for claude-code-harness. Finds leftover stale skills/hooks/agents that the plugin now provides, missing settings, and other config drift. Read-only — never modifies anything.
+description: Sanity-check that a project is correctly set up for the code-harness plugin. Finds stale local skills/hooks/agents the plugin now provides, leftovers of the old claude-code-harness name, missing settings and other config drift. Read-only.
 ---
 
 # Skill: /harness-doctor
@@ -14,6 +14,32 @@ Validates that the project's `.claude/` is consistent with the harness plugin.
 
 `${CLAUDE_PLUGIN_ROOT}/templates/project-settings.template.json` exists.
 If not: 🔴 — plugin isn't installed or env var isn't set.
+
+### 1b. Leftovers of the pre-0.7.0 plugin name
+
+0.7.0 renamed the plugin from `claude-code-harness` to `code-harness`; the
+marketplace is still `claude-code-harness` (ADR-0014). So the **old plugin id**
+is `claude-code-harness@claude-code-harness` and the new one is
+`code-harness@claude-code-harness` — only the part before `@` changed.
+
+- Read `enabledPlugins` in `~/.claude/settings.json`, `.claude/settings.json`
+  and `.claude/settings.local.json`. A key that starts with
+  `claude-code-harness@` → 🟠: "Settings still enable the pre-0.7.0 plugin id.
+  Claude Code ≥ 2.1.193 rewrites it automatically from the marketplace's
+  `renames` map; if the plugin then reports `not cached`, run
+  `/plugin install code-harness@claude-code-harness` once." (Managed settings
+  can't be rewritten — tell the user to ask their admin.)
+- `grep -rn 'claude-code-harness:' .claude/ CLAUDE.md` (permission rules such
+  as `Skill(claude-code-harness:deliver)`, docs, scripts) → 🟡 per hit: "Uses
+  the old namespace; components are now `code-harness:<name>`."
+
+### 1c. Claude Code version
+
+Run `claude --version`. Older than **2.1.193** → 🟡: "This Claude Code can't
+follow the marketplace `renames` map, so the 0.7.0 rename shows up as
+`Plugin "claude-code-harness" not found in marketplace`. Upgrade Claude Code, or
+uninstall the old id and install `code-harness@claude-code-harness`." Skip
+silently if `claude` isn't on `PATH`.
 
 ### 2. `.claude/settings.json` present
 
@@ -33,6 +59,15 @@ Check `.claude/skills/` for any of these (each shadows the plugin version):
   `repo-map`, `code-map`
 
 Each match → 🟠. Suggest `rm -rf .claude/skills/<name>/`.
+
+### 3b. Pocock's plugin installed alongside
+
+If any `enabledPlugins` key (the three settings files of §1b) starts with
+`mattpocock-skills@` → 🟡: "Matt Pocock's own plugin is enabled next to the
+harness, so `grill-me`, `tdd`, `triage`, … load twice (`mattpocock-skills:*` and
+`code-harness:*`) under diverging texts and names (`to-tickets` vs `to-issues`,
+`GLOSSARY.md` vs `CONTEXT.md`). The harness vendors the subset it relies on —
+disable one of the two." Never edit the settings.
 
 ### 4. Stale local agents
 
@@ -113,8 +148,8 @@ or remove the reference."
 
 ### 8. CLAUDE.md presence (soft)
 
-If no `CLAUDE.md` in repo root → 🟡: "Plugin's code-reviewer benefits from
-a project rule file."
+If neither `CLAUDE.md` nor `.claude/CLAUDE.md` exists → 🟡: "Plugin's
+code-reviewer benefits from a project rule file."
 
 ### 9. Plaintext forge credentials
 
@@ -154,7 +189,7 @@ Each check is read-only; report, never fix.
 # Harness doctor — <project-name>
 
 ## 🔴 Errors (n)
-- Plugin not installed (no CLAUDE_PLUGIN_ROOT). Run `/plugin install claude-code-harness`.
+- Plugin not installed (no CLAUDE_PLUGIN_ROOT). Run `/plugin install code-harness@claude-code-harness`.
 
 ## 🟠 Issues (n)
 - `.claude/skills/commit-agent/` exists locally; plugin provides it.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# scripts/check-consistency.sh — self-verify for the claude-code-harness repo.
+# scripts/check-consistency.sh — self-verify for the code-harness plugin repo
+# (repository and marketplace: claude-code-harness).
 #
 # Run from the repo root (or anywhere inside it). Non-zero exit on any failure.
 # Checks structural invariants that are easy to break during a vendor sync or a
@@ -108,6 +109,38 @@ CV="$(grep -m1 -oE '## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md 2>/dev/null | gr
   || note "plugin.json version ($PV) != CHANGELOG top ($CV)"
 
 # ---------------------------------------------------------------------------
+# ADR-0014: Claude Code reserves plugin names that pass as Anthropic's own
+# (claude-*, anthropic-*, cc-plugin-*, or `claude` as a word). The plugin was
+# renamed through the marketplace's append-only `renames` map; this keeps the map
+# and the names in step, then runs Claude Code's own validator when it's here.
+section "plugin name, renames map, claude plugin validate --strict"
+PNAME="$(jq -r '.name' .claude-plugin/plugin.json 2>/dev/null || echo '?')"
+if [[ "$PNAME" =~ (^|-)(claude|anthropics?)(-|$) || "$PNAME" =~ ^cc-plugin- ]]; then
+  note "plugin name '$PNAME' is reserved or reads as Anthropic's own (ADR-0014)"
+else
+  ok "plugin name '$PNAME' avoids the reserved forms"
+fi
+jq -e --arg n "$PNAME" '.plugins | length == 1 and .[0].name == $n' .claude-plugin/marketplace.json >/dev/null 2>&1 \
+  && ok "marketplace entry is named '$PNAME'" || note "marketplace plugins[0].name != plugin.json name '$PNAME'"
+jq -e --arg n "$PNAME" '.renames["claude-code-harness"] == $n' .claude-plugin/marketplace.json >/dev/null 2>&1 \
+  && ok "renames maps the pre-0.7.0 name claude-code-harness -> $PNAME (append-only)" \
+  || note "marketplace renames must keep \"claude-code-harness\": \"$PNAME\" (ADR-0014; never delete a renames entry)"
+[[ -f CLAUDE.md ]] && note "CLAUDE.md is back at the plugin root — keep contributor context in .claude/CLAUDE.md (ADR-0014)" \
+  || ok "no CLAUDE.md at the plugin root"
+if command -v claude >/dev/null 2>&1 && claude plugin validate --help >/dev/null 2>&1; then
+  for target in . .claude-plugin/plugin.json skills agents; do
+    if out="$(claude plugin validate "$target" --strict 2>&1)"; then
+      ok "claude plugin validate --strict $target"
+    else
+      note "claude plugin validate --strict $target failed:"
+      printf '%s\n' "$out" | sed 's/^/      /'
+    fi
+  done
+else
+  echo "  (claude CLI with 'plugin validate' not on PATH — skipping; CI runs it through npx)"
+fi
+
+# ---------------------------------------------------------------------------
 section "every skill has SKILL.md with frontmatter name == dir"
 for d in skills/*/; do
   name="$(basename "$d")"
@@ -121,10 +154,20 @@ done
 ok "walked $(find skills -maxdepth 1 -type d | tail -n +2 | wc -l | tr -d ' ') skills"
 
 # ---------------------------------------------------------------------------
-section "every hooks.json command resolves to an existing file"
+# Shell form, quoted placeholder, run through bash (docs/architecture.md § Plugin
+# layout): an unquoted ${CLAUDE_PLUGIN_ROOT} splits on a space in the plugin path
+# and fails `claude plugin validate --strict`; a bare script path stops working
+# when a repackager strips the exec bit.
+section "every hooks.json command is 'bash \"\${CLAUDE_PLUGIN_ROOT}/…\"' and resolves"
 if command -v jq >/dev/null 2>&1; then
   while IFS= read -r cmd; do
-    rel="${cmd/\$\{CLAUDE_PLUGIN_ROOT\}\//}"
+    # shellcheck disable=SC2016 — the placeholder is matched literally.
+    if [[ "$cmd" != 'bash "${CLAUDE_PLUGIN_ROOT}/'*'"' ]]; then
+      note "hooks.json command is not in the bash \"\${CLAUDE_PLUGIN_ROOT}/…\" form: $cmd"
+      continue
+    fi
+    # shellcheck disable=SC2016
+    rel="${cmd#'bash "${CLAUDE_PLUGIN_ROOT}/'}"; rel="${rel%\"}"
     [[ -f "$rel" ]] && ok "$rel" || note "hooks.json references missing $rel"
   done < <(jq -r '.hooks[][]?.hooks[]?.command' hooks/hooks.json 2>/dev/null | sort -u)
 fi
@@ -137,6 +180,107 @@ for a in agents/*.md; do
   fmname="$(awk '/^name:/{sub(/^name:[[:space:]]*/,"");print;exit}' "$a")"
   [[ "$fmname" == "$base" ]] && ok "$base" || note "$a: name '$fmname' != filename"
 done
+
+# ---------------------------------------------------------------------------
+# Claude Code still loads a SKILL.md whose header isn't valid YAML, so nothing
+# at runtime notices — but `npx skills`, skills-ref and claude.ai uploads skip
+# or reject it (project-infra shipped that way until 0.7.0). Parse the header
+# for real, keep keys to known fields (typos are silent otherwise), and budget
+# what Claude sees in EVERY session: the descriptions of skills without
+# disable-model-invocation (ADR-0015). Needs python3 + PyYAML; CI installs it.
+section "skill + agent frontmatter (YAML, names, keys, listing budget)"
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+  python3 - <<'PY' || FAIL=1
+import glob, re, sys, yaml
+
+# Agent Skills spec fields, then the Claude Code-only ones (code.claude.com/docs/en/skills).
+SPEC = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+CLAUDE_SKILL = {"when_to_use", "argument-hint", "arguments", "disable-model-invocation",
+                "user-invocable", "disallowed-tools", "model", "effort", "context", "agent",
+                "background", "hooks", "paths", "shell"}
+AGENT = {"name", "description", "tools", "disallowedTools", "model", "permissionMode",
+         "maxTurns", "skills", "mcpServers", "hooks", "memory", "background", "omitClaudeMd",
+         "effort", "isolation", "color", "initialPrompt", "experimental"}
+# ADR-0015: the user-invoked-only set. zoom-out keeps its upstream flag. A skill
+# another skill composes must never be added here — the flag blocks that call.
+USER_ONLY = {"autopilot", "deliver", "harness-init", "zoom-out"}
+# Characters of description (+ when_to_use) in the always-on skill listing.
+# 6849 at 0.7.0. Raise it on purpose, never just to get green.
+LISTING_BUDGET = 7200
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+failed = False
+def bad(msg):
+    global failed
+    failed = True
+    print(f"  ✗ {msg}")
+
+def header(path):
+    text = open(path, encoding="utf-8").read()
+    m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None, "no YAML frontmatter"
+    try:
+        data = yaml.safe_load(m.group(1))
+    except yaml.YAMLError as e:
+        return None, "frontmatter is not valid YAML (" + str(e).splitlines()[0] + ") — quote values containing ': ' or use a '>-' block"
+    if not isinstance(data, dict):
+        return None, "frontmatter is not a YAML mapping"
+    return data, None
+
+skills = sorted(glob.glob("skills/*/SKILL.md"))
+visible = 0
+for path in skills:
+    d = path.split("/")[1]
+    data, err = header(path)
+    if err:
+        bad(f"{path}: {err}")
+        continue
+    name, desc = data.get("name"), data.get("description")
+    if name != d:
+        bad(f"{path}: name {name!r} != directory {d!r}")
+    if not isinstance(name, str) or not NAME_RE.match(name) or len(name) > 64:
+        bad(f"{path}: name {name!r} is not 1-64 lowercase letters, digits and single hyphens")
+    if not isinstance(desc, str) or not desc.strip():
+        bad(f"{path}: missing description")
+        continue
+    if len(desc) > 1024:
+        bad(f"{path}: description is {len(desc)} chars (Agent Skills max 1024)")
+    unknown = sorted(set(data) - SPEC - CLAUDE_SKILL)
+    if unknown:
+        bad(f"{path}: unknown frontmatter key(s) {unknown}")
+    dmi = data.get("disable-model-invocation") is True
+    if dmi and d not in USER_ONLY:
+        bad(f"{path}: disable-model-invocation outside ADR-0015's user-only set {sorted(USER_ONLY)}")
+    if d in USER_ONLY and not dmi:
+        bad(f"{path}: must carry disable-model-invocation: true (ADR-0015)")
+    if not dmi:
+        visible += len(desc) + len(str(data.get("when_to_use") or ""))
+print(f"  ✓ parsed {len(skills)} skill headers")
+if visible > LISTING_BUDGET:
+    bad(f"always-on skill descriptions are {visible} chars > LISTING_BUDGET {LISTING_BUDGET} — trim, or make a runner user-only (ADR-0015)")
+else:
+    print(f"  ✓ always-on skill descriptions: {visible} / {LISTING_BUDGET} chars")
+
+agents = sorted(glob.glob("agents/*.md"))
+for path in agents:
+    data, err = header(path)
+    if err:
+        bad(f"{path}: {err}")
+        continue
+    unknown = sorted(set(data) - AGENT)
+    if unknown:
+        bad(f"{path}: unknown agent frontmatter key(s) {unknown}")
+    if not isinstance(data.get("description"), str) or not data["description"].strip():
+        bad(f"{path}: missing description")
+print(f"  ✓ parsed {len(agents)} agent headers")
+sys.exit(1 if failed else 0)
+PY
+elif [[ "${CI:-}" == "true" ]]; then
+  note "python3 + PyYAML are required in CI for the frontmatter lint"
+else
+  echo "  (python3/PyYAML not available — skipping frontmatter lint)"
+fi
 
 # ---------------------------------------------------------------------------
 section "sync-log rows <-> vendored dirs (both directions)"
@@ -246,9 +390,9 @@ ii_has 'git rev-parse --abbrev-ref HEAD' 'branch assertion around the review'
 ii_has 'last-verify-status' 'verify-status assertion around the review'
 ii_has 'gh pr create --base' 'gh pr create --base'
 ii_has 'needs-triage' 'out-of-scope findings filed as needs-triage issues'
-grep -q 'setup-matt-pocock-skills' CLAUDE.md && grep -qi 'known upstream mismatch' CLAUDE.md \
-  && ok "CLAUDE.md lists triage's /setup-matt-pocock-skills known upstream mismatch" \
-  || note "CLAUDE.md lacks the triage /setup-matt-pocock-skills known-mismatch note"
+grep -q 'setup-matt-pocock-skills' .claude/CLAUDE.md && grep -qi 'known upstream mismatch' .claude/CLAUDE.md \
+  && ok ".claude/CLAUDE.md lists triage's /setup-matt-pocock-skills known upstream mismatch" \
+  || note ".claude/CLAUDE.md lacks the triage /setup-matt-pocock-skills known-mismatch note"
 
 # ---------------------------------------------------------------------------
 section "harness-init bootstraps the workflow labels"
@@ -314,18 +458,18 @@ grep -qi 'manual' <(sed -n '/Stop gate/,$p' skills/autopilot/SKILL.md) \
 section "own-skill inventories list every non-vendored skill"
 SYNC="docs/pocock-sync-log.md"
 README_OWN="$(grep -E '^\| \*\*Skills \(own' README.md || true)"
-CLAUDE_OWN="$(awk '/^3\. \*\*Own\*\*/{b=1} b&&/Plus agents/{exit} b{print}' CLAUDE.md)"
+CLAUDE_OWN="$(awk '/^3\. \*\*Own\*\*/{b=1} b&&/Plus agents/{exit} b{print}' .claude/CLAUDE.md)"
 DOCTOR_OWN="$(awk '/^- Own:/{b=1} b&&/^$/{exit} b{print}' skills/harness-doctor/SKILL.md)"
 for d in skills/*/; do
   n="$(basename "$d")"
   grep -qE "^\| ${n} \|" "$SYNC" && continue   # vendored (Pocock or Vercel table)
-  for pair in "README:$README_OWN" "CLAUDE.md:$CLAUDE_OWN" "harness-doctor:$DOCTOR_OWN"; do
+  for pair in "README:$README_OWN" ".claude/CLAUDE.md:$CLAUDE_OWN" "harness-doctor:$DOCTOR_OWN"; do
     name="${pair%%:*}"; text="${pair#*:}"
     grep -qF -- "\`$n\`" <<<"$text" && ok "$name lists own skill $n" || note "$name own-skill list omits $n"
   done
 done
-grep -qF 'integration/<slug>' CLAUDE.md && ok "CLAUDE.md branch model covers integration branches" \
-  || note "CLAUDE.md branch model does not cover integration/<slug> branches"
+grep -qF 'integration/<slug>' .claude/CLAUDE.md && ok ".claude/CLAUDE.md branch model covers integration branches" \
+  || note ".claude/CLAUDE.md branch model does not cover integration/<slug> branches"
 
 # ---------------------------------------------------------------------------
 section "user guide pages: version + Deliver path + no external assets"

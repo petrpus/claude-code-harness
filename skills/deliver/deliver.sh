@@ -1313,7 +1313,7 @@ write_pr_body() {
       done < "$dir/follow-ups.pr.list"
     fi
     echo
-    echo "Delivered by \`/deliver\` (claude-code-harness) — run \`$RUN_ID\`."
+    echo "Delivered by \`/deliver\` (code-harness) — run \`$RUN_ID\`."
   } > "$dir/pr-body.md"
 }
 
