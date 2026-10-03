@@ -47,12 +47,16 @@ ADR-0014, ADR-0015.
     and `agents/` when the `claude` CLI on `PATH` is ≥ 2.1.233 — older CLIs
     fail `--strict` on a clean tree, so they skip with a note;
   - hooks.json commands must be `bash "${CLAUDE_PLUGIN_ROOT}/…"`, and the CI
-    workflow must keep its `plugin validate --strict` step.
+    workflow must keep its `scripts/verify.sh` and `plugin validate --strict`
+    steps — checked on the lines a step runs, since the header comment and the
+    steps' `name:` lines mention both.
 - `scripts/test-consistency-lint.sh` (run by `verify.sh`): breaks a copy of the
   repo on purpose and asserts every new check reports it; asserts a two-hop
   `renames` chain, a second marketplace plugin and an old `claude` CLI stay
-  green; runs every hooks.json command from a plugin path with a space and no
-  exec bits.
+  green; pins both sides of the CLI gate (2.1.232 skips, 2.1.233 and 2.1.1000
+  reach the validator); runs every hooks.json command from a plugin path with a
+  space and no exec bits. Its fixtures fail loudly instead of testing an
+  unmodified tree.
 - CI (`.github/workflows/verify.yml`) installs PyYAML, runs
   `claude plugin validate --strict` through `npx` — so a new platform rule
   fails a PR instead of a user's install — and drops the token to

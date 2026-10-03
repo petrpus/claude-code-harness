@@ -4,12 +4,13 @@
 #
 # verify.sh only ever runs scripts/check-consistency.sh on a clean tree, so the
 # new checks — the skill/agent frontmatter lint, the plugin-name and renames-chain
-# checks, the hooks.json command form, the CI validate step and the claude-CLI
+# checks, the hooks.json command form, the CI workflow lints and the claude-CLI
 # version gate — would pass even if they could never fail. This copies the repo,
 # breaks the copy on purpose and asserts each break is reported; and it asserts
 # the legitimate variants stay green: a two-hop renames chain (ADR-0014 is
 # append-only), a second plugin in the marketplace, and a claude CLI too old for
-# `plugin validate --strict` (skipped, not failed).
+# `plugin validate --strict` (skipped, not failed). Both sides of the version
+# gate are pinned: 2.1.232 skips, 2.1.233 and 2.1.1000 reach the validator.
 #
 # It also runs every hooks.json command the way Claude Code runs a shell-form
 # hook (`sh -c`), from a plugin path containing a space and with the exec bits
@@ -32,16 +33,18 @@ fi
 HAVE_YAML=0
 command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1 && HAVE_YAML=1
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d)" || exit 1
+[[ -n "$WORK" && -d "$WORK" ]] || { echo "  ✗ mktemp -d gave no directory"; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
-# A Claude Code too old for `plugin validate --strict`: it answers --version and
-# fails anything else, so a version gate that lets it through turns the run red.
+# A stand-in `claude`: --version reports $SHIM_CLAUDE_VERSION, anything else
+# fails — so a gate that lets an old CLI through turns the run red, and a gate
+# that lets a new one through is seen to reach the validator.
 SHIM="$WORK/shim"
 mkdir -p "$SHIM"
 cat > "$SHIM/claude" <<'SH'
 #!/bin/sh
-[ "$1" = "--version" ] && { echo "2.1.100 (Claude Code)"; exit 0; }
+[ "$1" = "--version" ] && { echo "${SHIM_CLAUDE_VERSION:-2.1.232} (Claude Code)"; exit 0; }
 echo "error: unknown option '--strict'" >&2
 exit 1
 SH
@@ -54,9 +57,9 @@ copy_repo() {
   git -C "$1" init -q
 }
 
-# run_check <repo> <out> — check-consistency with the old claude first on PATH.
+# run_check <repo> <out> <claude version> — check-consistency with the shim first on PATH.
 run_check() {
-  (cd "$1" && PATH="$SHIM:$PATH" bash scripts/check-consistency.sh) > "$2" 2>&1
+  (cd "$1" && SHIM_CLAUDE_VERSION="$3" PATH="$SHIM:$PATH" bash scripts/check-consistency.sh) > "$2" 2>&1
 }
 
 # expect <out> <fixed string> <what>
@@ -64,7 +67,7 @@ expect() {
   grep -qF -- "$2" "$1" && ok "reported: $3" || note "not reported: $3 (looked for: $2)"
 }
 
-# json_set <file> <jq filter>
+# json_set <file> <jq filter> — fails when jq does.
 json_set() {
   local tmp="$1.tmp"
   jq "$2" "$1" > "$tmp" && mv "$tmp" "$1"
@@ -78,29 +81,40 @@ skill_fixture() {
 }
 
 # ---------------------------------------------------------------------------
-# Legitimate variants stay green.
+# Legitimate variants stay green; both sides of the CLI version gate.
 GOOD="$WORK/good"
 copy_repo "$GOOD"
-(
-  cd "$GOOD" || exit 1
+if ! (
+  set -e
+  cd "$GOOD"
   json_set .claude-plugin/marketplace.json \
     '.renames = {"claude-code-harness": "code-harness-interim", "code-harness-interim": .plugins[0].name}
      | .plugins += [{"name": "design-harness", "source": "./design", "description": "fixture"}]'
-)
-if run_check "$GOOD" "$WORK/good.out"; then
+  jq -e '.renames["code-harness-interim"] and (.plugins | length == 2)' .claude-plugin/marketplace.json >/dev/null
+); then
+  note "the legitimate-variant fixture did not apply — the checks below would test an unmodified tree"
+fi
+if run_check "$GOOD" "$WORK/good.out" 2.1.232; then
   ok "a two-hop renames chain and a second marketplace plugin pass"
 else
   note "check-consistency failed on legitimate variants:"
   grep -F '✗' "$WORK/good.out" | sed 's/^/    /'
 fi
-expect "$WORK/good.out" "claude 2.1.100 is older than" "an old claude CLI skips the validator instead of failing"
+expect "$WORK/good.out" "claude 2.1.232 is older than 2.1.233" "claude 2.1.232 skips the validator instead of failing"
+for v in 2.1.233 2.1.1000; do
+  run_check "$GOOD" "$WORK/gate-$v.out" "$v"
+  expect "$WORK/gate-$v.out" "claude plugin validate --strict . failed (claude $v)" "claude $v reaches the validator"
+done
+run_check "$GOOD" "$WORK/gate-garbled.out" "unknown"
+expect "$WORK/gate-garbled.out" "claude --version printed no version" "an unreadable claude --version skips, saying why"
 
 # ---------------------------------------------------------------------------
 # Every break is reported.
 BAD="$WORK/bad"
 copy_repo "$BAD"
-(
-  cd "$BAD" || exit 1
+if ! (
+  set -e
+  cd "$BAD"
   skill_fixture zz-bad-yaml   'name: zz-bad-yaml' 'description: Does things. Triggers: "x", "y".'
   skill_fixture zz-wrong-name 'name: other-name' 'description: Fixture.'
   skill_fixture zz-typo-key   'name: zz-typo-key' 'description: Fixture.' 'allowed_tools: Bash'
@@ -113,9 +127,16 @@ copy_repo "$BAD"
   json_set .claude-plugin/marketplace.json 'del(.renames)'
   json_set .claude-plugin/plugin.json '.name = "claude-tools"'
   : > CLAUDE.md
-  sed -i.bak '/plugin validate/d' .github/workflows/verify.yml && rm -f .github/workflows/verify.yml.bak
-)
-if run_check "$BAD" "$WORK/bad.out"; then
+  # Drop only what the steps run: the header comment and the steps' name: lines
+  # still mention both commands, and must not keep the lints green.
+  sed -i.bak -e '/npx .*plugin validate/d' -e '/run: bash scripts\/verify\.sh/d' .github/workflows/verify.yml
+  rm -f .github/workflows/verify.yml.bak
+  grep -q 'plugin validate' .github/workflows/verify.yml   # the decoys are still there
+  ! grep -q 'npx .*plugin validate' .github/workflows/verify.yml
+); then
+  note "the broken-tree fixture did not apply — the checks below would test an unmodified tree"
+fi
+if run_check "$BAD" "$WORK/bad.out" 2.1.232; then
   note "check-consistency passed on a deliberately broken tree"
 else
   ok "check-consistency fails on the broken tree"
@@ -125,7 +146,8 @@ expect "$WORK/bad.out" "marketplace has no plugins[] entry named 'claude-tools'"
 expect "$WORK/bad.out" "renames chain from claude-code-harness ends at" "a deleted renames entry"
 expect "$WORK/bad.out" "CLAUDE.md is back at the plugin root" "a CLAUDE.md at the plugin root"
 expect "$WORK/bad.out" "hooks.json command is not in the bash" "an unquoted hooks.json command"
-expect "$WORK/bad.out" "no longer runs claude plugin validate --strict" "the CI validate step removed"
+expect "$WORK/bad.out" "no longer runs claude plugin validate --strict" "the CI validate step removed (comment and name: left behind)"
+expect "$WORK/bad.out" "does not invoke scripts/verify.sh" "the CI verify step removed (comment and name: left behind)"
 if [[ "$HAVE_YAML" -eq 1 ]]; then
   expect "$WORK/bad.out" "skills/zz-bad-yaml/SKILL.md: frontmatter is not valid YAML" "invalid YAML frontmatter"
   expect "$WORK/bad.out" "name 'other-name' != directory 'zz-wrong-name'" "name != directory"
@@ -151,7 +173,10 @@ MAIN_REPO="$WORK/mainrepo"
 git init -q "$MAIN_REPO"
 git -C "$MAIN_REPO" symbolic-ref HEAD refs/heads/main
 CWD_JSON="$(printf '%s' "$MAIN_REPO" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+HOOK_RUNS=0
 while IFS= read -r cmd; do
+  [[ -z "$cmd" ]] && continue
+  HOOK_RUNS=$((HOOK_RUNS + 1))
   name="${cmd%\"}"; name="${name##*/}"
   case "$name" in
     pre-bash.sh) input="{\"cwd\":\"$CWD_JSON\",\"tool_input\":{\"command\":\"git push\"}}"; want=2 ;;
@@ -163,6 +188,7 @@ while IFS= read -r cmd; do
   [[ "$got" == "$want" ]] && ok "$name runs from a spaced, non-exec plugin path (exit $got)" \
     || note "$name from a spaced, non-exec plugin path: expected exit $want, got $got"
 done < <(jq -r '.hooks[][]?.hooks[]?.command' hooks/hooks.json)
+[[ "$HOOK_RUNS" -gt 0 ]] || note "hooks/hooks.json yielded no hook commands — nothing was run"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then echo "test-consistency-lint: PASS"; else echo "test-consistency-lint: FAIL"; fi

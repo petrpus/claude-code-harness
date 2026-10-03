@@ -29,9 +29,10 @@ Another public plugin also ships under the name `claude-code-harness`.
    **append-only history**: a future rename adds an entry, it never edits this
    one.
 4. **`claude plugin validate --strict` is part of the harness's own verify.**
-   `scripts/check-consistency.sh` runs it when the `claude` CLI is on `PATH`;
-   CI runs it through `npx`, so a new platform rule fails a PR instead of a
-   user's install.
+   `scripts/check-consistency.sh` runs it when the `claude` CLI on `PATH` is
+   2.1.233 or newer — older CLIs fail `--strict` on a clean tree, so they skip
+   with a note; CI runs it through `npx`, so a new platform rule fails a PR
+   instead of a user's install.
 5. **The contributor `CLAUDE.md` moves to `.claude/CLAUDE.md`.** The plugin root
    is the repo root (`"source": "./"`); Claude Code never loads a `CLAUDE.md` at
    a plugin root as context and the validator warns about one, which `--strict`

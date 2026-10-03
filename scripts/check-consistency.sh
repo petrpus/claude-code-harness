@@ -158,8 +158,10 @@ fi
 # before 2.1.193, `No manifest found` for skills/agents before 2.1.233.
 MIN_VALIDATE_CLI=2.1.233
 CLI_VER=""
-if command -v claude >/dev/null 2>&1 && [[ "$(claude --version 2>/dev/null)" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-  CLI_VER="${BASH_REMATCH[1]}"
+HAVE_CLI=0
+if command -v claude >/dev/null 2>&1; then
+  HAVE_CLI=1
+  [[ "$(claude --version 2>/dev/null)" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] && CLI_VER="${BASH_REMATCH[1]}"
 fi
 if [[ -n "$CLI_VER" ]] && version_ge "$CLI_VER" "$MIN_VALIDATE_CLI"; then
   for target in . .claude-plugin/plugin.json skills agents; do
@@ -172,6 +174,8 @@ if [[ -n "$CLI_VER" ]] && version_ge "$CLI_VER" "$MIN_VALIDATE_CLI"; then
   done
 elif [[ -n "$CLI_VER" ]]; then
   echo "  (claude $CLI_VER is older than $MIN_VALIDATE_CLI — skipping the validator; CI runs it through npx)"
+elif [[ "$HAVE_CLI" -eq 1 ]]; then
+  echo "  (claude --version printed no version — skipping the validator; CI runs it through npx)"
 else
   echo "  (claude CLI not on PATH — skipping the validator; CI runs it through npx)"
 fi
@@ -359,10 +363,13 @@ section "harness CI workflow exists and invokes scripts/verify.sh"
 CI_WORKFLOW=".github/workflows/verify.yml"
 if [[ -f "$CI_WORKFLOW" ]]; then
   ok "$CI_WORKFLOW exists"
-  grep -q 'scripts/verify\.sh' "$CI_WORKFLOW" \
+  # Only what a step runs counts: the header comment and the steps' `name:`
+  # lines mention both commands, so a bare grep stays green with a step deleted.
+  CI_RUN_LINES="$(grep -vE '^[[:space:]]*(#|-?[[:space:]]*name:)' "$CI_WORKFLOW")"
+  grep -q 'scripts/verify\.sh' <<<"$CI_RUN_LINES" \
     && ok "$CI_WORKFLOW invokes scripts/verify.sh" \
     || note "$CI_WORKFLOW does not invoke scripts/verify.sh"
-  grep -qE 'plugin validate .*--strict' "$CI_WORKFLOW" \
+  grep -qE 'plugin validate .*--strict' <<<"$CI_RUN_LINES" \
     && ok "$CI_WORKFLOW runs claude plugin validate --strict (ADR-0014)" \
     || note "$CI_WORKFLOW no longer runs claude plugin validate --strict (ADR-0014)"
 else
