@@ -53,8 +53,8 @@ ADR-0014, ADR-0015.
 - `scripts/test-consistency-lint.sh` (run by `verify.sh`): breaks a copy of the
   repo on purpose and asserts every new check reports it; asserts a two-hop
   `renames` chain, a second marketplace plugin and an old `claude` CLI stay
-  green; pins both sides of the CLI gate (2.1.232 skips, 2.1.233 and 2.1.1000
-  reach the validator); runs every hooks.json command from a plugin path with a
+  green; pins both sides of the CLI gate (2.1.232 skips; 2.1.233, 2.1.1000,
+  2.2.0 and 3.0.0 reach the validator); runs every hooks.json command from a plugin path with a
   space and no exec bits. Its fixtures fail loudly instead of testing an
   unmodified tree.
 - CI (`.github/workflows/verify.yml`) installs PyYAML, runs

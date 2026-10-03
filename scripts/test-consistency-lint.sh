@@ -10,7 +10,8 @@
 # the legitimate variants stay green: a two-hop renames chain (ADR-0014 is
 # append-only), a second plugin in the marketplace, and a claude CLI too old for
 # `plugin validate --strict` (skipped, not failed). Both sides of the version
-# gate are pinned: 2.1.232 skips, 2.1.233 and 2.1.1000 reach the validator.
+# gate are pinned: 2.1.232 skips; 2.1.233, 2.1.1000, 2.2.0 and 3.0.0 reach the
+# validator.
 #
 # It also runs every hooks.json command the way Claude Code runs a shell-form
 # hook (`sh -c`), from a plugin path containing a space and with the exec bits
@@ -82,18 +83,21 @@ skill_fixture() {
 
 # ---------------------------------------------------------------------------
 # Legitimate variants stay green; both sides of the CLI version gate.
+# Fixture subshells run as plain statements, their status read on the next
+# line: bash ignores `set -e` inside a subshell that is an `if`/`!`/`||`
+# condition, which would let a failed `cd` run the fixture in the checkout.
+# The `|| exit 1` guards stay explicit for the same reason.
 GOOD="$WORK/good"
 copy_repo "$GOOD"
-if ! (
+(
   set -e
-  cd "$GOOD"
+  cd "$GOOD" || exit 1
   json_set .claude-plugin/marketplace.json \
     '.renames = {"claude-code-harness": "code-harness-interim", "code-harness-interim": .plugins[0].name}
-     | .plugins += [{"name": "design-harness", "source": "./design", "description": "fixture"}]'
-  jq -e '.renames["code-harness-interim"] and (.plugins | length == 2)' .claude-plugin/marketplace.json >/dev/null
-); then
-  note "the legitimate-variant fixture did not apply — the checks below would test an unmodified tree"
-fi
+     | .plugins += [{"name": "design-harness", "source": "./design", "description": "fixture"}]' || exit 1
+  jq -e '.renames["code-harness-interim"] and (.plugins | length == 2)' .claude-plugin/marketplace.json >/dev/null || exit 1
+)
+[[ $? -eq 0 ]] || note "the legitimate-variant fixture did not apply — the checks below would test an unmodified tree"
 if run_check "$GOOD" "$WORK/good.out" 2.1.232; then
   ok "a two-hop renames chain and a second marketplace plugin pass"
 else
@@ -101,7 +105,7 @@ else
   grep -F '✗' "$WORK/good.out" | sed 's/^/    /'
 fi
 expect "$WORK/good.out" "claude 2.1.232 is older than 2.1.233" "claude 2.1.232 skips the validator instead of failing"
-for v in 2.1.233 2.1.1000; do
+for v in 2.1.233 2.1.1000 2.2.0 3.0.0; do
   run_check "$GOOD" "$WORK/gate-$v.out" "$v"
   expect "$WORK/gate-$v.out" "claude plugin validate --strict . failed (claude $v)" "claude $v reaches the validator"
 done
@@ -112,9 +116,9 @@ expect "$WORK/gate-garbled.out" "claude --version printed no version" "an unread
 # Every break is reported.
 BAD="$WORK/bad"
 copy_repo "$BAD"
-if ! (
+(
   set -e
-  cd "$BAD"
+  cd "$BAD" || exit 1
   skill_fixture zz-bad-yaml   'name: zz-bad-yaml' 'description: Does things. Triggers: "x", "y".'
   skill_fixture zz-wrong-name 'name: other-name' 'description: Fixture.'
   skill_fixture zz-typo-key   'name: zz-typo-key' 'description: Fixture.' 'allowed_tools: Bash'
@@ -131,11 +135,11 @@ if ! (
   # still mention both commands, and must not keep the lints green.
   sed -i.bak -e '/npx .*plugin validate/d' -e '/run: bash scripts\/verify\.sh/d' .github/workflows/verify.yml
   rm -f .github/workflows/verify.yml.bak
-  grep -q 'plugin validate' .github/workflows/verify.yml   # the decoys are still there
-  ! grep -q 'npx .*plugin validate' .github/workflows/verify.yml
-); then
-  note "the broken-tree fixture did not apply — the checks below would test an unmodified tree"
-fi
+  grep -q 'plugin validate' .github/workflows/verify.yml || exit 1   # the decoys are still there
+  if grep -q 'npx .*plugin validate' .github/workflows/verify.yml; then exit 1; fi
+  [[ -f CLAUDE.md && -d skills/zz-bad-yaml ]] || exit 1
+)
+[[ $? -eq 0 ]] || note "the broken-tree fixture did not apply — the checks below would test an unmodified tree"
 if run_check "$BAD" "$WORK/bad.out" 2.1.232; then
   note "check-consistency passed on a deliberately broken tree"
 else
