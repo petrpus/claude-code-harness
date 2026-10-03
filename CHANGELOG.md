@@ -40,18 +40,31 @@ ADR-0014, ADR-0015.
     only on ADR-0015's set, and the always-on skill descriptions fit
     `LISTING_BUDGET` (7200 characters; 6849 at release);
   - plugin name and marketplace checks: no reserved name form, the marketplace
-    entry matches `plugin.json`, the `renames` entry is kept (append-only), no
+    lists `plugin.json`'s name, the `renames` chain from `claude-code-harness`
+    resolves to the current name (append-only: a later rename adds a hop), no
     `CLAUDE.md` at the plugin root;
   - `claude plugin validate --strict` on the marketplace, the plugin, `skills/`
-    and `agents/` when the `claude` CLI is on `PATH`;
-  - hooks.json commands must be `bash "${CLAUDE_PLUGIN_ROOT}/…"`.
-- CI (`.github/workflows/verify.yml`) installs PyYAML and runs
-  `claude plugin validate --strict` through `npx`, so a new platform rule
-  fails a PR instead of a user's install.
+    and `agents/` when the `claude` CLI on `PATH` is ≥ 2.1.233 — older CLIs
+    fail `--strict` on a clean tree, so they skip with a note;
+  - hooks.json commands must be `bash "${CLAUDE_PLUGIN_ROOT}/…"`, and the CI
+    workflow must keep its `plugin validate --strict` step.
+- `scripts/test-consistency-lint.sh` (run by `verify.sh`): breaks a copy of the
+  repo on purpose and asserts every new check reports it; asserts a two-hop
+  `renames` chain, a second marketplace plugin and an old `claude` CLI stay
+  green; runs every hooks.json command from a plugin path with a space and no
+  exec bits.
+- CI (`.github/workflows/verify.yml`) installs PyYAML, runs
+  `claude plugin validate --strict` through `npx` — so a new platform rule
+  fails a PR instead of a user's install — and drops the token to
+  `permissions: contents: read`.
+- `CONTEXT.md`: plugin id, renames map, user-invoked-only skill, listing
+  budget.
 - `harness-doctor`: §1b leftovers of the old plugin id and namespace, §1c
   Claude Code older than 2.1.193, §3b Matt Pocock's `mattpocock-skills` plugin
   enabled next to the harness (every shared skill loads twice); §8 accepts
-  `.claude/CLAUDE.md`.
+  `.claude/CLAUDE.md`; §3's stale-skill list names `resolving-merge-conflicts`.
+- `code-reviewer`, autopilot's PROMPT template and `/deliver`'s charter point at
+  `CLAUDE.md` or `.claude/CLAUDE.md`.
 - `skills/deliver/SKILL.md` opens with an Invariants block (user-only start,
   run-state files, stop/resume, exit codes, the human merges the final PR):
   compaction re-attaches only a skill's first 5,000 tokens.

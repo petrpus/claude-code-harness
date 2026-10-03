@@ -235,9 +235,12 @@ If a project breaks a convention, the corresponding skill/hook gets less useful 
   and get a CHANGELOG migration note.
 - The plugin `name` must pass `claude plugin validate --strict`: nothing starting
   with `claude-`/`anthropic-`, and no `claude` as a whole word (ADR-0014).
-  `scripts/check-consistency.sh` runs the validator when the `claude` CLI is on
-  `PATH`, and CI runs it through `npx`. A rename goes through the marketplace's
-  append-only `renames` map, never a silent `name` edit.
+  `scripts/check-consistency.sh` runs the validator when the `claude` CLI on
+  `PATH` is 2.1.233 or newer (older CLIs fail `--strict` on a clean tree, so they
+  skip), and CI runs it through `npx`. A rename goes through the marketplace's
+  append-only `renames` map, never a silent `name` edit; the check follows the
+  chain from `claude-code-harness` to the current name.
+  `scripts/test-consistency-lint.sh` proves these checks can fail.
 
 ## CLAUDE_PLUGIN_ROOT vs CLAUDE_PROJECT_DIR (historical note)
 

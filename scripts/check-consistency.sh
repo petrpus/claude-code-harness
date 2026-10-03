@@ -14,6 +14,17 @@ FAIL=0
 note() { echo "  ✗ $*"; FAIL=1; }
 ok()   { echo "  ✓ $*"; }
 section() { echo; echo "== $1 =="; }
+# version_ge A B — true when dotted version A >= B, compared field by field.
+version_ge() {
+  local IFS=. i
+  # shellcheck disable=SC2206 — splitting on IFS=. is the point.
+  local -a a=($1) b=($2)
+  for ((i = 0; i < ${#b[@]}; i++)); do
+    (( 10#${a[i]:-0} > 10#${b[i]} )) && return 0
+    (( 10#${a[i]:-0} < 10#${b[i]} )) && return 1
+  done
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 section "shell syntax (bash -n)"
@@ -111,33 +122,58 @@ CV="$(grep -m1 -oE '## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md 2>/dev/null | gr
 # ---------------------------------------------------------------------------
 # ADR-0014: Claude Code reserves plugin names that pass as Anthropic's own
 # (claude-*, anthropic-*, cc-plugin-*, or `claude` as a word). The plugin was
-# renamed through the marketplace's append-only `renames` map; this keeps the map
-# and the names in step, then runs Claude Code's own validator when it's here.
+# renamed through the marketplace's append-only `renames` map: a later rename
+# adds a hop, so the check follows the chain from the oldest name rather than
+# pinning one entry. Claude Code's own validator runs when a new enough CLI is
+# on PATH — older ones fail on a clean tree, so they skip instead.
 section "plugin name, renames map, claude plugin validate --strict"
-PNAME="$(jq -r '.name' .claude-plugin/plugin.json 2>/dev/null || echo '?')"
-if [[ "$PNAME" =~ (^|-)(claude|anthropics?)(-|$) || "$PNAME" =~ ^cc-plugin- ]]; then
-  note "plugin name '$PNAME' is reserved or reads as Anthropic's own (ADR-0014)"
+if command -v jq >/dev/null 2>&1; then
+  PNAME="$(jq -r '.name // empty' .claude-plugin/plugin.json 2>/dev/null)"
+  if [[ -z "$PNAME" ]]; then
+    note ".claude-plugin/plugin.json has no name"
+  elif [[ "$PNAME" =~ (^|-)(claude|anthropics?)(-|$) || "$PNAME" =~ ^cc-plugin- ]]; then
+    note "plugin name '$PNAME' is reserved or reads as Anthropic's own (ADR-0014)"
+  else
+    ok "plugin name '$PNAME' avoids the reserved forms"
+  fi
+  jq -e --arg n "$PNAME" 'any(.plugins[]?; .name == $n)' .claude-plugin/marketplace.json >/dev/null 2>&1 \
+    && ok "marketplace lists a plugin named '$PNAME'" \
+    || note "marketplace has no plugins[] entry named '$PNAME'"
+  # claude-code-harness -> … -> current name; 32 hops cut off a cycle.
+  RENAMED_TO="$(jq -r '(.renames // {}) as $r
+    | [limit(32; "claude-code-harness"
+        | recurse(. as $k | if ($k | type) == "string" and ($r | has($k)) then $r[$k] else empty end))]
+    | last' .claude-plugin/marketplace.json 2>/dev/null)"
+  [[ -n "$PNAME" && "$RENAMED_TO" == "$PNAME" ]] \
+    && ok "renames chain claude-code-harness -> … -> $PNAME resolves (append-only)" \
+    || note "renames chain from claude-code-harness ends at '$RENAMED_TO', not '$PNAME' (ADR-0014: add a renames entry, never edit or delete one)"
 else
-  ok "plugin name '$PNAME' avoids the reserved forms"
+  echo "  (jq not available — skipping the plugin-name and renames checks)"
 fi
-jq -e --arg n "$PNAME" '.plugins | length == 1 and .[0].name == $n' .claude-plugin/marketplace.json >/dev/null 2>&1 \
-  && ok "marketplace entry is named '$PNAME'" || note "marketplace plugins[0].name != plugin.json name '$PNAME'"
-jq -e --arg n "$PNAME" '.renames["claude-code-harness"] == $n' .claude-plugin/marketplace.json >/dev/null 2>&1 \
-  && ok "renames maps the pre-0.7.0 name claude-code-harness -> $PNAME (append-only)" \
-  || note "marketplace renames must keep \"claude-code-harness\": \"$PNAME\" (ADR-0014; never delete a renames entry)"
 [[ -f CLAUDE.md ]] && note "CLAUDE.md is back at the plugin root — keep contributor context in .claude/CLAUDE.md (ADR-0014)" \
   || ok "no CLAUDE.md at the plugin root"
-if command -v claude >/dev/null 2>&1 && claude plugin validate --help >/dev/null 2>&1; then
+# `plugin validate --strict` accepts all four targets (the renames field, bare
+# skills/ and agents/ dirs) only from Claude Code 2.1.233 (2026-08-14). Older CLIs
+# fail on a clean tree: no --strict before 2.1.145, `renames: Unknown field`
+# before 2.1.193, `No manifest found` for skills/agents before 2.1.233.
+MIN_VALIDATE_CLI=2.1.233
+CLI_VER=""
+if command -v claude >/dev/null 2>&1 && [[ "$(claude --version 2>/dev/null)" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+  CLI_VER="${BASH_REMATCH[1]}"
+fi
+if [[ -n "$CLI_VER" ]] && version_ge "$CLI_VER" "$MIN_VALIDATE_CLI"; then
   for target in . .claude-plugin/plugin.json skills agents; do
     if out="$(claude plugin validate "$target" --strict 2>&1)"; then
-      ok "claude plugin validate --strict $target"
+      ok "claude plugin validate --strict $target (claude $CLI_VER)"
     else
-      note "claude plugin validate --strict $target failed:"
+      note "claude plugin validate --strict $target failed (claude $CLI_VER):"
       printf '%s\n' "$out" | sed 's/^/      /'
     fi
   done
+elif [[ -n "$CLI_VER" ]]; then
+  echo "  (claude $CLI_VER is older than $MIN_VALIDATE_CLI — skipping the validator; CI runs it through npx)"
 else
-  echo "  (claude CLI with 'plugin validate' not on PATH — skipping; CI runs it through npx)"
+  echo "  (claude CLI not on PATH — skipping the validator; CI runs it through npx)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -326,6 +362,9 @@ if [[ -f "$CI_WORKFLOW" ]]; then
   grep -q 'scripts/verify\.sh' "$CI_WORKFLOW" \
     && ok "$CI_WORKFLOW invokes scripts/verify.sh" \
     || note "$CI_WORKFLOW does not invoke scripts/verify.sh"
+  grep -qE 'plugin validate .*--strict' "$CI_WORKFLOW" \
+    && ok "$CI_WORKFLOW runs claude plugin validate --strict (ADR-0014)" \
+    || note "$CI_WORKFLOW no longer runs claude plugin validate --strict (ADR-0014)"
 else
   note "$CI_WORKFLOW is missing"
 fi

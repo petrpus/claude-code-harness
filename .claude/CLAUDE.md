@@ -151,4 +151,7 @@ Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record,
 commit on `main`, never on a feature branch. The harness generates CI/CD for
 *consumer* projects (`/project-infra ci`); the harness repo runs its own
 `.github/workflows/verify.yml` (`scripts/verify.sh`, then
-`claude plugin validate --strict` through `npx`).
+`claude plugin validate --strict` through `npx`). Locally, check-consistency
+runs the validator only with a `claude` CLI ≥ 2.1.233 and skips it otherwise.
+A new check in `scripts/check-consistency.sh` gets a negative case in
+`scripts/test-consistency-lint.sh`, or nothing proves it can fail.

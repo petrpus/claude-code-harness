@@ -39,6 +39,6 @@ Mandatory. Concrete, checkable statements — this is what the verifier checks
 
 <!-- Stack conventions, files to avoid, perf/security requirements, data-safety
      rules (e.g. no destructive migrations), etc. -->
-- Follow the repo's `CLAUDE.md` and `CONTEXT.md`.
+- Follow the repo's `CLAUDE.md` (or `.claude/CLAUDE.md`) and `CONTEXT.md`.
 - Tests are required for every behavior change (TDD: red-green-refactor).
 - Record any architectural decision as a `docs/adr/` entry.

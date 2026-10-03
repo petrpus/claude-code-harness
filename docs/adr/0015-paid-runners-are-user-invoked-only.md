@@ -26,7 +26,10 @@ the documented behaviour that the sync-log's open question about
 1. **`autopilot`, `deliver` and `harness-init` carry
    `disable-model-invocation: true`.** Only a person starts them, by typing
    `/code-harness:autopilot`, `/code-harness:deliver #<map>` or
-   `/code-harness:harness-init`.
+   `/code-harness:harness-init`. The vendored, Frozen `zoom-out` keeps the flag
+   it already carried upstream, so the **user-only set** the lint enforces is
+   these three plus `zoom-out` — an inherited exception, not a fourth
+   decision.
 2. **A skill that another skill composes never carries the flag** —
    `to-issues`, `to-prd`, `grill-*`, `triage`, `tdd`, `codebase-design`,
    `domain-modeling` and anything a workflow skill tells Claude to run. The flag

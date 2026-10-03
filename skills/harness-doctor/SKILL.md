@@ -51,8 +51,9 @@ Check `.claude/skills/` for any of these (each shadows the plugin version):
 
 - Vendored: `caveman`, `codebase-design`, `diagnose`, `domain-modeling`,
   `grill-me`, `grill-with-docs`, `grilling`, `handoff`,
-  `improve-codebase-architecture`, `prototype`, `research`, `tdd`, `to-issues`,
-  `to-prd`, `triage`, `write-a-skill`, `zoom-out`, `find-skills`
+  `improve-codebase-architecture`, `prototype`, `research`,
+  `resolving-merge-conflicts`, `tdd`, `to-issues`, `to-prd`, `triage`,
+  `write-a-skill`, `zoom-out`, `find-skills`
 - Own: `next`, `commit-agent`, `implement-issue`, `start-feature`,
   `migration-check`, `worklog`, `harness-init`, `harness-doctor`, `autopilot`,
   `deliver`, `cost-discipline`, `usage-report`, `project-infra`, `openapi-sync`,
