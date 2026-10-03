@@ -6,7 +6,12 @@
 # Offline layers, in the order they run (see the `section` headings below for
 # the current list — the ones worth calling out here):
 #   1. scripts/check-consistency.sh — structural invariants (skills, sync-log,
-#      version==changelog, hooks.json resolves, …).
+#      version==changelog, hooks.json form + resolution, skill/agent
+#      frontmatter lint and listing budget, plugin name + renames chain, and
+#      `claude plugin validate --strict` when the CLI on PATH is >= 2.1.233, …).
+#      scripts/test-consistency-lint.sh breaks a copy of the repo on purpose and
+#      asserts those checks report it (and runs every hooks.json command from a
+#      plugin path with a space in it).
 #   2. Hook test matrix — each guard hook is fed representative stdin-JSON and
 #      its exit code asserted (block cases exit 2, allow cases exit 0), per the
 #      stdin-JSON / exit-2 contract in docs/architecture.md § Hook contract.
@@ -352,6 +357,18 @@ if [[ -f scripts/test-hook-faults.sh ]]; then
   fi
 else
   note "scripts/test-hook-faults.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+section "consistency checks catch what they claim (test-consistency-lint.sh)"
+if [[ -f scripts/test-consistency-lint.sh ]]; then
+  if bash scripts/test-consistency-lint.sh; then
+    ok "consistency-check negative tests passed"
+  else
+    note "consistency-check negative tests failed (see above)"
+  fi
+else
+  note "scripts/test-consistency-lint.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,9 @@
 ---
 name: code-map
-description: Generate a self-contained, offline, interactive HTML module/dependency map from tmp/repo-map.json. `/code-map [--granularity=dir|file]` — default is top-level source directories, `--granularity=file` maps individual files. Use when the user wants to visualize module dependencies, see which files/directories are most depended-on, or understand a codebase's shape at a glance.
+description: >-
+  Render tmp/repo-map.json as a self-contained, offline, interactive HTML
+  module/dependency map (`--granularity=dir|file`). Use to visualize module
+  dependencies, find the most depended-on code, or see a codebase's shape.
 ---
 
 # Skill: /code-map

@@ -5,84 +5,120 @@ something upstream changes that we want, we cherry-pick by hand and update this
 file.
 
 Procedure:
-1. Fetch the source repo at the target commit. In this environment the GitHub
-   API / codeload tarballs are blocked by the proxy — fetch per-file from
-   `raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` (sleep/retry on 429).
+1. Fetch the source repo with history: `git clone --filter=blob:none
+   https://github.com/<owner>/<repo>.git` (works through this environment's
+   proxy, unlike the GitHub API, github.com pages and codeload tarballs).
+   Anchor a survey on a **release tag** when upstream has one, read its
+   CHANGELOG / pending changesets, and diff tag to tag locally. Per-file
+   `raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` is the fallback
+   (sleep/retry on 429). Never infer safety from semver: upstream ships renames
+   and removals as "minor" releases.
 2. Diff `SKILL.md` (and any bundled resource files) against our vendored copy.
+   Diff the **whole** vendored set, not only the skills that look busy — the
+   2026-07-24 and 2026-08-28 surveys skipped most of them and missed real drift.
 3. Copy what we want. Where we keep a local dir name that differs from upstream,
    patch the frontmatter `name:` to match our dir and record it as a **local
    patch** below.
-4. Commit. For a broad re-sync to a single upstream SHA, one bulk commit
+4. Record the **commit** SHA the content came from (with its commit date —
+   `git log -1 --format=%cd --date=short` — and, when there is one, the release
+   tag) — not a `git ls-tree` tree hash. The tree hash
+   of the skill dir may go in the Tree column as a content checksum
+   (`git diff <tree> <commit>:<path>` works against it).
+5. Commit. For a broad re-sync to a single upstream SHA, one bulk commit
    (`vendor: re-sync <source> skills to <short-sha>`) is more auditable than
    many; for a single skill, `vendor: sync <skill> from <short-sha>`.
 
 ## Pocock (`mattpocock/skills`)
 
-**Survey 2026-08-28 @ `6654f6b`** (no content re-vendored — survey only, during the
-PRD 0002 grill): every vendored `SKILL.md` diffed against `6654f6b`. Bulk of the drift
-is the upstream em-dash purge (`3216582`) and ticket/spec terminology — cosmetic, not
-adopted. Substantive upstream changes worth a future targeted re-sync:
-`tdd` restructured (new **tautological-tests** anti-pattern, seams-first "test only at
-pre-agreed seams", refactoring moved out of the loop into their `code-review` skill —
-that last bit conflicts with our autopilot BUILD prompt's red-green-refactor, so any
-re-sync is a cherry-pick, not a copy). `writing-great-skills` was **renamed and
-restructured to `productivity/writing-for-agents`** (`1fc6573`, 2026-07-23) — our
-`write-a-skill` row's upstream path is stale; the successor's context-pointer /
-information-hierarchy doctrine is strong and a re-sync candidate. `zoom-out` is still
-404 → **now Frozen** (was Watch). `batch-grill-me` is gone upstream → dropped from the
-watch list. New upstream skills surveyed and *not* adopted: `engineering/implement` +
-`in-progress/implement-spec` (thin; our `implement-issue` is richer),
-`in-progress/retro` (environment-retrospective — interesting shape, overlaps
-`harness-doctor`/`usage-report` territory; watch), `misc/git-guardrails-claude-code`
-(blocks *all* `git push`; our `pre-bash.sh` guards are more surgical — nothing to
-adopt), `wait-what`, `to-questionnaire`, `wizard`, writing-track skills.
+**Survey 2026-10-02 @ `d81f3a1`** (2026-09-29, merge of PR #1120 = the v1.3
+content; the newest tag is still `v1.2.3`, the 1.3.0 version PR is unmerged). No
+content re-vendored — survey and log hygiene only, as part of 0.7.0. Every
+vendored skill was diffed against `d81f3a1` from a full clone.
+- **This log was wrong in two ways.** 11 "Vendored SHA" values were git **tree**
+  hashes of the skill dir, not commits — they are converted below (the tree stays
+  as a checksum). And the two previous surveys diffed only a few skills: our
+  copies of `diagnose`, `tdd`, `triage`, `handoff`, `improve-codebase-architecture`,
+  `prototype` and `grilling` lag substantive upstream changes that predate them
+  (each row says what). `diagnose` has no local additions; `to-prd` has two
+  undocumented ones (now recorded).
+- **Inside the range** the only change to our vendored text is upstream's
+  `CONTEXT.md` / `CONTEXT-MAP.md` → `GLOSSARY.md` / `GLOSSARY-MAP.md` rename, with
+  no fallback. Decision for 0.7.0: **not adopted yet** — it lands with the bulk
+  re-sync in 0.8.0 as an ADR (read `GLOSSARY.md`, else `CONTEXT.md`; write
+  `GLOSSARY.md`), because it touches the autopilot prompt, the deliver charter,
+  the code-reviewer agent and `check-consistency.sh`.
+- **New in the upstream plugin**: `engineering/pr` (PR body with Summary /
+  Evidence / Merge Danger — candidate for `implement-issue` and `/deliver`'s
+  final PR; its text credits Dex Horthy's `show-me`, licence unverified),
+  `engineering/retro` (environment retrospective from session logs — graduated
+  from our watch list; needs `writing-for-agents`) and `engineering/implement-spec`
+  (skipped, see below). **Removed upstream**: `resolving-merge-conflicts`
+  (`daa01d8`, "No longer needed") → **Frozen** here.
+- **Distribution**: upstream is now the `mattpocock-skills` plugin (official
+  marketplace since 2026-08-05) and versions with Changesets. Depending on that
+  plugin instead of vendoring stays rejected — our names, `gh` wording, Map
+  publishing and self-contained grills diverge, and installing both loads every
+  shared skill twice; `harness-doctor` §3b warns when both are enabled.
 
-Previous survey: re-surveyed at upstream **`ed37663`** (2026-07-24) — every row below was diffed
-against `ed37663` on that date (so `Last reviewed` is bulk-bumped), but
-`Vendored SHA` moves only for rows whose content we actually re-copied this pass
-(`to-issues`, `to-prd`). The rest either match an older vendored copy or diverge
-for a documented reason; a full collection re-vendor to `ed37663` remains future
-work. Upstream keeps its category folders (`engineering/`, `productivity/`,
-`in-progress/`, …) and the **grill delegation model**; we keep our local dir
-names and our self-contained grill skills. This pass renamed two upstream skills
-into our names: `to-tickets`→`to-issues`, `to-spec`→`to-prd` (local patches).
+Previous survey **2026-08-28 @ `6654f6b`** (no content re-vendored, during the
+PRD 0002 grill): bulk drift is the em-dash purge (`3216582`) and ticket/spec
+terminology. Recorded then: the `tdd` restructure (tautological-tests
+anti-pattern, seams-first, refactoring moved to `code-review` — conflicts with
+our autopilot BUILD prompt's red-green-refactor, so cherry-pick, not copy) and the
+`writing-great-skills` → `productivity/writing-for-agents` rename (`1fc6573`).
+`zoom-out` became Frozen; `batch-grill-me` left the watch list (gone upstream).
+New skills surveyed and not adopted then: `engineering/implement`,
+`in-progress/implement-spec`, `misc/git-guardrails-claude-code` (blocks every
+`git push`; our `pre-bash.sh` guards are more surgical), `wait-what`,
+`to-questionnaire`, `wizard`, writing-track skills.
 
-| Skill | Upstream path @ed37663 | Vendored SHA | First vendored | Last reviewed | Notes |
-|---|---|---|---|---|---|
-| caveman | — (removed upstream) | `17972a1` | 2026-05-16 | 2026-07-24 | **Frozen.** 404 upstream — deleted from the collection. Kept locally at its last-vendored SHA. |
-| codebase-design | `skills/engineering/codebase-design/` | `6eeb81b` | 2026-06-21 | 2026-07-24 | incl. `DEEPENING.md`, `DESIGN-IT-TWICE.md`. Identical @ed37663. |
-| diagnose | `skills/engineering/diagnosing-bugs/` | `43d464d` | 2026-05-16 | 2026-07-24 | **Local patch**: upstream dir/name is `diagnosing-bugs`; we keep `diagnose`. Local divergence (own additions) — not re-synced this pass. |
-| domain-modeling | `skills/engineering/domain-modeling/` | `6eeb81b` | 2026-06-21 | 2026-07-24 | incl. `ADR-FORMAT.md`, `CONTEXT-FORMAT.md` (lockstep — see below). Identical @ed37663. |
-| grill-me | `skills/*/grill-me/` | `2a1ad17` | 2026-05-16 | 2026-07-24 | **Divergence**: upstream is a thin delegator to `/grilling`. We keep our self-contained version so the skill stands alone. |
-| grill-with-docs | `skills/engineering/grill-with-docs/` | `3c4ac97` | 2026-05-16 | 2026-07-24 | **Divergence**: upstream delegates to `/grilling` + `/domain-modeling`. We keep our self-contained version. |
-| grilling | `skills/productivity/grilling/` | `66f92b6` | 2026-07-06 | 2026-07-24 | Standalone relentless-interview loop. Minor upstream diff @ed37663; deferred (no behaviour change). |
-| research | `skills/engineering/research/` | `66f92b6` | 2026-07-06 | 2026-07-24 | Delegates investigation to a background agent against primary sources. Identical @ed37663. |
-| handoff | `skills/productivity/handoff/` | `85c644d` | 2026-05-16 | 2026-07-24 | Minor upstream diff @ed37663; deferred. (Upstream `claude-handoff` intentionally skipped — overlaps this.) |
-| improve-codebase-architecture | `skills/engineering/improve-codebase-architecture/` | `3ad8fa7` | 2026-05-16 | 2026-07-24 | incl. `DEEPENING.md` (lockstep), `INTERFACE-DESIGN.md`, `LANGUAGE.md`. Upstream diverged @ed37663; deferred. |
-| prototype | `skills/engineering/prototype/` | `c91bdc5` | 2026-05-16 | 2026-07-24 | incl. `LOGIC.md`, `UI.md`. Minor upstream diff @ed37663; deferred. |
-| tdd | `skills/engineering/tdd/` | `75beb30` | 2026-05-16 | 2026-07-24 | Upstream diverged further @ed37663 (code-review ref + more); deferred — our bundled resources differ in layout. |
-| to-issues | `skills/engineering/to-tickets/` | `ed37663` | 2026-05-16 | 2026-07-24 | **Local patch** (rename): upstream is `to-tickets`. Adopted blocking edges, one-context-window slice sizing, prefactoring-first, expand–contract (incl. integration-branch variant); dropped HITL/AFK typing; kept GitHub-Issues-via-`gh` wording. **Local patch** (deliver #64): added step 6, Map-publishing per `skills/deliver/MAP-FORMAT.md` (ADR-0008). `disable-model-invocation` NOT adopted — see note. |
-| to-prd | `skills/engineering/to-spec/` | `ed37663` | 2026-05-16 | 2026-07-24 | **Local patch** (rename): upstream is `to-spec`. Adopted seams-first step (prefer existing seams, highest possible, ideal one); kept PRD terminology + template. **Local patch** (deliver #64): the PRD gets the `prd` label instead of `ready-for-agent`. `disable-model-invocation` NOT adopted — see note. |
-| triage | `skills/engineering/triage/` | `de4f182` | 2026-05-16 | 2026-07-24 | incl. `AGENT-BRIEF.md`, `OUT-OF-SCOPE.md`. Upstream diverged @ed37663; deferred. |
-| write-a-skill | `skills/productivity/writing-for-agents/` (renamed upstream `1fc6573`) | `2f252b3` | 2026-05-16 | 2026-08-28 | **Local patch**: we keep `write-a-skill`. Upstream renamed `writing-great-skills` → `writing-for-agents` and restructured around context pointers / information hierarchy — re-sync candidate, cherry-pick (our S4 extensions must survive). |
-| zoom-out | — (removed upstream) | `6ecebab` | 2026-05-16 | 2026-08-28 | **Frozen.** Still 404 at `6654f6b` (two surveys in a row) — deleted upstream. Kept locally at its last-vendored SHA. |
-| resolving-merge-conflicts | `skills/engineering/resolving-merge-conflicts/` | `ed37663` | 2026-07-24 | 2026-07-24 | **New vendor.** Verbatim from upstream (14 lines, no resources): see current state → primary sources → resolve each hunk → run checks → finish. |
+Survey **2026-07-24 @ `ed37663`**: re-copied `to-issues` and `to-prd` (renamed
+upstream `to-tickets` / `to-spec`, kept as local patches) and vendored
+`resolving-merge-conflicts`. Upstream keeps its category folders and the grill
+delegation model; we keep our local dir names and self-contained grills.
 
-**`disable-model-invocation` — evaluated, NOT adopted.** Upstream `to-tickets`
-and `to-spec` carry `disable-model-invocation: true`. We drop it: `start-feature`
-and `next` compose `/to-issues` and `/to-prd` programmatically, and we can't
-guarantee the flag preserves that indirect invocation across Claude Code
-versions. Keeping them model-invocable is the safe choice; revisit if the flag's
-semantics are confirmed to allow skill-to-skill calls.
+| Skill | Upstream path @d81f3a1 | Vendored commit | Tree | First vendored | Last reviewed | Notes |
+|---|---|---|---|---|---|---|
+| caveman | — (removed upstream) | `ab45d5e` (2026-04-17) | `17972a1` | 2026-05-16 | 2026-10-02 | **Frozen.** Deleted from the collection; still absent @d81f3a1. Kept locally at that content. |
+| codebase-design | `skills/engineering/codebase-design/` | `6eeb81b` (2026-06-18) | — | 2026-06-21 | 2026-10-02 | incl. `DEEPENING.md`, `DESIGN-IT-TWICE.md`. Cosmetic drift only: em-dash rewrites, harness-neutral subagent wording, the GLOSSARY rename. |
+| diagnose | `skills/engineering/diagnosing-bugs/` | `7afa86d` (2026-04-28) | `43d464d` | 2026-05-16 | 2026-10-02 | **Local patch**: upstream dir/name is `diagnosing-bugs`; we keep `diagnose`. Otherwise byte-identical to upstream @`7afa86d` — **no own additions** (the old "local divergence" note was wrong). Upstream since: Phase 1 ends on "a tight loop that goes red", reproduce + minimise, `## Redact` (`efce423`, v1.2.3), post-mortem hand-off removed (`1dab982`). Re-sync candidate: take whole. |
+| domain-modeling | `skills/engineering/domain-modeling/` | `6eeb81b` (2026-06-18) | — | 2026-06-21 | 2026-10-02 | incl. `ADR-FORMAT.md`, `CONTEXT-FORMAT.md` (lockstep — see below). @d81f3a1: GLOSSARY rename (`CONTEXT-FORMAT.md` → `GLOSSARY-FORMAT.md`) and a narrower description; waits for the 0.8.0 glossary ADR. Our richer `CONTEXT-FORMAT.md` is old, deliberate divergence. |
+| grill-me | `skills/productivity/grill-me/` | `a6bdfd9` (2026-03-26) | `2a1ad17` | 2026-05-16 | 2026-10-02 | **Divergence**: upstream is a two-line user-invoked delegator to `/grilling`. We keep the self-contained version — upstream's own docs report that delegated loading is unreliable, and `start-feature` composes it. Its one-question-at-a-time wording predates upstream's round-based grilling (see `grilling`). |
+| grill-with-docs | `skills/engineering/grill-with-docs/` | `e74f006` (2026-05-13) | `3c4ac97` | 2026-05-16 | 2026-10-02 | **Divergence**: upstream delegates to `/grilling` + `/domain-modeling` (user-invoked). We keep our self-contained version. |
+| grilling | `skills/productivity/grilling/` | `66f92b6` (2026-07-05) | — | 2026-07-06 | 2026-10-02 | **Behaviour drift upstream** — the "no behaviour change" note was wrong from `a4b2009` (committed 2026-07-31) on: the whole question frontier per round, numbered, each with a recommended answer; facts fetched by sub-agents (`a4b2009`, `294a2c9`, `85f83d3`). Re-sync candidate; the inline copies in grill-me / grill-with-docs would follow. |
+| research | `skills/engineering/research/` | `66f92b6` (2026-07-05) | — | 2026-07-06 | 2026-10-02 | Delegates investigation to a background agent against primary sources. Cosmetic drift only (one em-dash line). |
+| handoff | `skills/productivity/handoff/` | `918f3fe` (2026-05-06) | `85c644d` | 2026-05-16 | 2026-10-02 | Upstream since: "Redact any sensitive information…" (`feaaf42`), a suggested-skills section, OS temp dir, `disable-model-invocation`. Re-sync candidate: the Redact line. (Upstream `claude-handoff` intentionally skipped — overlaps this.) |
+| improve-codebase-architecture | `skills/engineering/improve-codebase-architecture/` | `7afa86d` (2026-04-28) | `3ad8fa7` | 2026-05-16 | 2026-10-02 | incl. `DEEPENING.md` (lockstep), `INTERFACE-DESIGN.md`, `LANGUAGE.md`. Upstream restructured: vocabulary delegated to `codebase-design`, "Scope before you scan: YAGNI" (`45afd80`), an HTML report loading Tailwind and Mermaid from CDNs (not adoptable: offline rule), `disable-model-invocation`. Cherry-pick candidate: the YAGNI scoping. |
+| prototype | `skills/engineering/prototype/` | `f304057` (2026-05-12) | `c91bdc5` | 2026-05-16 | 2026-10-02 | incl. `LOGIC.md`, `UI.md`. Upstream since: keep the prototype on a throwaway branch as a primary source (`371b9c9`), logic branch as a single HTML file (`6bcbcb0`). Cherry-pick candidate: the throwaway-branch rule. |
+| tdd | `skills/engineering/tdd/` | `7afa86d` (2026-04-28) | `75beb30` | 2026-05-16 | 2026-10-02 | Our bundled resources keep the 2026-04-28 layout. Upstream since: tautological-test anti-pattern (`43ea088`), test only at pre-agreed seams (`e81f976`), refactor dropped from the loop (`80e9dcc`) — the last conflicts with autopilot's BUILD prompt, so cherry-pick, not copy. |
+| to-issues | `skills/engineering/to-tickets/` | `ed37663` (2026-07-21) | — | 2026-05-16 | 2026-10-02 | **Local patch** (rename): upstream is `to-tickets`. Adopted blocking edges, one-context-window slice sizing, prefactoring-first, expand–contract (incl. integration-branch variant); dropped HITL/AFK typing; kept GitHub-Issues-via-`gh` wording. **Local patch** (deliver #64): added step 6, Map-publishing per `skills/deliver/MAP-FORMAT.md` (ADR-0008). `disable-model-invocation` NOT adopted — see note. Unchanged upstream in range. |
+| to-prd | `skills/engineering/to-spec/` | `ed37663` (2026-07-21) | — | 2026-05-16 | 2026-10-02 | **Local patch** (rename): upstream is `to-spec`. Adopted seams-first step (prefer existing seams, highest possible, ideal one); kept PRD terminology + template. **Local patch** (deliver #64): the PRD gets the `prd` label instead of `ready-for-agent`. **Local patch** (recorded 2026-10-02, origin unknown): "A deep module … makes the best seam: it can be tested in isolation" and "which modules they want tests written for" — neither is upstream @`ed37663`. `disable-model-invocation` NOT adopted — see note. Unchanged upstream in range. |
+| triage | `skills/engineering/triage/` | `179a14e` (2026-04-28) | `de4f182` | 2026-05-16 | 2026-10-02 | incl. `AGENT-BRIEF.md`, `OUT-OF-SCOPE.md`. Upstream since: PRs as a triage surface (`e00eadb`), a redundancy check plus an "Already implemented" wontfix that is *not* written to `.out-of-scope/`, "Verify the claim", grilling via the Skill tool, the GLOSSARY rename. Cherry-pick candidate: the redundancy check. The `/setup-matt-pocock-skills` mismatch persists (`.claude/CLAUDE.md`). |
+| write-a-skill | `skills/productivity/writing-for-agents/` (renamed upstream `1fc6573`) | `985d8fc` (2026-02-03) | `2f252b3` | 2026-05-16 | 2026-10-02 | **Local patch**: we keep `write-a-skill` = upstream's February `write-a-skill` plus our S4 extensions (500-line cap, one-level references, TOC, naming, checklist). Upstream's `writing-for-agents` shares no text with it; `retro` depends on it, so adopting `retro` means vendoring `writing-for-agents` as its own dir. |
+| zoom-out | — (removed upstream) | `7afa86d` (2026-04-28) | `6ecebab` | 2026-05-16 | 2026-10-02 | **Frozen.** Deleted upstream; still absent @d81f3a1. Keeps its upstream `disable-model-invocation: true` (ADR-0015's user-only set). |
+| resolving-merge-conflicts | — (removed upstream `daa01d8`, 2026-09-24) | `ed37663` (2026-07-21) | — | 2026-07-24 | 2026-10-02 | **Frozen.** Removed upstream ("No longer needed"; archived in v1.3.0, nothing replaces it). Kept locally at `ed37663`; nothing in `autopilot/` or `deliver/` depends on it. |
+
+**`disable-model-invocation` — closed 2026-10-02, stays NOT adopted** on
+`to-issues` / `to-prd` (upstream's `to-tickets` / `to-spec` carry it). The
+question was whether the flag still lets one skill invoke another; the Claude
+Code skills docs (§ Control who invokes a skill) say it doesn't: only the user
+can invoke such a skill, and Claude Code blocks the model's Skill-tool call even
+when another skill asked for it. `start-feature` and `next` compose these two,
+so they stay model-invocable. Where we *do* use the flag: ADR-0015.
 
 **Skipped intentionally** (documented so a future sync doesn't re-add them):
 `setup-matt-pocock-skills` (conventions baked into `docs/architecture.md`),
 `claude-handoff` (overlaps `handoff`), `loop-me` (the harness ships its own
 `autopilot` loop; two loop doctrines would conflict), `code-review` skill (we
-ship the `code-reviewer` agent), `ask-matt`, `teach`. **`wayfinder`** has
-graduated from `in-progress/` upstream but stays skipped — it depends on
-upstream's tracker-doc infra and overlaps our `to-prd` / `to-issues` / `triage`
-flow. **Watch list**: `in-progress/retro` (environment retrospectives — surfaced @6654f6b). `batch-grill-me` was on this list @ed37663 but is gone upstream @6654f6b — dropped. `zoom-out` graduated to Frozen above.
+ship the `code-reviewer` agent), `ask-matt`, `teach`. **`wayfinder`** stays
+skipped — it depends on upstream's tracker-doc infra and overlaps our `to-prd` /
+`to-issues` / `triage` flow. **`implement-spec`** (graduated in v1.3) is skipped:
+it orchestrates subagents inside one session, which upstream itself says loses to
+a deterministic loop for AFK work; its documented field failures (stale
+blocked-by counts mid-run, parallel workers naming one thing differently, tests
+silently skipping in worktrees) are input for parallel `/deliver` (#39).
+**Candidates for the 0.8.0 re-sync**: `pr`, `retro` (+ `writing-for-agents`),
+and the per-row candidates above.
 
 ### Duplicated bundled resources — keep in lockstep
 
@@ -98,9 +134,9 @@ noted; `scripts/check-consistency.sh` enforces it.
 
 ## Vercel Labs (`vercel-labs/skills`)
 
-| Skill | Upstream path | Vendored SHA | First vendored | Last reviewed | Notes |
+| Skill | Upstream path | Vendored commit | First vendored | Last reviewed | Notes |
 |---|---|---|---|---|---|
-| find-skills | `skills/find-skills/SKILL.md` | `e173b8c` | 2026-05-16 | 2026-08-28 | Byte-identical to upstream `435076e` (2026-08-28 survey). Earlier: synced `--owner` flag; removed the `skills check` line. |
+| find-skills | `skills/find-skills/SKILL.md` | `e173b8c` (2026-07-22) | 2026-05-16 | 2026-10-02 | Byte-identical to upstream HEAD `18f96ea` (2026-10-02); the file last changed in `773fb2c` (2026-07-10). Earlier: synced `--owner` flag; removed the `skills check` line. The CLI moved to 1.7.0 (SHA pinning, `add --json` audit verdicts) — nothing to vendor. |
 
 ## Own (no external source)
 
@@ -109,13 +145,26 @@ Authored in this repo, no upstream. Tracked via git history, not the sync table.
 - `skills/next/`, `skills/commit-agent/`, `skills/implement-issue/`,
   `skills/start-feature/`, `skills/migration-check/`, `skills/worklog/`,
   `skills/harness-init/`, `skills/harness-doctor/`
-- `skills/autopilot/`, `skills/cost-discipline/`, `skills/usage-report/`,
-  `skills/project-infra/`, `skills/openapi-sync/`, `skills/code-map/`
+- `skills/autopilot/`, `skills/deliver/`, `skills/cost-discipline/`,
+  `skills/usage-report/`, `skills/project-infra/`, `skills/openapi-sync/`,
+  `skills/repo-map/`, `skills/code-map/`
 - `agents/code-reviewer.md`, `agents/verifier.md`
 - `hooks/*.sh` + `hooks/hooks.json`
 - `scripts/check-consistency.sh`
 
 ## Loopkit (`Archive228/loopkit`, MIT)
+
+Surveyed **2026-10-02 @ `5ae033e`**: no upstream commits since 2026-07-15
+("ship 8 upgrades + finn-loop preset"). Its July "loop & harness" skills still
+hold ideas we haven't harvested, recorded as prior art (nothing vendored):
+**`sprint-contract`** (3–7 script-decidable acceptance predicates, a runtime path
+and an out-of-scope list, agreed with the evaluator before any code is written),
+**`harness-stripping`** (ablate one harness component at a time on a fixed task
+set — never the safety or cost caps), the **finn-loop** gate (a human approves the
+spec by renaming `SPEC-PENDING.md` to `SPEC-APPROVED.md`; prior art for M2, #40)
+and **`init-script-contract`** (kill processes by PID — "grep kills sibling
+agents on shared sandboxes"; input for #39). Its numeric claims are unsourced and
+not to be quoted.
 
 Surveyed 2026-08-28 @ `5ae033e`: upstream grew from a loop runner into a 50-skill
 collection (July 2026, "loop & harness track"). Directly relevant prior art, ideas

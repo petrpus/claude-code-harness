@@ -1,4 +1,4 @@
-# claude-code-harness
+# code-harness
 
 Universal code-dev harness distributed as a Claude Code plugin. This context covers
 the vocabulary of the harness itself — how skills are sourced, guarded, verified,
@@ -33,6 +33,21 @@ _Avoid_: fork, divergence (divergence is the state; the patch is the recorded de
 
 **Sync-log**:
 `docs/pocock-sync-log.md` — the source of truth for what is vendored, from where, at which SHA.
+
+**Plugin id**:
+`<plugin>@<marketplace>` — `code-harness@claude-code-harness`. 0.7.0 renamed the plugin half (Claude Code reserves `claude-` plugin names); the marketplace half is this repo's self-marketplace and stays (ADR-0014).
+_Avoid_: "the plugin name" for the whole id
+
+**Renames map**:
+The append-only `renames` object in `.claude-plugin/marketplace.json`, mapping a former plugin name to its successor. Claude Code follows the chain to migrate installs; a new rename adds an entry, never edits one.
+
+**User-invoked-only skill**:
+A skill with `disable-model-invocation: true`: only a person starts it with its slash command; Claude can neither load it nor compose it from another skill. The set is `autopilot`, `deliver` and `harness-init` (ADR-0015), plus the inherited `zoom-out`.
+_Avoid_: manual skill, disabled skill
+
+**Listing budget**:
+The cap, in `scripts/check-consistency.sh`, on the description characters of every model-invocable skill — the text Claude carries in every session.
+_Avoid_: context budget (that is the whole window)
 
 **Gate**:
 The genus: a check whose failure refuses to let something proceed. Three kinds, told apart by *what* they stop.

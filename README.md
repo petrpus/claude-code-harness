@@ -1,6 +1,8 @@
-# claude-code-harness
+# code-harness
 
-Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code). One repo, distributed as an Anthropic plugin, used across all code-development projects.
+Universal code-dev harness for [Claude Code](https://docs.claude.com/claude-code). One repo, distributed as a Claude Code plugin, used across all code-development projects.
+
+The plugin is **`code-harness`**; this repository is its marketplace, **`claude-code-harness`**. Up to 0.6.x the plugin was also named `claude-code-harness` — Claude Code reserves `claude-` plugin names, so 0.7.0 renamed it (ADR-0014; migration steps in [`docs/install.md`](docs/install.md#migrating-from-claude-code-harness-06x-and-earlier)).
 
 ## What's inside
 
@@ -46,10 +48,13 @@ In any code-dev project:
 
 ```bash
 /plugin marketplace add git@github.com:petrpus/claude-code-harness.git
-/plugin install claude-code-harness
+/plugin install code-harness@claude-code-harness
 ```
 
-That's it. Skills, agent, and hooks become available immediately.
+That's it. Skills, agents, and hooks become available immediately, namespaced as
+`code-harness:<name>`. `harness-init`, `autopilot` and `deliver` are user-invoked
+only (ADR-0015) — Claude won't start a paid or long-running run on its own, so
+type `/code-harness:deliver` (etc.) yourself.
 
 ## Per-project layout (after install)
 

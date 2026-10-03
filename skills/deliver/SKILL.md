@@ -1,11 +1,10 @@
 ---
 name: deliver
 description: >-
-  Deliver a Map issue — every issue in its Delivery section becomes its own
-  PR into the current integration branch, built by autopilot, verified,
-  squash-merged and ticked, in blocking-edge order. Use when the user asks to
-  "deliver map #N", "run the map", "doruč mapu", or to work through a set of
-  issues one PR at a time.
+  Deliver a Map issue: each issue in its Delivery section becomes its own PR
+  into the integration branch — built by autopilot, verified, reviewed,
+  squash-merged and ticked, in blocking-edge order. User-invoked only.
+disable-model-invocation: true
 ---
 
 # deliver — a Map of issues to merged PRs
@@ -18,11 +17,22 @@ tick the Map line.
 The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
-> **Shipped in 0.6.0** (maps #68 and #106): the straight path, independent
-> review, parking, final verify with the base-moved merge and merge retry,
-> the CI wait, bounded review and CI fix rounds with follow-up issues, run
-> state / resume / stop / global caps, the final integration → default PR
-> (below) and the one-command launcher (next section).
+**Invariants** — they sit first because compaction keeps only the start of a
+skill:
+
+- Only a person starts a run (`/code-harness:deliver #<map>`, ADR-0015). You
+  plan, show the plan, ask once, launch detached and monitor. Never run the
+  runner's phases by hand, never merge a PR, never push to the integration
+  branch yourself — the runner holds every forge operation (ADR-0007).
+- Run state lives in `tmp/deliver/<run-id>/`: `status.json` (headline),
+  `events.jsonl` (milestones), `lock` (runner pid), `state.json` (resume truth).
+- Stop: `deliver.sh --map <N> --stop` (a `STOP` file, honoured at the next phase
+  boundary); hard stop `tmux kill-session -t deliver-<N>`. Continue:
+  `--resume [--retry '#N']`.
+- Exit codes: 0 all merged · 1 precondition/runner failure · 2 partial ·
+  3 `--max-minutes` · 4 `--budget-usd` · 6 stopped; 3, 4 and 6 are resumable.
+- The final integration → default-branch PR is merged by a human, with a merge
+  commit.
 
 ## The final PR
 
