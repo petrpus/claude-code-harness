@@ -1,6 +1,9 @@
 ---
 name: openapi-sync
-description: Generate or sync docs/api/openapi.yaml from route handler code (code is the source of truth) and render a browsable Redoc HTML page. `/openapi-sync [--check]` — default mode writes/updates the spec and HTML; `--check` mode is offline (pure grep + yaml diff, no network) and reports drift for CI. Use when the user wants an API spec, OpenAPI docs, route documentation, or asks "is our OpenAPI spec out of date".
+description: >-
+  Generate or sync docs/api/openapi.yaml from route handlers (code is the source
+  of truth) plus a browsable Redoc page; `--check` reports drift offline for CI.
+  Use for an API spec, OpenAPI docs, or "is our OpenAPI spec out of date".
 ---
 
 # Skill: /openapi-sync

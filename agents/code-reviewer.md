@@ -57,7 +57,7 @@ git diff <base>...<head> -- <scope>
 
 - `CONTEXT.md` (shared language), if present
 - Relevant spec section (if the branch has clear scope)
-- Project rules in `CLAUDE.md` and `docs/adr/`
+- Project rules in `CLAUDE.md` (or `.claude/CLAUDE.md`) and `docs/adr/`
 
 **Don't read session history — it's not available.**
 

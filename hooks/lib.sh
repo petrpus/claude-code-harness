@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hooks/lib.sh — shared helpers for claude-code-harness hooks.
+# hooks/lib.sh — shared helpers for code-harness hooks.
 #
 # Claude Code passes hook input as a JSON object on STDIN, e.g.:
 #   {"session_id":"...","transcript_path":"...","cwd":"...",
@@ -53,7 +53,7 @@ _HARNESS_DEGRADED_WARNED=0
 warn_guard_degraded() {
   [[ "$_HARNESS_DEGRADED_WARNED" -eq 1 ]] && return 0
   _HARNESS_DEGRADED_WARNED=1
-  echo "claude-code-harness: jq is missing or not working — hook guards cannot read this tool call and are ALLOWING it. Install a working jq to restore the push-from-main, .env and rm -rf guards." >&2
+  echo "code-harness: jq is missing or not working — hook guards cannot read this tool call and are ALLOWING it. Install a working jq to restore the push-from-main, .env and rm -rf guards." >&2
   return 0
 }
 

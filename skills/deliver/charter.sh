@@ -80,7 +80,7 @@ EOF
 
 ## Constraints & notes
 
-- Follow the repo's \`CLAUDE.md\` and \`CONTEXT.md\`.
+- Follow the repo's \`CLAUDE.md\` (or \`.claude/CLAUDE.md\`) and \`CONTEXT.md\`.
 - Tests are required for every behavior change (TDD: red-green-refactor).
 - Record any architectural decision as a \`docs/adr/\` entry.
 - Do not open, push or merge anything — the /deliver runner does that (ADR-0007).

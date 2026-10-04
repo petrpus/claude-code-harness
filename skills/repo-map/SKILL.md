@@ -1,6 +1,9 @@
 ---
 name: repo-map
-description: Machine-readable module/dependency map (tmp/repo-map.json, Schema v1) that agents query instead of grepping the tree. Grep backend scans JS/TS and Python import edges; a Graphify graph.json is adapted when one is already on disk. Use to answer "what depends on this file", "what does this file depend on", "what are the hotspots", or "what are the entry points" without a fresh grep sweep.
+description: >-
+  Build and query tmp/repo-map.json, a machine-readable import graph (JS/TS and
+  Python; adapts a Graphify graph.json). Use to answer what depends on a file,
+  what it depends on, the hotspots or the entry points without a grep sweep.
 ---
 
 # Skill: /repo-map

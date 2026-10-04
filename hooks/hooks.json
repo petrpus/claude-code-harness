@@ -1,5 +1,5 @@
 {
-  "description": "claude-code-harness hooks — git context injection, verify-status gates, edit/bash guards, session logging",
+  "description": "code-harness hooks — git context injection, verify-status gates, edit/bash guards, session logging",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre-edit.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-edit.sh\""
           }
         ]
       },
@@ -16,11 +16,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre-bash.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-bash.sh\""
           },
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre-commit-gate.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-commit-gate.sh\""
           }
         ]
       }
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/inject-git-context.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/inject-git-context.sh\""
           }
         ]
       }
@@ -40,11 +40,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/on-stop.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-stop.sh\""
           },
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-log.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-log.sh\""
           }
         ]
       }

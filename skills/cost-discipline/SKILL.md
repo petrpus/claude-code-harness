@@ -1,12 +1,10 @@
 ---
 name: cost-discipline
 description: >-
-  Doctrine for keeping token spend and context usage under control — read
-  narrowly, batch tool calls, fan out subagents sparingly. Load before
-  token-heavy work: large-scope reads/greps across a big codebase, fanning out
-  multiple subagents, connecting new MCP servers, or any long session that
-  risks context rot. Triggers: "keep this cheap", "watch the budget", "don't
-  blow the context", "fan out subagents", "spawn agents for this".
+  Doctrine for keeping token spend and context under control — read narrowly,
+  batch tool calls, fan out subagents sparingly. Load before token-heavy work
+  or long sessions. Triggers: "keep this cheap", "watch the budget", "don't blow
+  the context", "fan out subagents".
 ---
 
 # Cost discipline

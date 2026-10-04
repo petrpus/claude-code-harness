@@ -1,4 +1,4 @@
-<title>claude-code-harness — guide</title>
+<title>code-harness — guide</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 /* ============================================================= tokens */
@@ -245,7 +245,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 </style>
 
 <header class="topbar">
-  <span class="brand">claude-code-harness<span class="dot">.</span></span>
+  <span class="brand">code-harness<span class="dot">.</span></span>
   <nav class="topnav">
     <a href="#thesis">Thesis</a>
     <a href="#anatomy">Anatomy</a>
@@ -268,7 +268,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section class="hero" id="thesis" style="border-top:none">
     <div class="hero-grid">
       <div>
-        <p class="eyebrow">Claude Code plugin · v0.6.0</p>
+        <p class="eyebrow">Claude Code plugin · v0.7.0</p>
         <h1>A harness for safe, cost-conscious autonomous development.</h1>
         <p class="lead">Curated skills, two review agents, and git/dev guard hooks — plus a loop engine that runs long unattended sessions behind hard verify gates and real cost caps. Install once; every project gets the same disciplined toolkit.</p>
         <div class="pillrow">
@@ -398,14 +398,14 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
         <div class="term-body">
 <div class="l"><span class="cmd">/plugin marketplace add \</span></div>
 <div class="l cmd" style="padding-left:14px">git@github.com:petrpus/claude-code-harness.git</div>
-<div class="l"><span class="cmd">/plugin install claude-code-harness</span></div>
+<div class="l"><span class="cmd">/plugin install code-harness@claude-code-harness</span></div>
 <div class="l out">✓ skills, agents, hooks available</div>
         </div>
       </div>
       <div class="term">
         <div class="term-bar"><i></i><i></i><i></i><span class="t">make a project ready</span></div>
         <div class="term-body">
-<div class="l"><span class="cmd">/harness-init</span>      <span class="cmt"># settings + tmp/</span></div>
+<div class="l"><span class="cmd">/code-harness:harness-init</span> <span class="cmt"># settings + tmp/</span></div>
 <div class="l"><span class="cmd">/project-infra all</span>  <span class="cmt"># verify · CI · env</span></div>
 <div class="l"><span class="cmd">/harness-doctor</span>    <span class="cmt"># check for drift</span></div>
 <div class="l out">✓ verify command ready</div>
@@ -661,7 +661,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 
 <footer>
   <div class="wrap">
-    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.6.0 · MIT</span>
+    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.7.0 · MIT</span>
     <span class="muted">press <span class="kbd">t</span> to flip theme</span>
   </div>
 </footer>

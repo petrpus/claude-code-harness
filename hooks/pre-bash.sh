@@ -246,7 +246,7 @@ while IFS= read -r seg; do
     if seg_is_tag_only_push "$seg"; then
       : # tags don't move a branch — this rule doesn't apply
     elif [[ "$GIT_OK" -ne 1 || -z "$BRANCH" ]]; then
-      echo "claude-code-harness: could not determine the current branch (git unavailable, not a repo, or detached HEAD) — the push-from-main guard did NOT run for this command." >&2
+      echo "code-harness: could not determine the current branch (git unavailable, not a repo, or detached HEAD) — the push-from-main guard did NOT run for this command." >&2
     elif [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
       echo "Push from \`$BRANCH\` blocked. Use a feature branch." >&2
       echo "  git checkout -b feat/<area>-<short-desc>" >&2

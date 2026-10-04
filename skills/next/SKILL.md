@@ -38,7 +38,7 @@ Lightweight priority surface for GitHub-issue-driven projects. Two labels:
    - **Recent commits:** last 5 oneline.
    - **Suggestion:** if `next` exists, propose `/implement-issue <N>`. If no `next`, ask whether to promote from the queue.
 
-   - **Maps:** if an open issue labelled `map` exists, point to `/deliver #<map>` to deliver its whole Delivery list instead of one issue at a time.
+   - **Maps:** if an open issue labelled `map` exists, point to `/deliver #<map>` to deliver its whole Delivery list instead of one issue at a time. `/deliver` is user-invoked only — suggest the user types `/code-harness:deliver #<map>`; never try to start it yourself.
 
 4. **Wait for the user.** Don't auto-start `/implement-issue`. Don't pick from backlog without asking.
 

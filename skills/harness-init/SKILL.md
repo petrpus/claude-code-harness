@@ -1,6 +1,7 @@
 ---
 name: harness-init
-description: Bootstrap a project to use the claude-code-harness plugin. Copies the settings template into .claude/settings.json, ensures tmp/ exists for verify-status, and prints what to customize next. Run after `/plugin install claude-code-harness`.
+description: Bootstrap a project for the code-harness plugin — copies the settings template into .claude/settings.json, ensures tmp/ is ignored, creates the workflow labels, and prints what to customize next. Run after installing the plugin.
+disable-model-invocation: true
 ---
 
 # Skill: /harness-init
@@ -32,7 +33,7 @@ If empty: abort with "Run `git init` first or cd into a git repo."
 ### 2. Verify plugin reachable
 
 `${CLAUDE_PLUGIN_ROOT}/templates/project-settings.template.json` must exist.
-If not: abort with "Plugin not installed. Run `/plugin install claude-code-harness` first."
+If not: abort with "Plugin not installed. Run `/plugin install code-harness@claude-code-harness` first."
 
 ### 3. Settings file
 
@@ -97,9 +98,11 @@ Next steps:
    (autopilot requires an objective verify command before it will run).
 5. Run /harness-doctor to verify the setup.
 
-New in this harness: /autopilot (controlled long autonomous runs),
-/cost-discipline + /usage-report (token/cost awareness), /openapi-sync and
-/code-map (docs), /project-infra (infra + CI/CD).
+New in this harness: /autopilot (controlled long autonomous runs) and
+/deliver (a Map issue → one PR per issue), /cost-discipline + /usage-report
+(token/cost awareness), /openapi-sync, /repo-map and /code-map (docs),
+/project-infra (infra + CI/CD). /code-harness:autopilot, /code-harness:deliver
+and this init are user-invoked only — Claude won't start them on its own.
 ```
 
 ## When not to use

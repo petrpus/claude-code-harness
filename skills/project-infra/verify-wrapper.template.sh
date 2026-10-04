@@ -3,7 +3,7 @@
 #
 # Runs the project's real verify chain, then records the outcome to
 # tmp/.last-verify-status ("ok" or "fail") — the convention read by the
-# claude-code-harness hooks (inject-git-context.sh, on-stop.sh,
+# code-harness hooks (inject-git-context.sh, on-stop.sh,
 # pre-commit-gate.sh) to decide how stale/fresh the last verify run is.
 #
 # No `set -e`: we need to capture the underlying command's exit code

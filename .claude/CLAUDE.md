@@ -1,4 +1,4 @@
-# CLAUDE.md — claude-code-harness
+# CLAUDE.md — code-harness (repo `claude-code-harness`)
 
 Context for agents working **on this repo**. This repo is itself a Claude Code
 plugin (a "harness") distributed via an Anthropic plugin marketplace, not an
@@ -8,15 +8,23 @@ agent, and hooks.
 ## What this is
 
 A universal code-dev harness for Claude Code. Installed once per machine
-(`/plugin install claude-code-harness`), it makes a curated set of skills, one
-review agent, and a few git/dev safety hooks available in every project. A
+(`/plugin install code-harness@claude-code-harness`), it makes a curated set of
+skills, two agents, and a few git/dev safety hooks available in every project. A
 consumer project's own `.claude/` then holds **only** project-specific things.
+
+Names: the plugin is `code-harness` (components are namespaced `code-harness:*`);
+the repo and its self-marketplace stay `claude-code-harness`. Plugin names
+starting with `claude-` are reserved by Claude Code, so 0.7.0 renamed the plugin
+through the marketplace's append-only `renames` map (ADR-0014). Never rename the
+plugin by editing `name` alone.
 
 ## Layout
 
 ```
+.claude/CLAUDE.md      # this file — contributor context; a CLAUDE.md at the plugin
+                       # root (= repo root) is never loaded and fails validate --strict
 .claude-plugin/
-  marketplace.json    # self-marketplace manifest (this repo is its own marketplace)
+  marketplace.json    # self-marketplace manifest (this repo is its own marketplace) + renames
   plugin.json         # the plugin manifest
 skills/<name>/SKILL.md # one dir per skill; bundled resources sit flat alongside SKILL.md
 agents/                # code-reviewer.md (independent cold-diff review)
@@ -42,9 +50,12 @@ docs/                  # architecture.md, install.md, pocock-sync-log.md
 Sync is **manual, never automated**. `docs/pocock-sync-log.md` is the source of
 truth for what is vendored and at which upstream SHA. To pull an update:
 
-1. Inspect the upstream repo at its target SHA. In this environment the GitHub
-   API/codeload tarballs are proxy-blocked — fetch per-file from
-   `raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` (sleep/retry on 429).
+1. Inspect the upstream repo at its target SHA or release tag. In this
+   environment the GitHub API, github.com pages and codeload tarballs are
+   proxy-blocked, but `git clone --filter=blob:none https://github.com/<owner>/<repo>.git`
+   works and gives full history — diff tags/SHAs locally. Per-file
+   `raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` is the fallback
+   (sleep/retry on 429). Record **commit** SHAs (not `git ls-tree` tree hashes).
 2. Diff `SKILL.md` (and any bundled resource files) against our vendored copy.
 3. Copy what you want, then update the sync-log row: new SHA, review date, note
    what changed. Record local dir-name patches (e.g. `diagnose` ←
@@ -82,7 +93,9 @@ mismatch; leave it as vendored and do not "fix" it locally.
 
 ## Hooks model
 
-Wired in `hooks/hooks.json` against `${CLAUDE_PLUGIN_ROOT}`. **All hooks read
+Wired in `hooks/hooks.json` as `bash "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh"`
+(quoted placeholder, run through `bash` — see `docs/architecture.md` § Plugin
+layout for why not exec form). **All hooks read
 tool input as JSON on stdin** (via `hooks/lib.sh`) — NOT from `$CLAUDE_TOOL_*`
 env vars (those don't exist; assuming them is what made the pre-0.2.0 guards
 silent no-ops). PreToolUse blocks with **exit 2**. See `docs/architecture.md` §
@@ -117,9 +130,28 @@ Nothing here calls MCP. GitHub interaction goes through the `gh` CLI. If a web/m
 Claude Code session attaches account-level MCP connectors, that is environment
 config, unrelated to this repo, and only adds session-init overhead.
 
+## Skill frontmatter rules
+
+`scripts/check-consistency.sh` lints every `skills/*/SKILL.md` and `agents/*.md`
+frontmatter: it must parse as YAML (quote any value containing `: `, or use a
+`>-` block — an unparseable header is still loaded by Claude Code but silently
+skipped by `npx skills`), `name` must equal the directory and match the Agent
+Skills name rule, `description` ≤ 1024 characters, keys must be known Agent
+Skills / Claude Code fields, and the descriptions Claude sees in every session
+(skills without `disable-model-invocation`) must fit the listing budget set in the
+script. Grow that budget only on purpose. Paid or long-running runners
+(`autopilot`, `deliver`) and `harness-init` are user-invoked only (ADR-0015);
+never add `disable-model-invocation` to a skill another skill composes
+(`to-issues`, `to-prd`, `grill-*`, `triage`) — it blocks skill-to-skill calls too.
+
 ## Versioning
 
 Semver in `plugin.json` + git tags; `CHANGELOG.md` is the human record,
 `scripts/check-consistency.sh` asserts they agree. Tag `v0.x.0` on the merge
 commit on `main`, never on a feature branch. The harness generates CI/CD for
-*consumer* projects (`/project-infra ci`); the harness repo has no pipeline yet.
+*consumer* projects (`/project-infra ci`); the harness repo runs its own
+`.github/workflows/verify.yml` (`scripts/verify.sh`, then
+`claude plugin validate --strict` through `npx`). Locally, check-consistency
+runs the validator only with a `claude` CLI ≥ 2.1.233 and skips it otherwise.
+A new check in `scripts/check-consistency.sh` gets a negative case in
+`scripts/test-consistency-lint.sh`, or nothing proves it can fail.
