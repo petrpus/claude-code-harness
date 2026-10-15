@@ -128,15 +128,18 @@ harvest.sh me
 ```
 
 Exit 1 means there is no config yet. Tell the user to run, in their own
-terminal (the token must not pass through the conversation):
+terminal (the token must not pass through the conversation, and it is never
+an argument — `setup` asks for it on a hidden prompt, so it stays out of the
+shell history and the process list):
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh setup <personal-access-token> [account-name]
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh setup [account-name]
 ```
 
 It writes `~/.config/harvest/env` (mode 0600) with the token and the resolved
-account id. Tokens come from https://id.getharvest.com/developers. Stop here
-until `harvest.sh me` succeeds.
+account id (exact name or id first, name substring as a fallback). Tokens come
+from https://id.getharvest.com/developers. Stop here until `harvest.sh me`
+succeeds.
 
 ### 1. Build the batch
 
@@ -196,7 +199,8 @@ the batch names its row:
 
 - `{date} · notes` → replace the row's `notes` with `after` (newlines per
   line; strip HTML).
-- `{date} · hours` → parse `after` as a number; `0` means `"skip": true`.
+- `{date} · hours` → parse `after` as a number; `0` means `"skip": true`,
+  any value above `0` sets `hours` **and removes `skip`**.
 - A comment on a row is an instruction about that row — apply it, re-render,
   keep polling until the user says they are done or the feedback carries no
   edits.
@@ -217,7 +221,8 @@ Each success writes the row's `entry_id` back into the JSON, so a rerun
 skips it; a failure stops the batch at that row and prints which rows went
 through. Report the created entries (date, hours, id) and, on a partial
 failure, exactly which days are still missing. Undo is per entry:
-`harvest.sh delete <entry_id>`.
+`harvest.sh delete <entry_id>` (a `--force` rerun keeps the ids it replaced
+under `previous_entry_ids`, so those stay deletable too).
 
 ### Rules
 

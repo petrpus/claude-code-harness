@@ -2,7 +2,8 @@
 # skills/worklog/harvest.sh — Harvest API v2 helper for /worklog --harvest.
 #
 # Plain curl + jq against api.harvestapp.com; no MCP server, no SDK. The token
-# never leaves this machine: it is read from a config file (or the environment)
+# never leaves this machine: it is read from a config file (or the environment),
+# handed to curl through a config on stdin (never argv, so it is not in `ps`),
 # and sent only to Harvest.
 #
 # Config, first match wins per key:
@@ -11,7 +12,9 @@
 #                 (KEY=VALUE lines, written by `setup`, mode 0600)
 #
 # Commands (every one prints JSON unless --text is given):
-#   setup <token> [account]        resolve the Harvest account (name substring
+#   setup [account]                read the token from $HARVEST_ACCESS_TOKEN or
+#                                  a hidden prompt (never argv), resolve the
+#                                  account (exact name, then name substring,
 #                                  or id) and write the config file
 #   accounts                       accounts the token can see
 #   me                             the current user
@@ -24,7 +27,8 @@
 #                                  one entry per row of [{date,hours,notes}];
 #                                  on success the row gets "entry_id" written
 #                                  back into the file, and rows that already
-#                                  carry one are skipped unless --force
+#                                  carry one are skipped unless --force (which
+#                                  keeps the old id under "previous_entry_ids")
 #   delete <entry_id>              delete a time entry (undo for log/log-batch)
 #
 # Exit codes: 0 ok · 1 usage/config error · 2 Harvest refused (HTTP ≥ 400).
@@ -37,7 +41,7 @@ CONFIG="${HARVEST_CONFIG:-$HOME/.config/harvest/env}"
 UA="code-harness worklog (https://github.com/petrpus/claude-code-harness)"
 
 die()   { echo "harvest: $*" >&2; exit 1; }
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v jq   >/dev/null 2>&1 || die "jq is required"
@@ -63,12 +67,14 @@ need_account() { [[ -n "${HARVEST_ACCOUNT_ID:-}" ]]   || die "no account id — 
 # request METHOD URL [JSON-BODY] → body on stdout; exit 2 on HTTP ≥ 400.
 request() {
   local method="$1" url="$2" body="${3:-}" out code
-  local -a args=(-sS -X "$method" "$url"
-    -H "Authorization: Bearer $HARVEST_ACCESS_TOKEN"
+  # The bearer header goes in through `-K -` (a curl config on stdin) so the
+  # token is never part of curl's argv.
+  local -a args=(-sS -K - -X "$method" "$url"
     -H "User-Agent: $UA" -H "Accept: application/json")
   [[ "$url" == "$API"* && -n "${HARVEST_ACCOUNT_ID:-}" ]] && args+=(-H "Harvest-Account-Id: $HARVEST_ACCOUNT_ID")
   [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" --data "$body")
-  out="$(curl "${args[@]}" -w $'\n%{http_code}' 2>&1)" || die "curl failed: $out"
+  out="$(printf 'header = "Authorization: Bearer %s"\n' "${HARVEST_ACCESS_TOKEN//\"/\\\"}" \
+        | curl "${args[@]}" -w $'\n%{http_code}' 2>&1)" || die "curl failed: $out"
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   if [[ "$code" -ge 400 ]]; then
     echo "harvest: HTTP $code from $method ${url#"$API"}: $(jq -r '.message // .error_description // .error // .' <<<"$out" 2>/dev/null || echo "$out")" >&2
@@ -95,22 +101,34 @@ is_id()    { [[ "$1" =~ ^[0-9]+$ ]]; }
 
 # -------------------------------------------------------------- commands ---
 cmd_setup() {
-  local token="${1:-}" want="${2:-}"
-  [[ -n "$token" ]] || die "usage: harvest.sh setup <token> [account-name-or-id]"
+  local want="${1:-}" token="${HARVEST_ACCESS_TOKEN:-}"
+  [[ "$want" == -* ]] && die "usage: harvest.sh setup [account-name-or-id]  (token via \$HARVEST_ACCESS_TOKEN or the prompt)"
+  if [[ -z "$token" ]]; then
+    # Hidden prompt on the terminal, plain stdin otherwise (pipes, tests):
+    # the token must not appear on a command line or in shell history.
+    if [[ -t 0 ]]; then read -rs -p "Harvest personal access token: " token; echo; else IFS= read -r token; fi
+  fi
+  [[ -n "$token" ]] || die "no token given"
   HARVEST_ACCESS_TOKEN="$token"
   local accounts chosen n
   accounts="$(request GET "$ID_API/accounts" | jq -c '[.accounts[] | select(.product == "harvest") | {id, name}]')" || exit $?
   n="$(jq 'length' <<<"$accounts")"
   [[ "$n" -gt 0 ]] || die "the token sees no Harvest account"
   if [[ -n "$want" ]]; then
-    chosen="$(jq -c --arg w "$want" '[.[] | select((.id|tostring) == $w or (.name|ascii_downcase|contains($w|ascii_downcase)))]' <<<"$accounts")"
+    # Exact id or exact name (case-insensitive) wins; only when nothing matches
+    # exactly does a substring count, so "Acme" is not ambiguous beside
+    # "Acme Sandbox".
+    chosen="$(jq -c --arg w "$want" '
+      ($w | ascii_downcase) as $lw
+      | ([.[] | select((.id|tostring) == $w or (.name|ascii_downcase) == $lw)]) as $exact
+      | if ($exact|length) > 0 then $exact else [.[] | select(.name|ascii_downcase|contains($lw))] end' <<<"$accounts")"
   else
     chosen="$accounts"
   fi
   case "$(jq 'length' <<<"$chosen")" in
     1) ;;
     0) echo "no account matches '$want'. Available:" >&2; jq -r '.[] | "  \(.id)\t\(.name)"' <<<"$accounts" >&2; exit 1 ;;
-    *) echo "several accounts match — name one:" >&2; jq -r '.[] | "  \(.id)\t\(.name)"' <<<"$chosen" >&2; exit 1 ;;
+    *) echo "several accounts match — give the exact name or the id:" >&2; jq -r '.[] | "  \(.id)\t\(.name)"' <<<"$chosen" >&2; exit 1 ;;
   esac
   local id name
   id="$(jq -r '.[0].id' <<<"$chosen")"; name="$(jq -r '.[0].name' <<<"$chosen")"
@@ -227,8 +245,14 @@ cmd_log_batch() {
       elif ($r.hours|type) != "number" or $r.hours <= 0 or $r.hours > 24 then "row \($i) (\($r.date)): hours must be in (0, 24], got \($r.hours)"
       else empty end' "$file")"
   [[ -z "$bad" ]] || die $'invalid rows:\n'"$bad"
+  # The regex above only checks the shape; an impossible day (2026-13-45) is
+  # caught here, still before the first request.
+  local d
+  while IFS= read -r d; do
+    is_date "$d" || die "invalid rows: $d is not a real date"
+  done < <(jq -r --argjson force "$force" '.[] | select((.entry_id == null or $force == 1) and (.skip != true)) | .date' "$file")
 
-  local rows n i row d h notes created id
+  local rows n i row h notes created id
   rows="$(jq -c --argjson force "$force" '[to_entries[] | select((.value.entry_id == null or $force == 1) and (.value.skip != true))]' "$file")"
   n="$(jq 'length' <<<"$rows")"
   if [[ "$n" -eq 0 ]]; then echo "nothing to log: every row is already logged (entry_id) or skipped" >&2; echo '[]'; return 0; fi
@@ -248,9 +272,20 @@ cmd_log_batch() {
       return 2
     fi
     id="$(jq -r '.id' <<<"$created")"
-    # Write the id back row by row so an interrupted batch leaves an exact record.
-    jq --argjson k "$(jq '.key' <<<"$row")" --argjson id "$id" '.[$k].entry_id = $id' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
     results="$(jq -c --argjson c "$created" '. + [$c]' <<<"$results")"
+    # Write the id back row by row so an interrupted batch leaves an exact
+    # record. A --force run keeps the id it replaces, so every entry the file
+    # ever created stays reachable for `delete`. If the write-back fails the
+    # entry exists in Harvest but the file does not know — stop right there
+    # and say so, or the next run would log the day again.
+    if ! jq --argjson k "$(jq '.key' <<<"$row")" --argjson id "$id" '
+         .[$k] |= (if .entry_id != null then .previous_entry_ids = ((.previous_entry_ids // []) + [.entry_id]) else . end | .entry_id = $id)' \
+         "$file" > "$file.tmp" 2>/dev/null || ! mv "$file.tmp" "$file"; then
+      rm -f "$file.tmp"
+      echo "harvest: entry $id ($d, $h h) was created but could not be recorded in $file — add \"entry_id\": $id to that row by hand before running the batch again" >&2
+      printf '%s\n' "$results"
+      return 2
+    fi
     echo "logged $d $h h → entry $id" >&2
   done
   printf '%s\n' "$results"

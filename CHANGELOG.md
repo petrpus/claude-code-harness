@@ -9,8 +9,10 @@ All notable changes to the harness (the `code-harness` plugin, named
 
 - `worklog --harvest`: the digest becomes one Harvest time entry per day.
   `skills/worklog/harvest.sh` talks to the Harvest v2 API with curl + jq (no
-  MCP server, no third-party code holding the token): `setup` resolves the
-  account by name and writes `~/.config/harvest/env` (0600), `projects` /
+  MCP server, no third-party code holding the token; the token reaches curl
+  through a config on stdin, never argv): `setup` takes the token on a hidden
+  prompt, resolves the account by name and writes `~/.config/harvest/env`
+  (0600), `projects` /
   `entries` read, `log` / `log-batch` write, `delete` undoes. A batch is
   validated whole before the first request, every created `entry_id` is
   written back into the batch file row by row, and a rerun skips logged rows,

@@ -29,19 +29,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 jq -e 'type == "array" and all(.[]; .date and .hours != null)' "$in" >/dev/null 2>&1 || die "$in must be a JSON array of {date, hours, notes}"
+while IFS= read -r d; do
+  [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$d" >/dev/null 2>&1 || die "$in: $d is not a real date"
+done < <(jq -r '.[].date' "$in")
 
 from="$(jq -r 'map(.date) | min' "$in")"; to="$(jq -r 'map(.date) | max' "$in")"
 
 rows="$(jq -r '
   def esc: tostring | @html;
   def day: (.date | strptime("%Y-%m-%d") | strftime("%a"));
-  .[] | "<tr\(if .entry_id then " class=\"logged\"" else "" end)>
+  .[] | "<tr\(if .entry_id or .skip == true then " class=\"logged\"" else "" end)>
   <td class=\"date\"><strong>\(.date|esc)</strong><small>\(day)</small></td>
   <td data-block=\"\(.date|esc) · notes\">\((.notes // "") | esc | gsub("\n"; "<br>"))</td>
   <td class=\"num\" data-block=\"\(.date|esc) · hours\">\(.hours|esc)</td>
-  <td class=\"num muted\">\(if .entry_id then "entry \(.entry_id|esc)" elif .logged then "\(.logged|esc) h" else "" end)</td>
-</tr>"' "$in")"
-total="$(jq -r 'map(.hours) | add // 0' "$in")"
+  <td class=\"num muted\">\(if .entry_id then "entry \(.entry_id|esc)" elif .skip == true then "skipped" elif .logged then "\(.logged|esc) h" else "" end)</td>
+</tr>"' "$in")" || die "could not render the rows of $in"
+# Only the rows log-batch would send count towards the total the user confirms.
+to_send="$(jq -r 'map(select(.entry_id == null and .skip != true) | .hours) | add // 0' "$in")"
+held="$(jq -r 'map(select(.entry_id != null or .skip == true) | .hours) | add // 0' "$in")"
 
 cat > "$out" <<HTML
 <!doctype html>
@@ -81,9 +86,9 @@ cat > "$out" <<HTML
       <tbody>
 $rows
       </tbody>
-      <tfoot><tr><td>Total</td><td></td><td class="num">$total</td><td></td></tr></tfoot>
+      <tfoot><tr><td>To send</td><td></td><td class="num">$to_send</td><td class="num muted">${held} h logged/skipped</td></tr></tfoot>
     </table>
-    <p class="hint">Rows marked as logged already have a Harvest entry and will be skipped. Set a day's hours to 0 to leave it out.</p>
+    <p class="hint">Greyed rows already have a Harvest entry or are skipped and will not be sent. Set a day's hours to 0 to leave it out; set them back above 0 to include it again.</p>
   </section>
 </main>
 </body>
