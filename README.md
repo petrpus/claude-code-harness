@@ -10,7 +10,7 @@ The plugin is **`code-harness`**; this repository is its marketplace, **`claude-
 |---|---|
 | **Skills (Pocock-derived, vendored)** | `caveman`, `codebase-design`, `diagnose`, `domain-modeling`, `grill-me`, `grill-with-docs`, `grilling`, `handoff`, `improve-codebase-architecture`, `prototype`, `research`, `resolving-merge-conflicts`, `tdd`, `to-issues`, `to-prd`, `triage`, `write-a-skill`, `zoom-out` |
 | **Skills (Vercel Labs)** | `find-skills` |
-| **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog`, `harness-init`, `harness-doctor` |
+| **Skills (own — workflow)** | `next`, `commit-agent`, `implement-issue`, `start-feature`, `migration-check`, `worklog` (commit digest; `--harvest` logs it to Harvest after a review table), `harness-init`, `harness-doctor` |
 | **Skills (own — autonomy & infra)** | `autopilot` (controlled long autonomous runs), `deliver` (a Map issue → per-issue autopilot runs → one integration PR), `cost-discipline` (token/tool/fanout doctrine), `usage-report` (spend), `project-infra` (verify/CI/devcontainer), `openapi-sync`, `repo-map` (queryable import graph), `code-map` |
 | **Agents** | `code-reviewer` (independent cold-diff review, sonnet), `verifier` (adversarial 17-shortcuts gate, haiku) |
 | **Hooks** | `inject-git-context` (UserPromptSubmit), `on-stop` + `session-log` (Stop), `pre-bash` (push-from-main / force-push / rm -rf guards), `pre-commit-gate` (verify freshness warn), `pre-edit` (`.env` + lockfile blocks); all parse stdin JSON via `hooks/lib.sh` |
