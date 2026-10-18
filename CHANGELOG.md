@@ -3,6 +3,28 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [Unreleased]
+
+### Added
+
+- `worklog --harvest`: the digest becomes one Harvest time entry per day.
+  `skills/worklog/harvest.sh` talks to the Harvest v2 API with curl + jq (no
+  MCP server, no third-party code holding the token; the token reaches curl
+  through a config on stdin, never argv): `setup` takes the token on a hidden
+  prompt, resolves the account by name and writes `~/.config/harvest/env`
+  (0600), `projects` /
+  `entries` read, `log` / `log-batch` write, `delete` undoes. A batch is
+  validated whole before the first request, every created `entry_id` is
+  written back into the batch file row by row, and a rerun skips logged rows,
+  so an interrupted batch never double-logs. `harvest-review.sh` renders the
+  batch as a static review table (no script, no token) whose cells are
+  labelled `<date> · notes|hours` for the `human-review` skill; the skill
+  applies the user's edits to the batch, asks for an explicit yes, and only
+  then logs.
+  Requests time out (`HARVEST_MAX_TIME`, default 60 s), and
+  `scripts/test-harvest.sh` runs both scripts against a stub `curl` in
+  `verify.sh`.
+
 ## [0.7.1] — 2026-10-18
 
 Patch release: a large review diff no longer parks an issue.
