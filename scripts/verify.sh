@@ -798,6 +798,7 @@ cat > "$AGENT_DIR/bin/claude" <<'STUB'
 #!/usr/bin/env bash
 pwd > "$AGENT_PWD_FILE"
 printf '%s\n' "$*" > "$AGENT_ARGS_FILE"
+[[ -n "${AGENT_STDIN_FILE:-}" ]] && cat > "$AGENT_STDIN_FILE"
 case "${STUB_AGENT_MODE:-ok}" in
   ok)    printf '{"result":"hi there","total_cost_usd":0.25,"num_turns":2,"usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":5}}\n' ;;
   fail)  echo "not json at all"; exit 3 ;;
@@ -850,6 +851,19 @@ AGENT_ARGS_FIRST="$(cat "$AGENT_DIR/args.first" 2>/dev/null)"
 [[ "$AGENT_L4" == "0|dry-run|not-called" ]] \
   && ok "AGENT_DRY_RUN returns a zero-cost dry-run result without calling claude" \
   || note "dry run: '$AGENT_L4'"
+
+# #119: the prompt travels on stdin. As one argv string, anything over
+# MAX_ARG_STRLEN (128 KiB) made exec fail with E2BIG before claude started.
+AGENT_BIG="$(cd "$AGENT_DIR" && PATH="$AGENT_DIR/bin:$PATH" AGENT_PWD_FILE="$AGENT_DIR/pwd" \
+  AGENT_ARGS_FILE="$AGENT_DIR/args.big" AGENT_STDIN_FILE="$AGENT_DIR/stdin.big" bash -c '
+  . "$1/skills/autopilot/agent.sh"
+  big="BIG-START$(head -c 200000 /dev/zero | tr "\0" x)BIG-END"
+  agent_run review sonnet "Read" acceptEdits "$big"; echo "$?|$AGENT_LAST_RESULT"
+' _ "$AGENT_REPO" "$AGENT_DIR" 2>/dev/null)"
+[[ "$AGENT_BIG" == "0|hi there" ]] && grep -q '^BIG-STARTx*BIG-END$' "$AGENT_DIR/stdin.big" 2>/dev/null \
+  && [[ "$(wc -c < "$AGENT_DIR/stdin.big")" -ge 200016 ]] && ! grep -q 'BIG-START' "$AGENT_DIR/args.big" \
+  && ok "a prompt over 128 KiB reaches claude whole on stdin, not argv (#119)" \
+  || note "large prompt: rc|result='$AGENT_BIG', stdin bytes=$(wc -c < "$AGENT_DIR/stdin.big" 2>/dev/null), in argv: $(grep -c BIG-START "$AGENT_DIR/args.big" 2>/dev/null)"
 
 # ADR-0007: the model call runs without forge credentials; the caller keeps
 # its own. The stub reports what it sees; the caller's environment is checked
