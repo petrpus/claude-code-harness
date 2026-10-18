@@ -29,6 +29,8 @@
 #                                  back into the file, and rows that already
 #                                  carry one are skipped unless --force (which
 #                                  keeps the old id under "previous_entry_ids")
+#   update <entry_id> [--hours H] [--notes TEXT|--notes-file F]
+#                                  change the hours and/or notes of an entry
 #   delete <entry_id>              delete a time entry (undo for log/log-batch)
 #
 # Exit codes: 0 ok · 1 usage/config error (also: curl or jq missing, a network
@@ -211,7 +213,7 @@ cmd_entries() {
   url="$API/time_entries?user_id=$me&from=$from&to=$to&per_page=100"
   [[ -n "$project" ]] && url="$url&project_id=$project"
   json="$(paged "$url" time_entries)" || exit $?
-  json="$(jq '[.[] | {id, date: .spent_date, hours, project_id: .project.id, project: .project.name, task: .task.name, notes}] | sort_by(.date, .id)' <<<"$json")"
+  json="$(jq '[.[] | {id, date: .spent_date, hours, project_id: .project.id, project: .project.name, task_id: .task.id, task: .task.name, notes}] | sort_by(.date, .id)' <<<"$json")"
   if [[ "$text" -eq 1 ]]; then
     jq -r 'group_by(.date)[] | "\(.[0].date)\t\(map(.hours) | add) h\t" + (map("\(.project) / \(.task) \(.hours) h") | join("; "))' <<<"$json"
   else
@@ -328,6 +330,27 @@ cmd_log_batch() {
   printf '%s\n' "$results"
 }
 
+cmd_update() {
+  need_token; need_account
+  local id="${1:-}"; shift 1 2>/dev/null || true
+  is_id "$id" || die "usage: harvest.sh update <entry_id> [--hours H] [--notes TEXT|--notes-file F]"
+  local h="" notes="" has_notes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hours) need_val "$@"; h="$2"; shift 2 ;;
+      --notes) [[ $# -ge 2 ]] || die "--notes needs a value"; notes="$2"; has_notes=1; shift 2 ;;
+      --notes-file) need_val "$@"; [[ -r "$2" ]] || die "cannot read $2"; notes="$(cat "$2")"; has_notes=1; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$h" || "$has_notes" -eq 1 ]] || die "update needs --hours and/or --notes"
+  [[ -z "$h" ]] || is_hours "$h" || die "hours must be a number in (0, 24]"
+  local body
+  body="$(jq -nc --arg h "$h" --arg n "$notes" --argjson hn "$has_notes" \
+    '(if $h != "" then {hours: ($h | tonumber)} else {} end) + (if $hn == 1 then {notes: $n} else {} end)')"
+  request PATCH "$API/time_entries/$id" "$body" | jq -c '{id, date: .spent_date, hours, project: .project.name, task: .task.name}'
+}
+
 cmd_delete() {
   need_token; need_account
   local id="${1:-}"
@@ -348,6 +371,7 @@ case "$cmd" in
   entries)   cmd_entries "$@" ;;
   log)       cmd_log "$@" ;;
   log-batch) cmd_log_batch "$@" ;;
+  update)    cmd_update "$@" ;;
   delete)    cmd_delete "$@" ;;
   -h|--help|help|"") usage ;;
   *) die "unknown command: $cmd (try --help)" ;;

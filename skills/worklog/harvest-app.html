@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worklog → Harvest</title>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1d1d1b; --muted:#6b6b66; --line:#dcdcd7; --card:#fff; --field:#fff;
+          --accent:#f36c21; --accent-fg:#fff; --ok:#1f7a3d; --err:#b3261e; --changed:#fff4e8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161615; --fg:#ececea; --muted:#9a9a94; --line:#34342f; --card:#1f1f1d; --field:#262624;
+            --ok:#6fcf8f; --err:#ff8a80; --changed:#3a2a1c; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px 16px 64px; background:var(--bg); color:var(--fg);
+         font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:1280px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  .bar { display:flex; flex-wrap:wrap; gap:12px 20px; align-items:end; margin-bottom:16px; }
+  label.field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); font-weight:600; }
+  select, input, textarea, button { font:inherit; color:inherit; }
+  select, input, textarea { background:var(--field); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  select:focus, input:focus, textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  #project { min-width:280px; }
+  .task { padding:7px 0; font-weight:600; color:var(--fg); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; min-width:900px; }
+  th, td { text-align:left; vertical-align:top; padding:10px 8px; border-top:1px solid var(--line); }
+  th { font-size:12px; color:var(--muted); font-weight:600; border-top:0; }
+  td.date { white-space:nowrap; font-variant-numeric:tabular-nums; width:96px; }
+  td.date small { display:block; color:var(--muted); }
+  td.now { width:30%; }
+  .entry { margin:0 0 8px; }
+  .entry:last-child { margin:0; }
+  .entry .h { font-weight:600; font-variant-numeric:tabular-nums; }
+  .entry .n { white-space:pre-line; color:var(--muted); font-size:13px; }
+  .none { color:var(--muted); font-style:italic; }
+  .muted { color:var(--muted); }
+  .field.static { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); font-weight:600; }
+  td.hours { width:84px; }
+  td.hours input { width:68px; text-align:right; font-variant-numeric:tabular-nums; }
+  td.notes textarea { width:100%; min-height:72px; resize:vertical; overflow:hidden; }
+  td.act { width:170px; }
+  td.act select { width:100%; margin-bottom:6px; font-size:12px; }
+  tr.changed td.hours input, tr.changed td.notes textarea { background:var(--changed); }
+  td.hours input[aria-invalid="true"] { border-color:var(--err); outline-color:var(--err); }
+  #message button { margin-left:8px; }
+  button { border:1px solid var(--line); background:var(--field); border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-fg); font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  td.act button { width:100%; }
+  .status { font-size:12px; margin-top:6px; }
+  .status.ok { color:var(--ok); }
+  .status.err { color:var(--err); }
+  tfoot td { font-weight:600; font-variant-numeric:tabular-nums; }
+  .actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:16px; }
+  .confirm { display:none; gap:8px; align-items:center; }
+  .confirm.open { display:flex; }
+  #message { margin-top:12px; }
+  .hint { color:var(--muted); font-size:12px; margin-top:12px; }
+  .closed { padding:48px 16px; text-align:center; color:var(--muted); }
+</style>
+</head>
+<body>
+<main id="app">
+  <h1>Worklog → Harvest</h1>
+  <p class="sub" id="window">Loading…</p>
+  <div class="bar">
+    <label class="field">Project<select id="project"></select></label>
+    <div class="field static">
+      Task<span class="task" id="task"></span>
+    </div>
+  </div>
+  <section class="card">
+    <table>
+      <thead><tr>
+        <th>Day</th><th>In Harvest now</th><th>Hours</th><th>Proposed notes</th><th>Action</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+      <tfoot><tr>
+        <td>Total</td><td id="total-now"></td><td id="total-proposed"></td><td></td><td></td>
+      </tr></tfoot>
+    </table>
+  </section>
+  <div class="actions">
+    <button class="primary" id="send-all" type="button">Send all changes</button>
+    <span class="confirm" id="confirm">
+      <span id="confirm-text"></span>
+      <button class="primary" id="confirm-yes" type="button">Yes, send</button>
+      <button id="confirm-no" type="button">Back</button>
+    </span>
+    <button id="done" type="button">Done — close</button>
+  </div>
+  <p class="status" id="message"></p>
+  <p class="hint">Nothing reaches Harvest until you press a row's button or “Send all changes”. A day with an existing entry updates that entry; pick “New entry” to add another one instead. Hours take 1.5, 1,5 or 1:30.</p>
+</main>
+<script>
+"use strict";
+const KEY = new URLSearchParams(location.hash.slice(1)).get("k") || "";
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {
+  const n = document.createElement(tag);
+  Object.assign(n, props);
+  for (const k of kids) n.append(k);
+  return n;
+};
+let state = null;
+let entries = [];
+let entriesOk = false;
+let busy = false;
+const rowState = new Map();
+
+async function api(path, body) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { "X-Worklog-Key": KEY, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new Error("The page's server has stopped. Run /worklog --harvest again; edits not sent yet are only on this page.");
+  }
+  const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function parseHours(text) {
+  const t = text.trim();
+  const hm = t.match(/^(\d{1,2}):([0-5]\d)$/);
+  const dec = t.match(/^\d{1,2}(?:[.,]\d{1,2})?$/);
+  if (!hm && !dec) return null;
+  const n = hm ? Number(hm[1]) + Number(hm[2]) / 60 : Number(t.replace(",", "."));
+  return n > 0 && n <= 24 ? Math.round(n * 100) / 100 : null;
+}
+const fmt = (h) => (Math.round(h * 100) / 100).toString();
+const weekday = (d) => new Date(d + "T12:00:00").toLocaleDateString("en-GB", { weekday: "short" });
+
+function message(text, kind = "", retry = null) {
+  $("message").textContent = text;
+  $("message").className = "status " + kind;
+  if (retry) $("message").append(el("button", { type: "button", textContent: "Retry", onclick: retry }));
+}
+
+async function load() {
+  state = await api("/api/state");
+  $("window").textContent = `Window ${state.from} – ${state.to}. Proposals come from the commits; edit them, then send.`;
+  $("task").textContent = state.task_name;
+  const sel = $("project");
+  sel.name = "project";
+  sel.replaceChildren(el("option", { value: "", textContent: "— choose a project —" }));
+  for (const p of state.projects) {
+    sel.append(el("option", {
+      value: String(p.project_id),
+      textContent: p.task_id ? p.label : `${p.label} (no ${state.task_name} task)`,
+      disabled: !p.task_id,
+    }));
+  }
+  sel.value = state.project_id ? String(state.project_id) : "";
+  for (const r of state.rows) {
+    rowState.set(r.date, { hours: r.hours == null ? "" : fmt(r.hours), notes: r.notes, entryId: r.entry_id, target: undefined, status: null });
+  }
+  await loadEntries();
+}
+
+async function loadEntries() {
+  const pid = Number($("project").value);
+  entries = [];
+  entriesOk = false;
+  if (pid) {
+    try {
+      entries = await api(`/api/entries?project=${pid}`);
+      entriesOk = true;
+    } catch (e) {
+      // Without the current entries every day would look empty and offer
+      // "Create entry": keep every write disabled until a read succeeds.
+      message(`Could not read Harvest: ${e.message}`, "err", () => { message(""); loadEntries(); });
+    }
+  }
+  render();
+}
+
+const dayEntries = (date) => entries.filter((e) => e.date === date);
+
+function targetOf(date) {
+  const rs = rowState.get(date);
+  const list = dayEntries(date);
+  if (rs.target !== undefined && (rs.target === "new" || list.some((e) => e.id === rs.target))) return rs.target;
+  const own = list.find((e) => e.id === rs.entryId);
+  return own ? own.id : list.length ? list[0].id : "new";
+}
+
+function pending(date) {
+  const rs = rowState.get(date);
+  const h = parseHours(rs.hours);
+  if (busy || !entriesOk || !Number($("project").value) || h == null) return null;
+  const target = targetOf(date);
+  if (target !== "new") {
+    const e = entries.find((x) => x.id === target);
+    if (e && Number(e.hours) === h && (e.notes || "") === rs.notes.trim()) return null;
+  }
+  // `new` only when the user picked "New entry" beside existing ones; the
+  // server refuses a plain create on a day that already has an entry.
+  return { date, hours: h, notes: rs.notes.trim(), entry_id: target === "new" ? null : target, new: rs.target === "new" };
+}
+
+function render() {
+  const tbody = $("rows");
+  tbody.replaceChildren();
+  let totalNow = 0;
+  let totalProposed = 0;
+  for (const r of state.rows) {
+    const rs = rowState.get(r.date);
+    const list = dayEntries(r.date);
+    totalNow += list.reduce((s, e) => s + Number(e.hours), 0);
+    totalProposed += parseHours(rs.hours) || 0;
+
+    const now = el("td", { className: "now" });
+    if (list.length === 0) now.append(el("span", { className: "none", textContent: "nothing logged" }));
+    for (const e of list) {
+      now.append(el("div", { className: "entry" },
+        el("span", { className: "h", textContent: `${fmt(Number(e.hours))} h` }),
+        el("span", { className: "muted", textContent: ` · #${e.id}` }),
+        el("div", { className: "n", textContent: e.notes || "" })));
+    }
+
+    const hours = el("input", { name: `hours-${r.date}`, value: rs.hours, inputMode: "decimal", placeholder: "h", ariaLabel: `${r.date} hours` });
+    const notes = el("textarea", { name: `notes-${r.date}`, value: rs.notes, ariaLabel: `${r.date} notes` });
+    const target = el("select", { name: `target-${r.date}`, ariaLabel: `${r.date} target` });
+    for (const e of list) target.append(el("option", { value: String(e.id), textContent: `Update #${e.id} (${fmt(Number(e.hours))} h)` }));
+    target.append(el("option", { value: "new", textContent: "New entry" }));
+    target.value = String(targetOf(r.date));
+    target.hidden = list.length === 0;
+
+    const button = el("button", { type: "button", className: "primary" });
+    const status = el("div", { className: "status" });
+    if (rs.status) { status.textContent = rs.status.text; status.className = "status " + rs.status.kind; }
+    const tr = el("tr", {},
+      el("td", { className: "date" }, el("strong", { textContent: r.date }), el("small", { textContent: weekday(r.date) })),
+      now, el("td", { className: "hours" }, hours), el("td", { className: "notes" }, notes),
+      el("td", { className: "act" }, target, button, status));
+
+    const refresh = () => {
+      const p = pending(r.date);
+      const invalid = rs.hours.trim() !== "" && parseHours(rs.hours) == null;
+      hours.setAttribute("aria-invalid", String(invalid));
+      hours.title = invalid ? "0–24 h, e.g. 1.5, 1,5 or 1:30" : "";
+      button.disabled = !p;
+      button.textContent = targetOf(r.date) === "new" ? "Create entry" : "Update entry";
+      tr.classList.toggle("changed", !!p);
+      updateSendAll();
+    };
+    hours.addEventListener("input", () => { rs.hours = hours.value; refresh(); updateTotals(); });
+    notes.addEventListener("input", () => { rs.notes = notes.value; fit(notes); refresh(); });
+    target.addEventListener("change", () => { rs.target = target.value === "new" ? "new" : Number(target.value); refresh(); });
+    button.addEventListener("click", () => applyRows([r.date]));
+    refresh();
+    tbody.append(tr);
+    fit(notes);
+  }
+  $("total-now").textContent = `${fmt(totalNow)} h`;
+  $("total-proposed").textContent = `${fmt(totalProposed)} h`;
+  updateSendAll();
+}
+
+function fit(textarea) {
+  textarea.style.height = "auto";
+  textarea.style.height = `${textarea.scrollHeight + 2}px`;
+}
+
+function updateTotals() {
+  let t = 0;
+  for (const r of state.rows) t += parseHours(rowState.get(r.date).hours) || 0;
+  $("total-proposed").textContent = `${fmt(t)} h`;
+}
+
+function pendingDates() {
+  return state ? state.rows.map((r) => r.date).filter((d) => pending(d)) : [];
+}
+
+function updateSendAll() {
+  const n = pendingDates().length;
+  $("send-all").disabled = n === 0;
+  $("send-all").textContent = n ? `Send all changes (${n})` : "Send all changes";
+}
+
+async function applyRows(dates) {
+  const pid = Number($("project").value);
+  const todo = dates.map((d) => pending(d)).filter(Boolean);
+  busy = true;
+  $("project").disabled = true;
+  for (const b of document.querySelectorAll("button")) b.disabled = true;
+  let failed = 0;
+  for (const p of todo) {
+    const rs = rowState.get(p.date);
+    try {
+      const res = await api("/api/apply", { project_id: pid, ...p });
+      rs.entryId = res.entry.id;
+      rs.target = res.entry.id;
+      const verb = res.action === "created" ? "Created" : "Updated";
+      rs.status = res.warning
+        ? { kind: "err", text: `${verb} #${res.entry.id} — ${res.warning}` }
+        : { kind: "ok", text: `${verb} #${res.entry.id}` };
+    } catch (e) {
+      failed += 1;
+      rs.status = { kind: "err", text: e.message };
+      break;
+    }
+  }
+  busy = false;
+  $("project").disabled = false;
+  for (const id of ["done", "confirm-yes", "confirm-no"]) $(id).disabled = false;
+  message(failed ? "Stopped at the first refused row; the rows before it are in Harvest." : "", failed ? "err" : "");
+  await loadEntries();
+}
+
+$("project").addEventListener("change", async () => {
+  const pid = Number($("project").value);
+  for (const rs of rowState.values()) { rs.target = undefined; rs.status = null; }
+  if (pid) {
+    try { await api("/api/project", { project_id: pid }); } catch (e) { message(e.message, "err"); }
+  }
+  await loadEntries();
+});
+
+$("send-all").addEventListener("click", () => {
+  const n = pendingDates().length;
+  $("confirm-text").textContent = `Send ${n} ${n === 1 ? "entry" : "entries"} to Harvest?`;
+  $("confirm").classList.add("open");
+  $("send-all").hidden = true;
+});
+$("confirm-no").addEventListener("click", () => {
+  $("confirm").classList.remove("open");
+  $("send-all").hidden = false;
+});
+$("confirm-yes").addEventListener("click", async () => {
+  $("confirm").classList.remove("open");
+  $("send-all").hidden = false;
+  await applyRows(pendingDates());
+});
+
+$("done").addEventListener("click", async () => {
+  try { await api("/api/done", {}); } catch { /* the server may already be gone */ }
+  $("app").replaceChildren(el("p", { className: "closed", textContent: "Closed. Go back to Claude Code; you can close this tab." }));
+});
+
+load().catch((e) => message(e.message, "err"));
+// Keeps the server's idle timer from firing while the page is open.
+setInterval(() => { api("/api/ping").catch((e) => message(e.message, "err")); }, 60000);
+</script>
+</body>
+</html>

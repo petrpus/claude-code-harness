@@ -1,6 +1,6 @@
 ---
 name: worklog
-description: Generate a per-day, per-author time-tracking summary from git commits across all local and remote branches. Optional integer argument = days back (default 3). With --harvest, turn the digest into Harvest time entries after the user edits notes and hours in a review table.
+description: Generate a per-day, per-author time-tracking summary from git commits across all local and remote branches. Optional integer argument = days back (default 3). With --harvest, open a local page to review the days against Harvest and create or update the entries there.
 argument-hint: "[days-back, default 3] [--harvest]"
 ---
 
@@ -10,7 +10,7 @@ Daily commit-history digest for time tracking. Walks `git log --all` (local + re
 
 ## Inputs
 
-- `$ARGUMENTS` — optional integer **X**, the number of days back from today (inclusive). Defaults to `3` (= today and the previous 3 days, so 4 calendar days).
+- A number — optional integer **X**, the number of days back from today (inclusive). Defaults to `3` (= today and the previous 3 days, so 4 calendar days).
 - `--harvest` — after the digest, log the days into Harvest through the
   `## Harvest mode` flow below. The integer may come before or after the flag.
 
@@ -112,14 +112,19 @@ Filename pattern: `tmp/worklog-{from}_to_{to}.md`. If the file already exists, o
 
 ## Harvest mode (`--harvest`)
 
-Turns the digest into one Harvest time entry per day for **the user running the
-skill** (their own commits only — never log another author's work). Harvest is
-reached through `harvest.sh` (bundled, curl + jq, no MCP); the user edits the
-batch in a static review table before anything is sent.
+Turns the digest into Harvest time entries for **the user running the skill**
+(their own commits only — never log another author's work), on the
+**Programming** task. The user reviews and sends them on a local page:
+a project select, what Harvest already holds for that project and task in the
+window, and an editable proposal per day with a button that creates the entry
+or updates the existing one.
 
-Both scripts live in this skill's directory and are not on `PATH`: call them
-by the full path shown in each step. `tmp/` is the consumer project's
-gitignored `tmp/`.
+Harvest is reached only through `harvest.sh` (bundled, curl + jq, no MCP).
+`harvest-app.py` (python3, standard library only) serves the page on
+127.0.0.1 and calls `harvest.sh` for every read and write, so the token never
+reaches the page, the chat or this skill. Both scripts live in this skill's
+directory and are not on `PATH`: call them by the full path shown in each
+step. `tmp/` is the consumer project's gitignored `tmp/`.
 
 ### 0. Credentials
 
@@ -130,21 +135,23 @@ ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh me
 Exit 1 with "no token" or "no account id" means there is no config yet (exit 1
 also covers a missing curl or jq, or a network failure — say which). Exit 2
 with HTTP 401 means the token expired or was revoked: `setup` again replaces
-it. Tell the user to run, in their own
-terminal (the token must not pass through the conversation, and it is never
-an argument — `setup` asks for it on a hidden prompt, so it stays out of the
-shell history and the process list):
+it. Tell the user, in two numbered steps, to:
+
+1. create a personal access token at https://id.getharvest.com/developers
+   (Create new personal access token) and copy it;
+2. run, in **their own terminal** (not through `!`: the token goes into a
+   hidden prompt, never onto a command line or into the conversation):
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh setup [account-name]
 ```
 
 It writes `~/.config/harvest/env` (mode 0600) with the token and the resolved
-account id (exact name or id first, name substring as a fallback). Tokens come
-from https://id.getharvest.com/developers. Stop here until `harvest.sh me`
-succeeds.
+account id (exact name or id first, name substring as a fallback; the
+argument is only needed when the token sees several accounts). Stop here until
+`harvest.sh me` succeeds.
 
-### 1. Build the batch
+### 1. Build the proposals
 
 Write `tmp/worklog-harvest-{from}_to_{to}.json`, one row per day the user has
 commits (or session-log activity with no commit — say so in the notes):
@@ -155,97 +162,81 @@ commits (or session-log activity with no commit — say so in the notes):
 
 - `notes` is the day's bullets joined with newlines, same language rules as
   the digest, issue/PR numbers kept. No headline, no hashes.
-- `hours` is an **estimate**, and the table says so. Derive it from the
+- `hours` is an **estimate** the user corrects on the page. Derive it from the
   day's shape rather than from the commit count: the span between the first
   and last commit of the day (session log included), scaled down for gaps
   longer than two hours; a day with a single small commit is 1–2 h, a day
   with a merged multi-PR feature is 6–8 h; round to the quarter hour; never
-  exceed 10 h without the user asking for it. Say in the chat which rule
-  produced each estimate only if the user asks.
-- If the file already exists for the same window, reuse its rows (the user
-  may have edited it or already logged some of them — rows with `entry_id`
-  must survive).
+  exceed 10 h. Say which rule produced an estimate only if the user asks.
+- If the file already exists for the same window, keep its rows: the page
+  wrote the user's edits and `entry_id`s into it.
 
-### 2. Pick the project and task
+### 2. Guess the project
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh projects --text
 ```
 
-Ask with AskUserQuestion: one question for the project (client / project
-name, id in the description), then one for the task of that project. If a
-project has exactly one active task, take it without asking. Remember the
-pair for the rest of the session.
+Pick the project that fits the repo from context (CLAUDE.md, README, the
+remote's name, the client the code is for) and pass it as `--project`. It is
+only the default of the select: a project the user chose earlier for this
+repo (remembered in `~/.config/harvest/projects.json`) wins, and the user can
+change it on the page. Projects without an active Programming task show
+disabled. If `projects` prints nothing, or no project has an active
+Programming task, there is nothing the page could log to — stop and say so.
 
-### 3. Show what Harvest already holds
+### 3. Open the page
 
-```bash
-${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh entries {from} {to} --project {project_id}
-```
-
-Merge the per-day sums into the batch as `logged` so the table shows them.
-A day that already carries hours in Harvest is still logged again unless the
-user drops it — this is their call, not the skill's; make it visible, don't
-decide.
-
-### 4. Review table
+Start the server as a background task (`run_in_background`), so this turn is
+re-invoked when it exits; `--open` makes it open the page in the default
+browser itself:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest-review.sh tmp/worklog-harvest-{from}_to_{to}.json tmp/worklog-harvest-{from}_to_{to}.html --project "{client} / {project}" --task "{task}"
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest-app.py \
+  tmp/worklog-harvest-{from}_to_{to}.json --from {from} --to {to} \
+  --project {project_id} --repo "$(git rev-parse --show-toplevel)" --open
 ```
 
-Open it with the `human-review` skill and poll for feedback. (Without that
-skill: print the `file://` link, let the user edit the JSON directly, and
-continue from step 5 once they say so.) Each notes and
-hours cell is labelled `{date} · notes` / `{date} · hours`, so every edit in
-the batch names its row:
+Right after starting it, read the first line of the background task's output
+— the URL, `http://127.0.0.1:<port>/#k=<key>` (the key in the fragment guards
+the API) — and give it to the user as a link, in case the browser did not
+open. Then tell them in two lines what the page does: each row's button
+creates or updates that day's entry right away, “Send all changes” sends every
+changed row after an inline confirm, and “Done — close” ends the session.
+After that, do not poll: wait for the background task to finish.
 
-- `{date} · notes` → replace the row's `notes` with `after` (newlines per
-  line; strip HTML).
-- `{date} · hours` → parse `after` as a number; `0` means `"skip": true`,
-  any value above `0` sets `hours` **and removes `skip`**.
-- A comment on a row is an instruction about that row — apply it, re-render,
-  keep polling until the user says they are done or the feedback carries no
-  edits.
+The page lists every day of the window, newest first. A day that already has a
+Programming entry in that project shows it, and the row's button updates it
+(the target select can switch to a new entry instead); a day without one
+creates it. The server re-reads the day from Harvest before every write and
+refuses a plain create on a day that already has an entry (the user must pick
+“New entry” for a second one), so a stale page cannot log a day twice. If the
+entries cannot be read, every button stays disabled until a retry succeeds.
+Every write goes through `harvest.sh log` / `update`, prints one JSON line on
+the server's stdout and writes `entry_id` back into the proposals file.
 
-Re-render after every applied batch so the page reloads with the new state.
+### 4. Report
 
-### 5. Confirm, then log
-
-Print the final table in the chat (date, hours, first line of notes, total)
-and ask with AskUserQuestion whether to send it. The write happens only on a
-yes:
-
-```bash
-${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh log-batch tmp/worklog-harvest-{from}_to_{to}.json --project {project_id} --task {task_id}
-```
-
-Each success writes the row's `entry_id` back into the JSON, so a rerun
-skips it; a failure stops the batch at that row and prints which rows went
-through. Report the created entries (date, hours, id) and, on a partial
-failure, exactly which days are still missing.
-
-One window stays open: if the run is killed, or the connection drops, after
-Harvest created an entry but before its `entry_id` reached the JSON, a rerun
-logs that day again (each request times out after 60 s, so a hang ends; set
-`HARVEST_MAX_TIME` to change it). So after any batch that did not end
-cleanly — killed, timed out, `curl failed` — run step 3's `entries` for the
-window first and compare it with the JSON: a day Harvest already holds but the
-JSON does not mark gets its `entry_id` by hand (or `"skip": true`) before the
-rerun. Undo is per entry:
-`harvest.sh delete <entry_id>` (a `--force` rerun keeps the ids it replaced
-under `previous_entry_ids`, so those stay deletable too).
+When the server exits (`{"exit": "done"}`, or `{"exit": "idle"}` after 45
+minutes without a request — an open page pings it every minute, so idle means
+the tab was closed), read its stdout and report what reached Harvest:
+date, hours, created/updated, entry id. If nothing was sent, say so. A row
+that Harvest refused showed its message on the page; repeat it as is — a 422
+usually means a locked period or a missing assignment, which the user has to
+fix in Harvest. Undo is per entry: `harvest.sh delete <entry_id>`.
 
 ### Rules
 
-- Never run `log` / `log-batch` without the explicit yes from step 5, and
-  never with `--force` unless the user asked to log a day twice.
-- The HTML is a review surface, nothing else: no token, no script, no
-  network. Logging goes through `harvest.sh` only.
-- The user's `after` text is theirs — carry it verbatim into the JSON.
-- If `harvest.sh` exits 2 (Harvest refused), show its message as is; don't
-  retry on your own — a 422 usually means a locked period or a missing
-  assignment, which the user has to fix in Harvest.
+- Every write to Harvest is a click of the user on the page. The skill never
+  calls `log`, `update`, `log-batch` or `delete` itself, except `delete` when
+  the user asks for it in the chat.
+- The page and the server never see the token; it stays in
+  `~/.config/harvest/env`, read only by `harvest.sh`.
+- The server binds 127.0.0.1 only and exits on Done or when idle. Never expose
+  it on another interface or forward its port. The key reaches the browser on
+  its command line, so another account on the same machine could read it from
+  the process list while the page is open — on a shared machine, close the
+  page with Done as soon as you are finished.
 
 ## Example output
 
@@ -269,7 +260,7 @@ under `previous_entry_ids`, so those stay deletable too).
 - **Inventing work.** If a day has only a "chore: bump deps" commit, say so honestly — don't pad.
 - **Translating the summary.** Keep the language of the commits; don't auto-translate Czech → English or vice versa.
 - **Writing to `/tmp` instead of `tmp/`.** The project-local `tmp/` dir matches existing harness convention (`tmp/.last-verify-status`).
-- **Logging straight from the digest.** Harvest mode always goes through the review table and the explicit yes — an estimate the user never saw is not a time entry.
+- **Logging straight from the digest.** Harvest mode always goes through the page, where the user presses the button — an estimate the user never saw is not a time entry.
 - **Putting the token in the page or the chat.** `harvest.sh setup` runs in the user's terminal; the skill only ever sees `harvest.sh me` succeed or fail.
 
 ## Edge cases
@@ -281,3 +272,4 @@ under `previous_entry_ids`, so those stay deletable too).
 - **X = 0** → only today's commits.
 - **`--harvest` with no commits by the user in the window** → say so and stop; there is nothing to log.
 - **`--harvest` and `harvest.sh projects` prints `[]`** (no active assignments) → the user has no active project in that Harvest account; stop and say so.
+- **`--harvest` without python3** → say so; the page needs it. `harvest.sh log` / `update` still work by hand.
