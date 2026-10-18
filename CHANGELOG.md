@@ -3,6 +3,20 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [0.7.1] — 2026-10-18
+
+Patch release: a large review diff no longer parks an issue.
+
+### Fixed
+
+- **The model prompt goes in on stdin, not argv** (#119). `agent_run` passed
+  the whole prompt to `claude -p` as one argument, and Linux caps one argument
+  at 128 KiB (`MAX_ARG_STRLEN`). A `/deliver` review prompt that inlines a
+  larger diff failed with `Argument list too long` before claude started. The
+  runner read that as "no usable verdict" and parked the issue, and issues
+  blocked behind it were skipped. `verify.sh` now sends a 200 KB prompt through
+  `agent_run`.
+
 ## [0.7.0] — 2026-10-02
 
 Housekeeping release: the plugin passes `claude plugin validate --strict` and

@@ -135,12 +135,17 @@ agent_run() {
       # 125: "could not even start the command" (the xargs/env convention),
       # so an unusable cwd is told apart from anything claude itself returns.
       if [[ -n "$cwd" ]]; then cd "$cwd" || exit 125; fi
-      timeout "${AGENT_TIMEOUT:-1200}" claude -p "$prompt" \
+      # The prompt goes in on stdin, never as an argument (#119): Linux caps
+      # one argv string at MAX_ARG_STRLEN (128 KiB), and a review prompt that
+      # inlines a large diff exceeded it — exec failed with E2BIG before
+      # claude started, which read as "no usable verdict". A here-string,
+      # not a pipe, so pipefail callers never see printf's SIGPIPE.
+      timeout "${AGENT_TIMEOUT:-1200}" claude -p \
         --model "$model" --output-format json \
         --permission-mode "$perm" --allowedTools "$allowed" \
         --max-turns "${AGENT_MAX_TURNS:-80}" \
         --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-        ${extra[@]+"${extra[@]}"} 2>>"$errlog"
+        ${extra[@]+"${extra[@]}"} 2>>"$errlog" <<<"$prompt"
     )"
     rc=$?
   fi

@@ -71,9 +71,11 @@ STUB_DIR="$WORK/bin"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
-[[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
+# agent.sh sends the prompt on stdin (#119); argv carries only the flags.
+stdin=""; [[ -t 0 ]] || stdin="$(cat)"
+[[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$* $stdin" >> "$STUB_CALL_LOG"
 [[ -n "${STUB_SLEEP:-}" ]] && sleep "$STUB_SLEEP"
-prompt="$*"
+prompt="$* $stdin"
 # The plan path comes from the prompt, not a hardcoded tmp/autopilot/: every
 # phase that touches the plan names it (loop.sh interpolates $PLAN_FILE), and
 # --state-dir moves it. Fallback keeps any prompt that doesn't name it working.

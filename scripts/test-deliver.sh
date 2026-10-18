@@ -650,7 +650,9 @@ chmod +x "$BIN/gh"
 # --- stub claude: autopilot's three phases -----------------------------------
 cat > "$BIN/claude" <<'EOF'
 #!/usr/bin/env bash
-prompt="$*"
+# agent.sh sends the prompt on stdin (#119); argv carries only the flags.
+stdin=""; [[ -t 0 ]] || stdin="$(cat)"
+prompt="$* $stdin"
 plan="$(printf '%s' "$prompt" | grep -oE '[^[:space:],"]*IMPLEMENTATION_PLAN\.md' | head -1)"
 emit() { printf '{"result":%s,"total_cost_usd":0.01,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1"; }
 review_json() { # verdict findings-json [head]
