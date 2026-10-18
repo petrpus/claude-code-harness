@@ -3,7 +3,11 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
-## [Unreleased]
+## [0.8.5] — 2026-10-18
+
+Patch release: `/worklog --harvest` reviews and logs on a local page, beside
+the entries Harvest already holds, instead of a static table and a yes in the
+chat.
 
 ### Changed
 
