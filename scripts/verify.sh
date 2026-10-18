@@ -32,7 +32,7 @@
 #      scripts/test-deliver.sh does the same for skills/deliver/deliver.sh,
 #      against a bare git remote and a fake `gh`.
 #      scripts/test-harvest.sh drives skills/worklog/harvest.sh and
-#      harvest-review.sh against a stub `curl` playing the Harvest API.
+#      harvest-app.py against a stub `curl` playing the Harvest API.
 #   8. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #

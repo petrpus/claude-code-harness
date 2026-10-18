@@ -3,6 +3,35 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [Unreleased]
+
+### Changed
+
+- `worklog --harvest` reviews and logs on a local page instead of a static
+  table and a yes in the chat. `skills/worklog/harvest-app.py` (python3,
+  standard library) serves it on 127.0.0.1: a project select preset from
+  context (a project chosen earlier for the repo wins, remembered in
+  `~/.config/harvest/projects.json`), the task fixed to Programming, the
+  user's Harvest entries for that project and task in the window, and an
+  editable proposal per day whose button creates the entry or updates the
+  existing one; “Send all changes” sends every changed row after an inline
+  confirm. Every Harvest call still goes through `harvest.sh`, so the token
+  never reaches the page or the server's responses; the API answers only to
+  a loopback Host and a per-run key from the URL fragment, sent in a custom
+  header no cross-site page can add. The server re-reads the day before every
+  write and refuses a plain create on a day that already has an entry (409;
+  a second entry needs an explicit “New entry”), and the page keeps every
+  button disabled while the entries cannot be read, so a stale or failed read
+  cannot log a day twice. Applied rows get their `entry_id` written back into
+  the proposals file; an open page pings the server so its idle exit only
+  fires once the tab is gone.
+- `harvest.sh update <entry_id> [--hours H] [--notes …]` changes an existing
+  entry; `entries` now includes `task_id`.
+
+### Removed
+
+- `skills/worklog/harvest-review.sh` — the page replaces the static table.
+
 ## [0.8.0] — 2026-10-18
 
 Minor release: `/worklog --harvest` turns the commit digest into Harvest time

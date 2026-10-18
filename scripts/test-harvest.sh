@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # scripts/test-harvest.sh — offline tests for skills/worklog/harvest.sh and
-# harvest-review.sh.
+# harvest-app.py (the local review-and-log page, via scripts/test-harvest-app.py).
 #
 # A stub `curl` on PATH plays the Harvest API (accounts, users/me, paged
-# project assignments and time entries, POST/DELETE time_entries), records
+# project assignments and time entries, POST/PATCH/DELETE time_entries), records
 # every call's argv and stdin, and fails a POST on demand. Nothing touches the
 # network or the real ~/.config/harvest. Invoked from scripts/verify.sh's
 # "worklog harvest" section. Cleaned up on exit.
@@ -20,7 +20,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 H="$PWD/skills/worklog/harvest.sh"
-R="$PWD/skills/worklog/harvest-review.sh"
+A="$PWD/skills/worklog/harvest-app.py"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/home"
@@ -57,7 +57,7 @@ case "$method $url" in
   "GET http://api.test/time_entries?"*)
     # One page well over the 128 KiB a single argv string may hold.
     jq -nc '{time_entries: [range(100) as $i | {id: $i, spent_date: "2026-10-14", hours: 1,
-             project: {id: 1, name: "P1"}, task: {name: "Dev"}, notes: ("x" * 2000)}], links: {next: null}}' > "$d/big"
+             project: {id: 1, name: "P1"}, task: {id: 21, name: "Dev"}, notes: ("x" * 2000)}], links: {next: null}}' > "$d/big"
     reply 200 "$(cat "$d/big")" ;;
   "POST http://api.test/time_entries")
     printf '%s\n' "$body" >> "$d/posts.log"
@@ -68,6 +68,9 @@ case "$method $url" in
     if [[ -f "$d/no-id" ]]; then reply 201 "$(jq -c '{spent_date, hours}' <<<"$body")"; fi
     n=$(( $(cat "$d/next-id" 2>/dev/null || echo 100) + 1 )); echo "$n" > "$d/next-id"
     reply 201 "$(jq -c --argjson id "$n" '{id: $id, spent_date, hours, project: {name: "P1"}, task: {name: "Dev"}}' <<<"$body")" ;;
+  "PATCH http://api.test/time_entries/"*)
+    printf '%s %s\n' "${url##*/}" "$body" >> "$d/patches.log"
+    reply 200 "$(jq -c --argjson id "${url##*/}" '{id: $id, spent_date: "2026-10-14", hours: (.hours // 1), project: {name: "P1"}, task: {name: "Dev"}}' <<<"$body")" ;;
   "DELETE http://api.test/time_entries/"*) reply 200 '{}' ;;
 esac
 reply 404 '{"message":"stub: no route for '"$method $url"'"}'
@@ -125,8 +128,8 @@ for args in "log-batch $T/b.json --project 1 --task" "log 2026-10-14 2 --project
   [[ "$rc" -eq 1 ]] && ok "trailing flag fails fast: ${args%% *} … ${args##* }" \
                     || note "trailing flag gave rc=$rc (124 = hang): $args"
 done
-timeout 10 bash "$R" "$T/b.json" "$T/x.html" --task >/dev/null 2>&1; rc=$?
-[[ "$rc" -eq 1 ]] && ok "harvest-review: trailing flag fails fast" || note "harvest-review trailing flag rc=$rc"
+timeout 10 bash "$H" update 5 --hours >/dev/null 2>&1; rc=$?
+[[ "$rc" -eq 1 ]] && ok "trailing flag fails fast: update … --hours" || note "update trailing flag gave rc=$rc"
 
 bash "$H" log 2026-10-14 2 --project 1 --task 21 --notes-file "$T/missing" >/dev/null 2>&1 \
   && note "--notes-file with a missing file still logged" || ok "--notes-file with a missing file is refused"
@@ -207,22 +210,67 @@ n="$(bash "$H" projects 2>/dev/null | jq 'length')"
 n="$(bash "$H" entries 2026-10-14 2026-10-15 2>/dev/null | jq 'length')"
 [[ "$n" == 100 ]] && ok "entries reads a page over 128 KiB (no E2BIG)" || note "entries returned '$n' rows from a large page (want 100)"
 
-# ----------------------------------------------------------- review table ---
-cat > "$T/r.json" <<'EOF'
-[{"date":"2026-10-14","hours":7.5,"notes":"<script>alert(1)</script>\nsecond"},
- {"date":"2026-10-15","hours":2,"entry_id":101},
- {"date":"2026-10-16","hours":1,"skip":true}]
-EOF
-if bash "$R" "$T/r.json" "$T/r.html" --project 'C / <b>P</b>' --task Dev >/dev/null 2>&1 \
-   && ! grep -q '<script' "$T/r.html" && grep -q '&lt;script&gt;' "$T/r.html" \
-   && ! grep -q '<b>P</b>' "$T/r.html" \
-   && grep -q '<td class="num">7.5</td>' "$T/r.html" && grep -q '>3 h logged/skipped<' "$T/r.html"; then
-  ok "review table escapes notes and names and totals only the rows to send"
+# ------------------------------------------------------------------ update ---
+rm -f "$T/patches.log"
+bash "$H" update 55 --hours 2.5 --notes $'a\nb' >/dev/null 2>&1; rc=$?
+if [[ "$rc" -eq 0 ]] && grep -q '^55 ' "$T/patches.log" \
+   && sed 's/^55 //' "$T/patches.log" | jq -e '.hours == 2.5 and .notes == "a\nb"' >/dev/null; then
+  ok "update PATCHes the hours and notes of the given entry"
 else
-  note "review table output is wrong or unescaped"
+  note "update rc=$rc: $(cat "$T/patches.log" 2>/dev/null)"
 fi
-echo '[{"date":"2026-10-14","hours":"<img src=x onerror=1>"}]' > "$T/r2.json"
-bash "$R" "$T/r2.json" "$T/r2.html" >/dev/null 2>&1 \
-  && note "review table accepted a string in hours" || ok "review table rejects non-numeric hours"
+rm -f "$T/patches.log"
+bash "$H" update 55 --notes "" >/dev/null 2>&1
+sed 's/^55 //' "$T/patches.log" 2>/dev/null | jq -e '. == {notes: ""}' >/dev/null \
+  && ok "update with only --notes leaves the hours alone" || note "update --notes sent: $(cat "$T/patches.log" 2>/dev/null)"
+for args in "update 55" "update x --hours 1" "update 55 --hours 25"; do
+  # shellcheck disable=SC2086
+  bash "$H" $args >/dev/null 2>&1 && note "update accepted: $args" || ok "update refuses: $args"
+done
+
+# ---------------------------------------------------------------- the page ---
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  (python3 absent — skipping harvest-app)"; exit "$FAIL"
+fi
+rm -f "$T/patches.log"
+cat > "$T/app.json" <<'JSON'
+[{"date":"2026-10-15","hours":3,"notes":"proposal"},{"date":"2026-10-14","hours":2,"notes":"edit me"}]
+JSON
+export HARVEST_PROJECTS="$T/home/projects.json"
+echo '["not", "a map"]' > "$HARVEST_PROJECTS"
+python3 "$A" "$T/app.json" --from 2026-10-13 --to 2026-10-15 --project 1 --repo /repo/a --task-name Dev \
+  > "$T/app.out" 2> "$T/app.err" &
+app_pid=$!
+for _ in $(seq 50); do [[ -s "$T/app.out" ]] && break; sleep 0.1; done
+url="$(head -1 "$T/app.out")"
+if [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+/#k=.+ ]]; then
+  ok "harvest-app prints a loopback URL carrying the key in the fragment"
+  APP_URL="$url" BATCH="$T/app.json" python3 scripts/test-harvest-app.py || FAIL=1
+else
+  note "harvest-app did not start: $(cat "$T/app.err")"
+fi
+for _ in $(seq 50); do kill -0 "$app_pid" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$app_pid" 2>/dev/null; then
+  kill "$app_pid"; note "harvest-app kept running after done"
+elif grep -q '"exit": "done"' "$T/app.out" && grep -q '"action": "created"' "$T/app.out"; then
+  ok "harvest-app exits on done and prints each applied entry"
+else
+  note "harvest-app stdout: $(cat "$T/app.out")"
+fi
+python3 "$A" "$T/app.json" --from 2026-10-15 --to 2026-10-13 >/dev/null 2>&1 \
+  && note "harvest-app accepted a backwards window" || ok "harvest-app refuses a backwards window"
+echo '[{"date":"2026-10-14","hours":1},{"date":"2026-10-14","hours":2}]' > "$T/dup.json"
+python3 "$A" "$T/dup.json" --from 2026-10-13 --to 2026-10-15 >/dev/null 2>&1 \
+  && note "harvest-app accepted a batch with a date twice" || ok "harvest-app refuses a batch with a date twice"
+
+# A project remembered for the repo wins over the guess.
+echo '{"/repo/a": 1}' > "$HARVEST_PROJECTS"
+python3 "$A" "$T/app.json" --from 2026-10-13 --to 2026-10-15 --project 2 --repo /repo/a --task-name Dev \
+  > "$T/app2.out" 2>/dev/null &
+app_pid=$!
+for _ in $(seq 50); do [[ -s "$T/app2.out" ]] && break; sleep 0.1; done
+APP_URL="$(head -1 "$T/app2.out")" MODE=remembered python3 scripts/test-harvest-app.py \
+  && ok "a project remembered for the repo wins over the guess" || note "the remembered project did not win"
+wait "$app_pid" 2>/dev/null
 
 exit "$FAIL"
