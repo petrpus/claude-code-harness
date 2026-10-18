@@ -3,7 +3,10 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
-## [Unreleased]
+## [0.8.0] — 2026-10-18
+
+Minor release: `/worklog --harvest` turns the commit digest into Harvest time
+entries, after the user reviews them and confirms.
 
 ### Added
 
@@ -16,8 +19,10 @@ All notable changes to the harness (the `code-harness` plugin, named
   `entries` read, `log` / `log-batch` write, `delete` undoes. A batch is
   validated whole before the first request, every created `entry_id` is
   written back into the batch file row by row, and a rerun skips logged rows,
-  so an interrupted batch never double-logs. `harvest-review.sh` renders the
-  batch as a static review table (no script, no token) whose cells are
+  so a batch stopped by a refused row resumes without double-logging (the one
+  window left — a kill or dropped connection between Harvest's reply and the
+  write-back — is documented in the skill, with how to reconcile).
+  `harvest-review.sh` renders the batch as a static review table (no script, no token) whose cells are
   labelled `<date> · notes|hours` for the `human-review` skill; the skill
   applies the user's edits to the batch, asks for an explicit yes, and only
   then logs.

@@ -167,6 +167,19 @@ jq -e '.[0].entry_id == 103 and .[0].previous_entry_ids == [50] and .[1].previou
   && ok "--force keeps the replaced ids under previous_entry_ids" \
   || note "--force lost an id: $(jq -c . "$T/batch.json")"
 
+# Leading zeros pass is_hours / is_id and jq reads them as numbers (007 → 7);
+# guard that, so a stricter jq would fail here rather than mid-batch.
+reset_posts
+bash "$H" log 2026-10-24 007.50 --project 001 --task 021 --notes x >/dev/null 2>&1; rc=$?
+if [[ "$rc" -eq 0 ]] && jq -e '.hours == 7.5 and .project_id == 1 and .task_id == 21' "$T/posts.log" >/dev/null 2>&1; then
+  ok "log normalises leading-zero hours and ids to JSON numbers"
+else
+  note "leading zeros: rc=$rc body=$(cat "$T/posts.log" 2>/dev/null)"
+fi
+echo '[{"date":"2026-10-24","hours":1}]' > "$T/z.json"
+bash "$H" log-batch "$T/z.json" --project 001 --task 021 --dry-run 2>/dev/null | jq -e '.[0].project_id == 1 and .[0].task_id == 21' >/dev/null \
+  && ok "log-batch --dry-run normalises leading-zero ids" || note "log-batch --dry-run failed on leading-zero ids"
+
 # --------------------------------------------- partial failure and resume ---
 reset_posts
 echo '[{"date":"2026-10-20","hours":1},{"date":"2026-10-21","hours":1},{"date":"2026-10-22","hours":1}]' > "$T/p.json"
