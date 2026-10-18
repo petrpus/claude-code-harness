@@ -31,7 +31,9 @@
 #                                  keeps the old id under "previous_entry_ids")
 #   delete <entry_id>              delete a time entry (undo for log/log-batch)
 #
-# Exit codes: 0 ok · 1 usage/config error · 2 Harvest refused (HTTP ≥ 400).
+# Exit codes: 0 ok · 1 usage/config error (also: curl or jq missing, a network
+# failure, an unparseable response) · 2 Harvest refused (HTTP ≥ 400, so an
+# expired or revoked token is 2, not 1).
 
 set -uo pipefail
 
@@ -39,6 +41,9 @@ API="${HARVEST_API_BASE:-https://api.harvestapp.com/v2}"
 ID_API="${HARVEST_ID_API_BASE:-https://id.getharvest.com/api/v2}"
 CONFIG="${HARVEST_CONFIG:-$HOME/.config/harvest/env}"
 UA="code-harness worklog (https://github.com/petrpus/claude-code-harness)"
+# A hung connection must not block a batch forever.
+CONNECT_TIMEOUT="${HARVEST_CONNECT_TIMEOUT:-10}"
+MAX_TIME="${HARVEST_MAX_TIME:-60}"
 
 die()   { echo "harvest: $*" >&2; exit 1; }
 usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
@@ -54,26 +59,41 @@ load_config() {
       [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
       key="${line%%=*}"; val="${line#*=}"
       key="${key//[[:space:]]/}"
+      # Only the keys `setup` writes. Anything else is not ours to export, and
+      # an invalid name would abort the `${!key}` below.
+      case "$key" in
+        HARVEST_ACCESS_TOKEN|HARVEST_ACCOUNT_ID|HARVEST_ACCOUNT_NAME) ;;
+        *) continue ;;
+      esac
       # Environment wins over the file.
       [[ -n "${!key:-}" ]] && continue
       export "$key=$val"
     done < "$CONFIG"
   fi
 }
-need_token()   { [[ -n "${HARVEST_ACCESS_TOKEN:-}" ]] || die "no token — run: harvest.sh setup <token> [account]  (or export HARVEST_ACCESS_TOKEN)"; }
-need_account() { [[ -n "${HARVEST_ACCOUNT_ID:-}" ]]   || die "no account id — run: harvest.sh setup <token> [account]  (or export HARVEST_ACCOUNT_ID)"; }
+need_token()   { [[ -n "${HARVEST_ACCESS_TOKEN:-}" ]] || die "no token — run: harvest.sh setup [account]  (or export HARVEST_ACCESS_TOKEN)"; }
+need_account() { [[ -n "${HARVEST_ACCOUNT_ID:-}" ]]   || die "no account id — run: harvest.sh setup [account]  (or export HARVEST_ACCOUNT_ID)"; }
+
+# need_val OPTION "$@-from-the-option-on": an option that takes a value must
+# have one. Without this, `--task` as the last word made `shift 2` fail, and
+# with no `set -e` the option loop never advanced.
+need_val() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 # ------------------------------------------------------------------ http ---
 # request METHOD URL [JSON-BODY] → body on stdout; exit 2 on HTTP ≥ 400.
 request() {
-  local method="$1" url="$2" body="${3:-}" out code
+  local method="$1" url="$2" body="${3:-}" out code tok
   # The bearer header goes in through `-K -` (a curl config on stdin) so the
   # token is never part of curl's argv.
   local -a args=(-sS -K - -X "$method" "$url"
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME"
     -H "User-Agent: $UA" -H "Accept: application/json")
   [[ "$url" == "$API"* && -n "${HARVEST_ACCOUNT_ID:-}" ]] && args+=(-H "Harvest-Account-Id: $HARVEST_ACCOUNT_ID")
   [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" --data "$body")
-  out="$(printf 'header = "Authorization: Bearer %s"\n' "${HARVEST_ACCESS_TOKEN//\"/\\\"}" \
+  # A curl config string treats \ as an escape: escape it before the quotes.
+  tok="${HARVEST_ACCESS_TOKEN//\\/\\\\}"; tok="${tok//\"/\\\"}"
+  [[ "$tok" == *[$'\r\n']* ]] && die "the token contains a line break"
+  out="$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
         | curl "${args[@]}" -w $'\n%{http_code}' 2>&1)" || die "curl failed: $out"
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   if [[ "$code" -ge 400 ]]; then
@@ -88,8 +108,12 @@ paged() {
   local url="$1" key="$2" page acc='[]'
   while [[ -n "$url" && "$url" != "null" ]]; do
     page="$(request GET "$url")" || exit $?
-    acc="$(jq -c --argjson p "$page" --arg k "$key" '. + ($p[$k] // [])' <<<"$acc")"
-    url="$(jq -r '.links.next // empty' <<<"$page")"
+    # Both documents go in on stdin: a 100-row page passed with --argjson can
+    # exceed the 128 KiB argv limit for one argument (the E2BIG of #119), and
+    # an unchecked failure here returned a silently short list.
+    acc="$(printf '%s\n%s' "$acc" "$page" | jq -cs --arg k "$key" '.[0] + (.[1][$k] // [])')" \
+      || die "unreadable $key page from Harvest"
+    url="$(jq -r '.links.next // empty' <<<"$page")" || die "unreadable $key page from Harvest"
   done
   printf '%s' "$acc"
 }
@@ -132,6 +156,9 @@ cmd_setup() {
   esac
   local id name
   id="$(jq -r '.[0].id' <<<"$chosen")"; name="$(jq -r '.[0].name' <<<"$chosen")"
+  is_id "$id" || die "Harvest returned a non-numeric account id: $id"
+  # One KEY=VALUE per line: a line break in the name must not start a new key.
+  name="${name//[$'\r\n']/ }"
   mkdir -p "$(dirname "$CONFIG")"
   umask 077
   printf 'HARVEST_ACCESS_TOKEN=%s\nHARVEST_ACCOUNT_ID=%s\nHARVEST_ACCOUNT_NAME=%s\n' "$token" "$id" "$name" > "$CONFIG"
@@ -173,11 +200,12 @@ cmd_entries() {
   local project="" text=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --project) project="${2:-}"; shift 2 ;;
+      --project) need_val "$@"; project="$2"; shift 2 ;;
       --text) text=1; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
+  [[ -z "$project" ]] || is_id "$project" || die "--project must be a numeric id"
   local me url json
   me="$(request GET "$API/users/me" | jq -r '.id')" || exit $?
   url="$API/time_entries?user_id=$me&from=$from&to=$to&per_page=100"
@@ -205,10 +233,11 @@ cmd_log() {
   local project="" task="" notes=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --project) project="${2:-}"; shift 2 ;;
-      --task) task="${2:-}"; shift 2 ;;
-      --notes) notes="${2:-}"; shift 2 ;;
-      --notes-file) notes="$(cat "${2:-/dev/null}")"; shift 2 ;;
+      --project) need_val "$@"; project="$2"; shift 2 ;;
+      --task) need_val "$@"; task="$2"; shift 2 ;;
+      # Empty notes are legitimate, so --notes only needs a next word.
+      --notes) [[ $# -ge 2 ]] || die "--notes needs a value"; notes="$2"; shift 2 ;;
+      --notes-file) need_val "$@"; [[ -r "$2" ]] || die "cannot read $2"; notes="$(cat "$2")"; shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -225,15 +254,16 @@ cmd_log_batch() {
   local project="" task="" dry=0 force=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --project) project="${2:-}"; shift 2 ;;
-      --task) task="${2:-}"; shift 2 ;;
+      --project) need_val "$@"; project="$2"; shift 2 ;;
+      --task) need_val "$@"; task="$2"; shift 2 ;;
       --dry-run) dry=1; shift ;;
       --force) force=1; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
   is_id "$project" && is_id "$task" || die "--project and --task must be numeric ids"
-  jq -e 'type == "array"' "$file" >/dev/null 2>&1 || die "$file must hold a JSON array of {date, hours, notes}"
+  jq -e 'type == "array" and all(.[]; type == "object")' "$file" >/dev/null 2>&1 \
+    || die "$file must hold a JSON array of {date, hours, notes} objects"
 
   # Validate every row before touching Harvest: a batch is all-or-nothing in
   # intent, so a typo in row 9 must not leave rows 1–8 logged.
@@ -243,7 +273,9 @@ cmd_log_batch() {
     | if ($r.entry_id != null and $force == 0) or ($r.skip == true) then empty
       elif ($r.date|type) != "string" or ($r.date|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")|not) then "row \($i): bad date \($r.date)"
       elif ($r.hours|type) != "number" or $r.hours <= 0 or $r.hours > 24 then "row \($i) (\($r.date)): hours must be in (0, 24], got \($r.hours)"
-      else empty end' "$file")"
+      elif $r.notes != null and ($r.notes|type) != "string" then "row \($i) (\($r.date)): notes must be a string"
+      else empty end' "$file")" || die "could not validate $file"
+  # An empty $bad must mean "every row passed", never "jq failed".
   [[ -z "$bad" ]] || die $'invalid rows:\n'"$bad"
   # The regex above only checks the shape; an impossible day (2026-13-45) is
   # caught here, still before the first request.
@@ -272,7 +304,12 @@ cmd_log_batch() {
       return 2
     fi
     id="$(jq -r '.id' <<<"$created")"
-    results="$(jq -c --argjson c "$created" '. + [$c]' <<<"$results")"
+    if ! is_id "$id"; then
+      echo "harvest: Harvest answered $d without an entry id — check \`entries\` for that day before running the batch again" >&2
+      printf '%s\n' "$results"
+      return 2
+    fi
+    results="$(printf '%s\n%s' "$results" "$created" | jq -cs '.[0] + [.[1]]')"
     # Write the id back row by row so an interrupted batch leaves an exact
     # record. A --force run keeps the id it replaces, so every entry the file
     # ever created stays reachable for `delete`. If the write-back fails the
@@ -299,8 +336,10 @@ cmd_delete() {
 }
 
 # ------------------------------------------------------------------ main ---
-load_config
 cmd="${1:-}"; shift 1 2>/dev/null || true
+# `setup` replaces the config, so it must not read the token it is replacing:
+# a rerun after the token expired would silently write the stale one back.
+[[ "$cmd" == setup ]] || load_config
 case "$cmd" in
   setup)     cmd_setup "$@" ;;
   accounts)  cmd_accounts "$@" ;;

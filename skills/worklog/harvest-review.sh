@@ -23,12 +23,17 @@ in="${1:-}"; out="${2:-}"; shift 2 2>/dev/null || die "usage: harvest-review.sh 
 project="" task=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --project) project="${2:-}"; shift 2 ;;
-    --task) task="${2:-}"; shift 2 ;;
+    --project|--task)
+      # A trailing flag without its value would make `shift 2` fail and spin.
+      [[ $# -ge 2 ]] || die "$1 needs a value"
+      if [[ "$1" == --project ]]; then project="$2"; else task="$2"; fi
+      shift 2 ;;
     *) die "unknown option: $1" ;;
   esac
 done
-jq -e 'type == "array" and all(.[]; .date and .hours != null)' "$in" >/dev/null 2>&1 || die "$in must be a JSON array of {date, hours, notes}"
+# hours must be a number: the totals below are sums of it and land in the page.
+jq -e 'type == "array" and all(.[]; type == "object" and (.date|type) == "string" and (.hours|type) == "number")' "$in" >/dev/null 2>&1 \
+  || die "$in must be a JSON array of {date, hours, notes} with numeric hours"
 while IFS= read -r d; do
   [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$d" >/dev/null 2>&1 || die "$in: $d is not a real date"
 done < <(jq -r '.[].date' "$in")
@@ -45,8 +50,9 @@ rows="$(jq -r '
   <td class=\"num muted\">\(if .entry_id then "entry \(.entry_id|esc)" elif .skip == true then "skipped" elif .logged then "\(.logged|esc) h" else "" end)</td>
 </tr>"' "$in")" || die "could not render the rows of $in"
 # Only the rows log-batch would send count towards the total the user confirms.
-to_send="$(jq -r 'map(select(.entry_id == null and .skip != true) | .hours) | add // 0' "$in")"
-held="$(jq -r 'map(select(.entry_id != null or .skip == true) | .hours) | add // 0' "$in")"
+# Escaped like every other value in the page, even though they are numbers.
+to_send="$(jq -r 'map(select(.entry_id == null and .skip != true) | .hours) | add // 0 | tostring | @html' "$in")"
+held="$(jq -r 'map(select(.entry_id != null or .skip == true) | .hours) | add // 0 | tostring | @html' "$in")"
 
 cat > "$out" <<HTML
 <!doctype html>

@@ -21,6 +21,9 @@ All notable changes to the harness (the `code-harness` plugin, named
   labelled `<date> · notes|hours` for the `human-review` skill; the skill
   applies the user's edits to the batch, asks for an explicit yes, and only
   then logs.
+  Requests time out (`HARVEST_MAX_TIME`, default 60 s), and
+  `scripts/test-harvest.sh` runs both scripts against a stub `curl` in
+  `verify.sh`.
 
 ## [0.7.1] — 2026-10-18
 

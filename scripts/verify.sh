@@ -31,6 +31,8 @@
 #      stub `claude`, so the runner's gating decisions are exercised for free.
 #      scripts/test-deliver.sh does the same for skills/deliver/deliver.sh,
 #      against a bare git remote and a fake `gh`.
+#      scripts/test-harvest.sh drives skills/worklog/harvest.sh and
+#      harvest-review.sh against a stub `curl` playing the Harvest API.
 #   8. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
@@ -399,6 +401,20 @@ if [[ -f scripts/test-deliver.sh ]]; then
   fi
 else
   note "scripts/test-deliver.sh is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# harvest.sh writes time entries to a paid service on the user's behalf, so
+# validation, write-back and resume are tested against a stub curl, offline.
+section "worklog harvest (stub Harvest API)"
+if [[ -f scripts/test-harvest.sh ]]; then
+  if bash scripts/test-harvest.sh; then
+    ok "worklog harvest passed"
+  else
+    note "worklog harvest failed (see above)"
+  fi
+else
+  note "scripts/test-harvest.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------

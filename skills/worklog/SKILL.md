@@ -117,17 +117,20 @@ skill** (their own commits only — never log another author's work). Harvest is
 reached through `harvest.sh` (bundled, curl + jq, no MCP); the user edits the
 batch in a static review table before anything is sent.
 
-Paths below are relative to this skill's directory
-(`${CLAUDE_PLUGIN_ROOT}/skills/worklog/`); `tmp/` is the consumer project's
+Both scripts live in this skill's directory and are not on `PATH`: call them
+by the full path shown in each step. `tmp/` is the consumer project's
 gitignored `tmp/`.
 
 ### 0. Credentials
 
 ```bash
-harvest.sh me
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh me
 ```
 
-Exit 1 means there is no config yet. Tell the user to run, in their own
+Exit 1 with "no token" or "no account id" means there is no config yet (exit 1
+also covers a missing curl or jq, or a network failure — say which). Exit 2
+with HTTP 401 means the token expired or was revoked: `setup` again replaces
+it. Tell the user to run, in their own
 terminal (the token must not pass through the conversation, and it is never
 an argument — `setup` asks for it on a hidden prompt, so it stays out of the
 shell history and the process list):
@@ -166,7 +169,7 @@ commits (or session-log activity with no commit — say so in the notes):
 ### 2. Pick the project and task
 
 ```bash
-harvest.sh projects --text
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh projects --text
 ```
 
 Ask with AskUserQuestion: one question for the project (client / project
@@ -177,7 +180,7 @@ pair for the rest of the session.
 ### 3. Show what Harvest already holds
 
 ```bash
-harvest.sh entries {from} {to} --project {project_id}
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh entries {from} {to} --project {project_id}
 ```
 
 Merge the per-day sums into the batch as `logged` so the table shows them.
@@ -188,7 +191,7 @@ decide.
 ### 4. Review table
 
 ```bash
-harvest-review.sh tmp/worklog-harvest-{from}_to_{to}.json tmp/worklog-harvest-{from}_to_{to}.html --project "{client} / {project}" --task "{task}"
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest-review.sh tmp/worklog-harvest-{from}_to_{to}.json tmp/worklog-harvest-{from}_to_{to}.html --project "{client} / {project}" --task "{task}"
 ```
 
 Open it with the `human-review` skill and poll for feedback. (Without that
@@ -214,13 +217,22 @@ and ask with AskUserQuestion whether to send it. The write happens only on a
 yes:
 
 ```bash
-harvest.sh log-batch tmp/worklog-harvest-{from}_to_{to}.json --project {project_id} --task {task_id}
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh log-batch tmp/worklog-harvest-{from}_to_{to}.json --project {project_id} --task {task_id}
 ```
 
 Each success writes the row's `entry_id` back into the JSON, so a rerun
 skips it; a failure stops the batch at that row and prints which rows went
 through. Report the created entries (date, hours, id) and, on a partial
-failure, exactly which days are still missing. Undo is per entry:
+failure, exactly which days are still missing.
+
+One window stays open: if the run is killed, or the connection drops, after
+Harvest created an entry but before its `entry_id` reached the JSON, a rerun
+logs that day again (each request times out after 60 s, so a hang ends; set
+`HARVEST_MAX_TIME` to change it). So after any batch that did not end
+cleanly — killed, timed out, `curl failed` — run step 3's `entries` for the
+window first and compare it with the JSON: a day Harvest already holds but the
+JSON does not mark gets its `entry_id` by hand (or `"skip": true`) before the
+rerun. Undo is per entry:
 `harvest.sh delete <entry_id>` (a `--force` rerun keeps the ids it replaced
 under `previous_entry_ids`, so those stay deletable too).
 
@@ -268,4 +280,4 @@ under `previous_entry_ids`, so those stay deletable too).
 - **Detached HEAD / shallow clone** → still works, but warn that history may be incomplete.
 - **X = 0** → only today's commits.
 - **`--harvest` with no commits by the user in the window** → say so and stop; there is nothing to log.
-- **`--harvest` and `harvest.sh` exits 1 on `projects`** (no assignments) → the user has no active project in that Harvest account; stop and say so.
+- **`--harvest` and `harvest.sh projects` prints `[]`** (no active assignments) → the user has no active project in that Harvest account; stop and say so.
