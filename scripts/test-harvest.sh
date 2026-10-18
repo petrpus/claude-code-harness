@@ -38,7 +38,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -X) method="$2"; shift 2 ;;
     --data) body="$2"; shift 2 ;;
-    -H|-K|-w|--connect-timeout|--max-time) shift 2 ;;
+    --max-time) echo "$2" > "$d/max-time"; shift 2 ;;
+    -H|-K|-w|--connect-timeout) shift 2 ;;
     http*) url="$1"; shift ;;
     *) shift ;;
   esac
@@ -98,6 +99,14 @@ grep -qx 'HARVEST_ACCESS_TOKEN=tok-NEW' "$HARVEST_CONFIG" \
 if grep -q 'tok-' "$T/argv.log"; then note "the token appeared in curl's argv"
 elif grep -q 'Bearer tok-NEW' "$T/stdin.log"; then ok "the token reaches curl on stdin, never argv"
 else note "the token never reached curl"; fi
+
+# curl's config syntax reads \ and " as escapes; the token must arrive intact.
+HARVEST_ACCESS_TOKEN='a\b"c' HARVEST_MAX_TIME=5 bash "$H" me >/dev/null 2>&1
+grep -qF 'Bearer a\\b\"c"' "$T/last-stdin" \
+  && ok "a token with \\ and \" is escaped for the curl config" \
+  || note "token escaping is wrong: $(cat "$T/last-stdin")"
+[[ "$(cat "$T/max-time" 2>/dev/null)" == 5 ]] \
+  && ok "HARVEST_MAX_TIME reaches curl as --max-time" || note "--max-time did not reach curl"
 
 # Unknown keys in the config are not exported; a malformed line does not abort.
 printf 'HARVEST_EVIL=1\nnot a key value line\n9BAD=1\n' >> "$HARVEST_CONFIG"
