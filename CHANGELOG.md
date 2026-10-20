@@ -3,6 +3,39 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [0.8.6] — 2026-10-20
+
+Patch release: `/deliver` lets you choose the work branch, the branch it
+integrates into and how, and never launches (or starts `/to-prd`) without an
+approved procedure.
+
+### Added
+
+- `deliver.sh --work-branch <branch> --into <branch> --via pr|ff|none`
+  (ADR-0016). `--work-branch` switches to the branch per-issue PRs merge
+  into, or cuts it off `origin/<into>` and pushes it. `--into` (default: the
+  default branch) and `--via` (default: `pr`) choose the end of the run:
+  `pr` is the final PR, now aimed at `--into`; `ff` fast-forwards `--into` to
+  the work branch with an unforced push once every Delivery line merged (a
+  partial run leaves it alone); `none` integrates nothing. `--via ff` into
+  the default branch, or into a branch that has commits the work branch
+  lacks, is refused before the run starts. Both are recorded in
+  `state.json` (`integration`) for `--resume`; `--plan-only --json` reports
+  them as `integration`, with `given[]`.
+- `/deliver` has an `argument-hint`, so the flags show in the slash-command
+  menu.
+
+### Changed
+
+- `/deliver` settles the procedure first: any of work branch / `--into` /
+  `--via` the user did not pass, it proposes (the project's documented
+  convention first) and launches only after an explicit approval, with all
+  three passed. `--yes` skips that only when all three were given. Without a
+  Map it proposes the path to one and starts no `/to-prd`, `/start-feature`
+  or `/to-issues` on its own.
+- `--create-integration` cuts its branch off `origin/<into>` (unchanged
+  unless `--into` is passed); `deliver.sh --help` prints the whole header.
+
 ## [0.8.5] — 2026-10-18
 
 Patch release: `/worklog --harvest` reviews and logs on a local page, beside

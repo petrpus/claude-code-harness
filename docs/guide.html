@@ -268,7 +268,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section class="hero" id="thesis" style="border-top:none">
     <div class="hero-grid">
       <div>
-        <p class="eyebrow">Claude Code plugin · v0.8.5</p>
+        <p class="eyebrow">Claude Code plugin · v0.8.6</p>
         <h1>A harness for safe, cost-conscious autonomous development.</h1>
         <p class="lead">Curated skills, two review agents, and git/dev guard hooks — plus a loop engine that runs long unattended sessions behind hard verify gates and real cost caps. Install once; every project gets the same disciplined toolkit.</p>
         <div class="pillrow">
@@ -497,7 +497,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
   <section id="deliver">
     <p class="eyebrow">Deliver a map</p>
     <h2>From a Map issue to one integration PR.</h2>
-    <p class="sec-intro">When the work is a set of issues rather than one, <code>/deliver</code> walks a <b>Map</b> — a <code>map</code>-labelled issue listing the slices and their blocking edges — builds each issue on its own branch off an <code>integration/&lt;slug&gt;</code> branch, and opens a single final PR into the repo's default branch.</p>
+    <p class="sec-intro">When the work is a set of issues rather than one, <code>/deliver</code> walks a <b>Map</b> — a <code>map</code>-labelled issue listing the slices and their blocking edges — builds each issue on its own branch off a work branch (for example <code>integration/&lt;slug&gt;</code>), then integrates that work branch the way you approve: a final PR, a fast-forward, or nothing.</p>
     <div class="flow">
 
       <div class="card">
@@ -513,17 +513,18 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
       <div class="card">
         <p class="scenario">2) Pre-flight</p>
         <h3>Check before spending</h3>
-        <p><code>/deliver #&lt;map&gt;</code> first runs the plan-only pre-flight: which issues are ready, which are blocked, which base branch and verify command apply.</p>
+        <p><code>/deliver #&lt;map&gt;</code> first runs the plan-only pre-flight: which issues are ready, which are blocked, which work branch and verify command apply. Whatever of the procedure you did not pass (work branch, <code>--into</code>, <code>--via</code>), it proposes and waits for your explicit approval or correction before launching.</p>
         <ul class="steps">
-          <li><code>/deliver #12</code> — plan, confirm flags, then launch</li>
-          <li><code>--create-integration</code> or <code>--allow-main</code> — choose the base branch</li>
+          <li><code>/deliver #12</code> — plan, approve the procedure, then launch</li>
+          <li><code>--work-branch &lt;b&gt;</code>, <code>--into &lt;b&gt;</code>, <code>--via pr|ff|none</code> — the procedure up front</li>
+          <li><code>--create-integration</code> or <code>--allow-main</code> — the older ways to choose the work branch</li>
         </ul>
       </div>
 
       <div class="card">
         <p class="scenario">3) tmux run</p>
         <h3>Unattended, one issue at a time</h3>
-        <p>The run starts detached in a <code>deliver-&lt;N&gt;</code> tmux session. Each issue gets an autopilot build loop, a full verify, an independent review, the CI wait, and a squash-merge into the integration branch.</p>
+        <p>The run starts detached in a <code>deliver-&lt;N&gt;</code> tmux session. Each issue gets an autopilot build loop, a full verify, an independent review, the CI wait, and a squash-merge into the work branch.</p>
         <ul class="steps">
           <li><code>tmux has-session -t deliver-12</code> — is it alive?</li>
           <li><code>deliver.sh --map 12 --resume</code> — continue an interrupted run</li>
@@ -553,9 +554,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
       </div>
 
       <div class="card">
-        <p class="scenario">6) Final integration PR</p>
-        <h3>One review, one merge</h3>
-        <p>When the run ends, whether done or partial, the runner opens one PR from the integration branch into the default branch, or updates the one already open. Its body carries a <code>Closes #N</code> for each delivered issue, and <code>Closes #&lt;map&gt;</code> once every line of the Map is ticked. You review it and merge it with a merge commit; nothing is pushed to the default branch directly. Under <code>--allow-main</code> there is no final PR: each issue PR closes its own issue.</p>
+        <p class="scenario">6) Integration</p>
+        <h3>A PR, a fast-forward, or nothing</h3>
+        <p>When the run ends, the work branch goes to <code>--into</code> (default: the default branch) the way <code>--via</code> says. With <code>pr</code> (the default), the runner opens one PR into it, done or partial, or updates the one already open. Its body carries a <code>Closes #N</code> for each delivered issue, and <code>Closes #&lt;map&gt;</code> once every line of the Map is ticked; you merge it with a merge commit. With <code>ff</code>, once every issue is merged, the runner fast-forwards <code>--into</code> (for example <code>test</code>) to the work branch with an unforced push. It never does this into the default branch, and never for a partial run. With <code>none</code>, the work branch is left for you. Under <code>--allow-main</code> nothing is integrated: each issue PR closes its own issue.</p>
       </div>
 
     </div>
@@ -662,7 +663,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wr
 
 <footer>
   <div class="wrap">
-    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.8.5 · MIT</span>
+    <span><a href="https://github.com/petrpus/claude-code-harness">github.com/petrpus/claude-code-harness</a> · v0.8.6 · MIT</span>
     <span class="muted">press <span class="kbd">t</span> to flip theme</span>
   </div>
 </footer>

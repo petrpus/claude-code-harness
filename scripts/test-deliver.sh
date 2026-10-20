@@ -993,6 +993,97 @@ job_createintcombo() {
   run_deliver createintcombo -- --create-integration --resume
   echo $? > "$WORK/createintcombo/rc2"
 }
+# --work-branch / --into / --via (ADR-0016). Every fixture gets a `test`
+# branch on origin, cut from main like integration/x.
+test_branch() { git -C "$WORK/$1/repo" push -q origin main:test 2>/dev/null; }
+job_viaff() {
+  new_fixture viaff; test_branch viaff
+  run_deliver viaff -- --into test --via ff
+  echo $? > "$WORK/viaff/rc"
+}
+job_viaffpartial() {
+  new_fixture viaffpartial with4; test_branch viaffpartial
+  run_deliver viaffpartial STUB_STALL_ISSUES=1 -- --issue-max-iterations 2 --into test --via ff
+  echo $? > "$WORK/viaffpartial/rc"
+}
+job_viaffmoved() {
+  local d="$WORK/viaffmoved"
+  new_fixture viaffmoved; test_branch viaffmoved
+  git -C "$d/repo" switch -q -c t origin/test && echo moved > "$d/repo/moved.txt" \
+    && git -C "$d/repo" add moved.txt && git -C "$d/repo" commit -q -m moved \
+    && git -C "$d/repo" push -q origin t:test 2>/dev/null && git -C "$d/repo" switch -q integration/x
+  git -C "$d/remote.git" rev-parse test > "$d/test_before"
+  run_deliver viaffmoved -- --into test --via ff
+  echo $? > "$d/rc"
+}
+job_viaffmain() {
+  new_fixture viaffmain
+  run_deliver viaffmain -- --via ff
+  echo $? > "$WORK/viaffmain/rc"
+}
+job_vianone() {
+  new_fixture vianone
+  run_deliver vianone -- --via none
+  echo $? > "$WORK/vianone/rc1"
+  run_deliver vianone -- --resume
+  echo $? > "$WORK/vianone/rc"
+}
+job_viaprtest() {
+  new_fixture viaprtest; test_branch viaprtest
+  run_deliver viaprtest -- --into test
+  echo $? > "$WORK/viaprtest/rc"
+}
+job_wbcreate() {
+  new_fixture wbcreate; test_branch wbcreate
+  git -C "$WORK/wbcreate/repo" switch -q main
+  run_deliver wbcreate -- --work-branch feat/map-x --into test --via ff
+  echo $? > "$WORK/wbcreate/rc"
+}
+job_wbswitch() {
+  new_fixture wbswitch
+  git -C "$WORK/wbswitch/repo" switch -q main
+  run_deliver wbswitch -- --work-branch integration/x
+  echo $? > "$WORK/wbswitch/rc"
+}
+job_wbrefuse() { # a refused integration leaves no work branch behind
+  new_fixture wbrefuse
+  git -C "$WORK/wbrefuse/repo" switch -q main
+  run_deliver wbrefuse -- --work-branch feat/never --via ff
+  echo $? > "$WORK/wbrefuse/rc"
+}
+job_wbremote() { # the work branch exists only on origin
+  new_fixture wbremote
+  git -C "$WORK/wbremote/repo" push -q origin main:feat/remote-only 2>/dev/null
+  git -C "$WORK/wbremote/repo" switch -q main
+  run_deliver wbremote -- --work-branch feat/remote-only --via none
+  echo $? > "$WORK/wbremote/rc"
+}
+job_oldresume() { # a run recorded before 0.8.6 has no .integration: a PR into main, as then
+  local d="$WORK/oldresume" st
+  new_fixture oldresume
+  run_deliver oldresume -- --via none
+  echo $? > "$d/rc1"
+  for st in "$d"/repo/tmp/deliver/*/state.json; do jq 'del(.integration)' "$st" > "$st.x" && mv "$st.x" "$st"; done
+  run_deliver oldresume -- --resume
+  echo $? > "$d/rc"
+}
+job_amresume() { # --via pr on a resumed --allow-main run is refused
+  new_fixture amresume
+  git -C "$WORK/amresume/repo" switch -q main
+  run_deliver amresume -- --allow-main
+  echo $? > "$WORK/amresume/rc1"
+  run_deliver amresume -- --resume --via pr
+  echo $? > "$WORK/amresume/rc"
+}
+WBBAD_ARGS=("--via merge" "--work-branch x --create-integration" "--allow-main --via pr"
+            "--work-branch x --resume" "--work-branch test --into test" "--into nope")
+job_wbbad() { # <index> <args>
+  local name="wbbad$1"
+  new_fixture "$name"
+  # shellcheck disable=SC2086  # the args are word-split on purpose
+  run_deliver "$name" -- $2
+  echo $? > "$WORK/$name/rc"
+}
 job_dirty() {
   new_fixture dirty
   echo junk > "$WORK/dirty/repo/untracked.txt"
@@ -1367,6 +1458,19 @@ bg job_createintexists
 bg job_createintremote
 bg job_createintdirty
 bg job_createintcombo
+bg job_viaff
+bg job_viaffpartial
+bg job_viaffmoved
+bg job_viaffmain
+bg job_vianone
+bg job_viaprtest
+bg job_wbcreate
+bg job_wbswitch
+for i in "${!WBBAD_ARGS[@]}"; do bg job_wbbad "$i" "${WBBAD_ARGS[$i]}"; done
+bg job_wbrefuse
+bg job_wbremote
+bg job_oldresume
+bg job_amresume
 bg job_dirty
 bg job_nomap
 bg job_behind
@@ -1713,6 +1817,96 @@ done
   && ! grep -q '^switch -q -c' "$WORK/createintcombo/git.calls" 2>/dev/null \
   && ok "--create-integration refuses --allow-main and --resume" \
   || note "--create-integration combos: rc=$(cat "$WORK/createintcombo/rc") rc2=$(cat "$WORK/createintcombo/rc2")"
+
+# --- --work-branch / --into / --via (ADR-0016) ---------------------------------
+# no_force <name> — the runner never force-pushed in that fixture.
+no_force() { ! grep -qE '^push .*(--force|-f( |$)|\+[^ ]*:)' "$WORK/$1/git.calls"; }
+D="$WORK/viaff"
+[[ "$(cat "$D/rc")" -eq 0 ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse test)" == "$(git -C "$D/remote.git" rev-parse integration/x)" ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse test)" != "$(git -C "$D/remote.git" rev-parse main)" ]] \
+  && [[ ! -e "$D/gh/prs/6.json" ]] && no_force viaff \
+  && grep -qE "^push -q origin [0-9a-f]{40}:refs/heads/test$" "$D/git.calls" \
+  && jq -e --arg t "$(git -C "$D/remote.git" rev-parse test)" '.integration == {into:"test", via:"ff", pushed:$t} and (.final_pr // null) == null' "$D"/repo/tmp/deliver/*/state.json >/dev/null \
+  && grep -q '"event":"integrated"' "$D"/repo/tmp/deliver/*/events.jsonl \
+  && ok "--via ff: both issues merged, then test fast-forwarded to integration/x by an unforced push; no final PR; recorded" \
+  || note "--via ff: rc=$(cat "$D/rc") test=$(git -C "$D/remote.git" rev-parse --short test) ix=$(git -C "$D/remote.git" rev-parse --short integration/x) err: $(tail -3 "$D/err" | tr '\n' '|')"
+D="$WORK/viaffpartial"
+[[ "$(cat "$D/rc")" -eq 2 ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse test)" == "$(git -C "$D/remote.git" rev-parse main)" ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse integration/x)" != "$(git -C "$D/remote.git" rev-parse main)" ]] \
+  && grep -q '"event":"integration-skipped"' "$D"/repo/tmp/deliver/*/events.jsonl \
+  && grep -q "git push origin integration/x:test" "$D/err" && ! grep -q '^push -q origin [0-9a-f]*:refs/heads/test' "$D/git.calls" \
+  && ok "--via ff on a partial run (exit 2): #4 merged into integration/x, test left alone, the manual push named" \
+  || note "--via ff partial: rc=$(cat "$D/rc") err: $(tail -3 "$D/err" | tr '\n' '|')"
+D="$WORK/viaffmoved"
+[[ "$(cat "$D/rc")" -eq 1 ]] && grep -q "integration refused: 'test' has commits 'integration/x' lacks" "$D/err" \
+  && ! grep -qE '^(pr create|label create|issue edit)' "$D/gh/calls" && [[ ! -e "$D/repo/tmp/deliver" ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse test)" == "$(cat "$D/test_before")" ]] \
+  && ok "--via ff into a branch with commits the work branch lacks is refused before the run starts" \
+  || note "--via ff moved: rc=$(cat "$D/rc") err: $(tail -2 "$D/err" | tr '\n' '|')"
+D="$WORK/viaffmain"
+[[ "$(cat "$D/rc")" -eq 1 ]] && grep -q "into the default branch 'main' is refused (ADR-0016)" "$D/err" \
+  && ! grep -qE '^(pr create|label create)' "$D/gh/calls" && [[ ! -e "$D/repo/tmp/deliver" ]] \
+  && ok "--via ff into the default branch is refused before the run starts (main only via a PR)" \
+  || note "--via ff into main: rc=$(cat "$D/rc") err: $(tail -2 "$D/err" | tr '\n' '|')"
+D="$WORK/vianone"
+[[ "$(cat "$D/rc1")" -eq 0 && "$(cat "$D/rc")" -eq 0 ]] && [[ ! -e "$D/gh/prs/6.json" ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse main)" != "$(git -C "$D/remote.git" rev-parse integration/x)" ]] \
+  && [[ "$(grep -c '"event":"integration"' "$D"/repo/tmp/deliver/*/events.jsonl)" -eq 2 ]] \
+  && jq -e '.integration == {into:"main", via:"none"}' "$D"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--via none: no final PR, integration/x left as is — and a --resume without the flag keeps it from state.json" \
+  || note "--via none: rc=$(cat "$D/rc1")/$(cat "$D/rc") state=$(jq -c .integration "$D"/repo/tmp/deliver/*/state.json) err: $(tail -2 "$D/err" | tr '\n' '|')"
+D="$WORK/viaprtest"
+[[ "$(cat "$D/rc")" -eq 0 ]] \
+  && [[ "$(jq -r '.baseRefName + ">" + .headRefName' "$D/gh/prs/6.json")" == "test>integration/x" ]] \
+  && jq -r .body "$D/gh/prs/6.json" | grep -q 'only once the work reaches `main`' \
+  && jq -e '.final_pr.base == "test" and .integration.via == "pr"' "$D"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--into test (--via pr by default): the final PR targets test and says Closes acts only on main" \
+  || note "--into test: rc=$(cat "$D/rc") pr6=$(jq -c '{baseRefName,headRefName}' "$D/gh/prs/6.json" 2>/dev/null) err: $(tail -2 "$D/err" | tr '\n' '|')"
+D="$WORK/wbcreate"
+[[ "$(cat "$D/rc")" -eq 0 ]] \
+  && grep -qx 'switch -q -c feat/map-x origin/test' "$D/git.calls" && grep -qx 'push -q -u origin feat/map-x' "$D/git.calls" \
+  && [[ "$(jq -r .baseRefName "$D/gh/prs/4.json")" == "feat/map-x" && "$(jq -r .baseRefName "$D/gh/prs/5.json")" == "feat/map-x" ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse test)" == "$(git -C "$D/remote.git" rev-parse feat/map-x)" ]] \
+  && [[ "$(git -C "$D/remote.git" rev-parse main)" == "$(git -C "$D/remote.git" rev-parse integration/x)" ]] \
+  && ok "--work-branch that does not exist: cut off origin/<into> and pushed, PRs target it, then test fast-forwarded" \
+  || note "--work-branch create: rc=$(cat "$D/rc") git: $(grep -E '^(switch|push)' "$D/git.calls" | tr '\n' '|') err: $(tail -3 "$D/err" | tr '\n' '|')"
+D="$WORK/wbswitch"
+[[ "$(cat "$D/rc")" -eq 0 ]] && grep -qx 'switch -q integration/x' "$D/git.calls" \
+  && [[ "$(jq -r .baseRefName "$D/gh/prs/4.json")" == "integration/x" ]] \
+  && [[ "$(jq -r '.baseRefName + ">" + .headRefName' "$D/gh/prs/6.json")" == "main>integration/x" ]] \
+  && ok "--work-branch naming an existing branch: switched to it from main; the final PR into main as before" \
+  || note "--work-branch switch: rc=$(cat "$D/rc") err: $(tail -3 "$D/err" | tr '\n' '|')"
+D="$WORK/wbrefuse"
+[[ "$(cat "$D/rc")" -eq 1 ]] && grep -q "integration refused:.*ADR-0016" "$D/err" \
+  && ! grep -qE '^(switch|push)' "$D/git.calls" && [[ "$(git -C "$D/repo" branch --show-current)" == "main" ]] \
+  && ! git -C "$D/repo" rev-parse -q --verify refs/heads/feat/never >/dev/null \
+  && [[ -z "$(git -C "$D/remote.git" branch --list feat/never)" ]] \
+  && ok "--work-branch with a refused integration (ff into main): nothing created, pushed or switched" \
+  || note "--work-branch refused: rc=$(cat "$D/rc") git: $(grep -E '^(switch|push)' "$D/git.calls" | tr '\n' '|') err: $(tail -1 "$D/err")"
+D="$WORK/wbremote"
+[[ "$(cat "$D/rc")" -eq 0 ]] && grep -qx 'switch -q feat/remote-only' "$D/git.calls" \
+  && [[ "$(jq -r .baseRefName "$D/gh/prs/4.json")" == "feat/remote-only" ]] && [[ ! -e "$D/gh/prs/6.json" ]] \
+  && ok "--work-branch that exists only on origin: checked out from origin, PRs target it" \
+  || note "--work-branch remote-only: rc=$(cat "$D/rc") err: $(tail -2 "$D/err" | tr '\n' '|')"
+D="$WORK/oldresume"
+[[ "$(cat "$D/rc1")" -eq 0 && "$(cat "$D/rc")" -eq 0 ]] \
+  && [[ "$(jq -r '.baseRefName + ">" + .headRefName' "$D/gh/prs/6.json" 2>/dev/null)" == "main>integration/x" ]] \
+  && jq -e '.integration == {into:"main", via:"pr"}' "$D"/repo/tmp/deliver/*/state.json >/dev/null \
+  && ok "--resume of a run recorded without .integration (pre-0.8.6): the final PR into main, as it always had" \
+  || note "old resume: rc=$(cat "$D/rc1")/$(cat "$D/rc") err: $(tail -2 "$D/err" | tr '\n' '|')"
+D="$WORK/amresume"
+[[ "$(cat "$D/rc1")" -eq 0 && "$(cat "$D/rc")" -eq 1 ]] && grep -q "(--allow-main); --via pr does not apply" "$D/err" \
+  && ok "--resume --via pr of an --allow-main run is refused, not silently ignored" \
+  || note "allow-main resume: rc=$(cat "$D/rc1")/$(cat "$D/rc") err: $(tail -1 "$D/err")"
+for i in "${!WBBAD_ARGS[@]}"; do
+  D="$WORK/wbbad$i"
+  [[ "$(cat "$D/rc")" -eq 1 ]] && ! grep -qE '^(pr create|label create)' "$D/gh/calls" 2>/dev/null \
+    && ! grep -q '^switch -q -c' "$D/git.calls" 2>/dev/null && [[ ! -e "$D/repo/tmp/deliver" ]] \
+    && ok "refused before any run starts: ${WBBAD_ARGS[$i]}" \
+    || note "${WBBAD_ARGS[$i]}: rc=$(cat "$D/rc") err: $(tail -1 "$D/err")"
+done
 
 RC="$(cat "$WORK/dirty/rc")"
 [[ "$RC" -eq 1 ]] && grep -q "working tree is dirty" "$WORK/dirty/err" && [[ ! -s "$WORK/dirty/gh/calls" ]] \
@@ -2304,7 +2498,7 @@ new_fixture pf1
 run_deliver pf1 -- --plan-only --json; RC=$?
 PF1="$WORK/pf1"
 [[ "$RC" -eq 0 && "$(pojq pf1 .ok)" == "true" ]] \
-  && [[ "$(jq -c 'keys' "$PF1/out")" == '["base","caps","checks","estimate_usd","issues","map","ok","skipped"]' ]] \
+  && [[ "$(jq -c 'keys' "$PF1/out")" == '["base","caps","checks","estimate_usd","integration","issues","map","ok","skipped"]' ]] \
   && ok "plan-only --json: one object with ok, checks, issues, skipped, caps, estimate_usd (exit 0)" \
   || note "plan-only --json: rc=$RC out=$(head -c 300 "$PF1/out")"
 [[ "$(pojq pf1 '[.issues[].id]|join(",")')" == "#1,#2" && "$(pojq pf1 '.issues[1].after|join(",")')" == "#1" ]] \
@@ -2314,7 +2508,7 @@ PF1="$WORK/pf1"
   && ok "plan-only: estimate \$6-8 per remaining issue; caps carry the per-issue limits and null global ones" \
   || note "plan-only estimate/caps: $(pojq pf1 '.estimate_usd, .caps' | tr '\n' ' ')"
 MISSING_CHECKS=""
-for c in gh jq tmux base-branch clean-tree tmp-ignored base-synced verify map external-refs dag labels branch-protection; do
+for c in gh jq tmux base-branch clean-tree tmp-ignored base-synced verify map external-refs dag labels branch-protection integration; do
   [[ -n "$(pocheck pf1 $c)" ]] || MISSING_CHECKS="$MISSING_CHECKS $c"
 done
 [[ -z "$MISSING_CHECKS" && "$(pocheck pf1 labels)" == "warn" && "$(pocheck pf1 verify)" == "ok" ]] \
@@ -2329,6 +2523,22 @@ done
 run_deliver pf1 -- --plan-only; RC=$?
 grep -q 'Pre-flight for map #3' "$PF1/out" && grep -q '#1 feat(a): first feature' "$PF1/out" && grep -q 'Estimated cost: \$12-16' "$PF1/out" && [[ "$RC" -eq 0 ]] \
   && ok "plan-only without --json prints the same plan as text" || note "plan-only text: rc=$RC $(head -5 "$PF1/out" | tr '\n' '|')"
+run_deliver pf1 -- --plan-only --json
+[[ "$(pojq pf1 '.integration|"\(.work_branch)|\(.work_branch_action)|\(.into)|\(.via)|\(.default_branch)|\(.given|length)"')" == "integration/x|current|main|pr|main|0" ]] \
+  && ok "plan-only: with no --work-branch/--into/--via the plan shows the defaults (current branch, pr into main) and none as given" \
+  || note "plan-only integration defaults: $(pojq pf1 '.integration' | tr '\n' ' ')"
+new_fixture pfint; git -C "$WORK/pfint/repo" push -q origin main:test 2>/dev/null
+run_deliver pfint -- --plan-only --json --work-branch feat/new --into test --via ff; RC=$?
+[[ "$RC" -eq 0 && "$(pocheck pfint integration)" == "ok" && "$(pocheck pfint base-branch)" == "ok" ]] \
+  && [[ "$(pojq pfint '.integration|"\(.work_branch)|\(.work_branch_action)|\(.into)|\(.via)|\(.given|join(","))"')" == "feat/new|create|test|ff|work_branch,into,via" ]] \
+  && [[ "$(git -C "$WORK/pfint/repo" branch --show-current)" == "integration/x" ]] && ! git -C "$WORK/pfint/repo" rev-parse -q --verify refs/heads/feat/new >/dev/null \
+  && ok "plan-only: --work-branch (to create) --into test --via ff are reported as given, and nothing is created" \
+  || note "plan-only integration given: rc=$RC $(pojq pfint '.integration' | tr '\n' ' ') $(pocheck pfint integration)"
+run_deliver pfint -- --plan-only --json --via ff; RC=$?
+[[ "$RC" -ne 0 && "$(pocheck pfint integration)" == "fail" ]] \
+  && pojq pfint '.checks[]|select(.name=="integration")|.detail' | grep -q 'ADR-0016' \
+  && ok "plan-only: --via ff into the default branch fails the integration check" \
+  || note "plan-only ff into main: rc=$RC $(pojq pfint '.checks[]|select(.name=="integration")')"
 
 # a ticked issue is skipped, not planned or costed
 new_fixture pf2
