@@ -143,6 +143,46 @@ seg_is_git_clean() {
   [[ " $after " == *" clean "* ]]
 }
 
+# Tag names that an earlier `git tag <name>` segment of this same command
+# creates. The hook runs before any of the command does, so in the usual
+# release one-liner `git tag -a v1 -m … && git push origin v1` the tag does not
+# exist yet when the bare name is resolved, and the push was blocked as though
+# `v1` might be a branch.
+CREATED_TAGS=()
+
+# seg_created_tag <segment>  — prints the name a `git [-C dir] [-c k=v] tag …`
+# segment creates, and returns 0; returns 1 for anything else, including the
+# listing / deleting / verifying forms. Only the first operand counts: it is
+# the tag name, any later one is the commit it points at. A `-m "two words"`
+# message is not parsed as quoted (see the header note), so its words after
+# the first may land as operands — harmless, since a created name is still
+# only trusted when nothing by that name exists yet (seg_is_tag_only_push).
+seg_created_tag() {
+  local -a words=()
+  read -ra words <<<"$(seg_words "$1")"
+  local i=0 n="${#words[@]}" w
+  while [[ "$i" -lt "$n" && "${words[$i]}" != "git" ]]; do i=$(( i + 1 )); done
+  i=$(( i + 1 ))
+  # git's own options before the subcommand; -C and -c take a value.
+  while [[ "$i" -lt "$n" && "${words[$i]}" == -* ]]; do
+    case "${words[$i]}" in -C|-c) i=$(( i + 2 )) ;; *) i=$(( i + 1 )) ;; esac
+  done
+  [[ "$i" -lt "$n" && "${words[$i]}" == "tag" ]] || return 1
+  i=$(( i + 1 ))
+  while [[ "$i" -lt "$n" ]]; do
+    w="${words[$i]}"
+    case "$w" in
+      -d|--delete|-l|--list|-v|--verify|-n*|--contains*|--no-contains*|--points-at*|--merged*|--no-merged*|--sort*|--format*|--column*)
+        return 1 ;;
+      -m|-F|-u|--message|--file|--local-user|--cleanup) i=$(( i + 2 )); continue ;;
+      -*|[0-9]'>'*|'>'*|'<'*|'&>'*) i=$(( i + 1 )); continue ;;
+    esac
+    printf '%s\n' "$w"
+    return 0
+  done
+  return 1
+}
+
 # Return 0 if a push targets ONLY tags. A tag doesn't advance a branch, so the
 # push-from-main rule has nothing to say about it — and blocking it broke this
 # repo's own documented release step, which tags on the merge commit on main.
@@ -206,12 +246,20 @@ seg_is_tag_only_push() {
   [[ "$tagrefs" -gt 0 && "${#names[@]}" -eq 0 ]] && return 0
 
   # A bare name like `v0.4.0` is ambiguous — ask git. It must resolve to a tag
-  # and NOT to a branch; anything ambiguous stays blocked.
+  # and NOT to a branch; anything ambiguous stays blocked. A name an earlier
+  # segment creates (CREATED_TAGS) passes only while nothing by that name
+  # exists yet — no branch, tag, HEAD or commit — so the push can only send
+  # the tag that segment made.
   if [[ "$GIT_OK" -eq 1 && "$tagrefs" -eq 0 && "${#names[@]}" -gt 0 ]]; then
-    local n
+    local n c created
     for n in "${names[@]}"; do
-      git rev-parse --verify --quiet "refs/tags/$n" >/dev/null 2>&1 || return 1
       git rev-parse --verify --quiet "refs/heads/$n" >/dev/null 2>&1 && return 1
+      git rev-parse --verify --quiet "refs/tags/$n" >/dev/null 2>&1 && continue
+      created=0
+      for c in ${CREATED_TAGS[@]+"${CREATED_TAGS[@]}"}; do [[ "$c" == "$n" ]] && created=1; done
+      [[ "$created" -eq 1 ]] || return 1
+      git check-ref-format "refs/tags/$n" >/dev/null 2>&1 || return 1
+      git rev-parse --verify --quiet "$n" >/dev/null 2>&1 && return 1
     done
     return 0
   fi
@@ -237,6 +285,8 @@ seg_is_dangerous_rm() {
 
 while IFS= read -r seg; do
   [[ -z "${seg// }" ]] && continue
+
+  if created_tag="$(seg_created_tag "$seg")"; then CREATED_TAGS+=("$created_tag"); fi
 
   if seg_is_git_push "$seg"; then
     # The push-from-main rule is the one guard settings.json deny cannot

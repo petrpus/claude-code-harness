@@ -3,6 +3,17 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [Unreleased]
+
+### Fixed
+
+- `pre-bash.sh` lets a tag push from `main` through when the same command
+  creates the tag first (`git tag -a v1 -m … && git push origin v1`). The
+  hook runs before the command, so the bare name could not resolve to a tag
+  yet and the release one-liner was blocked as a possible branch push. A name
+  an earlier `git tag` segment creates passes only while nothing by that name
+  exists — no branch, tag, `HEAD` or commit.
+
 ## [0.8.5] — 2026-10-18
 
 Patch release: `/worklog --harvest` reviews and logs on a local page, beside
