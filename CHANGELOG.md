@@ -7,7 +7,8 @@ All notable changes to the harness (the `code-harness` plugin, named
 
 Patch release: `/deliver` lets you choose the work branch, the branch it
 integrates into and how, and never launches (or starts `/to-prd`) without an
-approved procedure.
+approved procedure; the `pre-bash` hook lets a release one-liner push the tag
+it just created.
 
 ### Added
 
@@ -35,6 +36,15 @@ approved procedure.
   or `/to-issues` on its own.
 - `--create-integration` cuts its branch off `origin/<into>` (unchanged
   unless `--into` is passed); `deliver.sh --help` prints the whole header.
+
+### Fixed
+
+- `pre-bash.sh` lets a tag push from `main` through when the same command
+  creates the tag first (`git tag -a v1 -m … && git push origin v1`). The
+  hook runs before the command, so the bare name could not resolve to a tag
+  yet and the release one-liner was blocked as a possible branch push. A name
+  an earlier `git tag` segment creates passes only while nothing by that name
+  exists — no branch, tag, `HEAD` or commit.
 
 ## [0.8.5] — 2026-10-18
 

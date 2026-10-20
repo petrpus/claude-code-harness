@@ -229,6 +229,22 @@ else
     "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin --tags\"}}"
   assert_hook "pre-bash allows 'push origin tag <name>' from main" 0 hooks/pre-bash.sh \
     "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin tag v9.9.9\"}}"
+  # A tag the same command creates first: the hook runs before the command, so
+  # the bare name cannot resolve yet (the v0.8.5 release one-liner was blocked).
+  assert_hook "pre-bash allows 'git tag -a <new> -m … && git push origin <new>' from main" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git tag -a v8.8.8 HEAD -m \\\"v8.8.8 — notes\\\" && git push origin v8.8.8 && git ls-remote --tags origin v8.8.8\"}}"
+  assert_hook "pre-bash allows 'git -C . tag <new>; git push origin <new> 2>&1' from main" 0 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git -C . tag v8.8.8; git push origin v8.8.8 2>&1\"}}"
+  assert_hook "pre-bash blocks a push placed before the tag it names" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push origin v8.8.8 && git tag v8.8.8\"}}"
+  assert_hook "pre-bash blocks pushing a name 'git tag -d' only deletes" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git tag -d v8.8.8 && git push origin v8.8.8\"}}"
+  assert_hook "pre-bash blocks a 'created tag' that is really a branch" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git tag relbranch && git push origin relbranch\"}}"
+  assert_hook "pre-bash blocks a 'created tag' that already resolves (HEAD)" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git tag HEAD && git push origin HEAD\"}}"
+  assert_hook "pre-bash blocks a branch named after a tag message word" 2 hooks/pre-bash.sh \
+    "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git tag -m main v8.8.8 && git push origin main\"}}"
   # …and everything that could still move a branch stays blocked.
   assert_hook "pre-bash blocks --follow-tags from main (pushes commits too)" 2 hooks/pre-bash.sh \
     "{\"cwd\":\"$TAG_JSON_CWD\",\"tool_input\":{\"command\":\"git push --follow-tags\"}}"
