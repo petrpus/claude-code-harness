@@ -30,13 +30,21 @@
 # itself (the forge unreachable, a dirty checkout, a review that touched the
 # checkout) ends the run instead.
 #
-# At the end of a run — also a partial one — final_pr (#62) opens (or, when an
-# open one exists for this branch, rewrites the body of) the PR from the
-# integration branch into the repo's default branch: `Closes #N` per delivered
-# issue, `Closes #<map>` only when every Delivery line is ticked, parked /
-# skipped / closed-externally / follow-up issues listed, and a line asking for
-# a merge commit rather than a squash. No final PR when nothing was delivered.
-# Recorded as .final_pr in state.json.
+# At the end of a run the work branch is integrated the way --via says
+# (ADR-0016), into --into (default: the repo's default branch):
+#   pr    (default) — also for a partial run, final_pr (#62) opens (or, when
+#         an open one exists for this branch, rewrites the body of) the PR
+#         from the work branch into --into: `Closes #N` per delivered issue,
+#         `Closes #<map>` only when every Delivery line is ticked, parked /
+#         skipped / closed-externally / follow-up issues listed, and a line
+#         asking for a merge commit rather than a squash. No final PR when
+#         nothing was delivered. Recorded as .final_pr in state.json.
+#   ff    — only when every Delivery line merged: origin/<into> is moved to
+#         the work branch's tip by an unforced push, if that is a
+#         fast-forward. Refused up front for the default branch, and when
+#         <into> already has commits the work branch lacks.
+#   none  — nothing; the work branch is left for a human.
+# --into / --via are recorded in state.json (.integration) for --resume.
 #
 # --plan-only (#65) is the read-only pre-flight the /deliver skill runs before
 # it launches anything: no run dir, no branch switch, no label or issue edit,
@@ -65,17 +73,22 @@
 #              [--ci-poll-seconds 30] [--ci-timeout 1800] [--ci-grace-seconds 120]
 #              [--max-fix-rounds 2] [--max-turns 200] [--review-max-turns 80]
 #              [--budget-usd <n>] [--max-minutes <n>]
-#              [--resume [--retry '#N']] [--allow-main | --create-integration]
+#              [--resume [--retry '#N']]
+#              [--work-branch <branch> | --create-integration | --allow-main]
+#              [--into <branch>] [--via pr|ff|none]
 #              [--plan-only [--json]] | --status | --stop
 #
-# Run it from a clean checkout of the integration branch, in sync with origin.
+# Run it from a clean checkout of the work branch (the "integration branch"
+# per-issue PRs merge into), in sync with origin — or name it with
+# --work-branch: the runner switches to it, or cuts it off origin/<into> and
+# pushes it when it exists neither locally nor on origin.
 # main/master is refused unless --allow-main (docs/adr/0013-*.md): per-issue
 # PRs then target that branch directly and no final PR is opened; the flag is
 # recorded in state.json, so --resume on main does not refuse again.
 # --create-integration (#62) makes the integration branch first: from a clean
 # checkout it derives integration/<map-slug> from the Map's title, runs
-# `git switch -c integration/<map-slug> origin/<default>` and pushes it with
-# `git push -u`, then delivers into it (final PR targets the default branch).
+# `git switch -c integration/<map-slug> origin/<into>` and pushes it with
+# `git push -u`, then delivers into it.
 # It refuses when that branch already exists locally or on origin, and cannot
 # be combined with --resume or --allow-main. State lives under tmp/deliver/<run-id>/: state.json
 # (resume truth), events.jsonl, status.json, run-<run-id>.jsonl (this
@@ -150,7 +163,10 @@ BUDGET_USD=""          # empty: no global cap
 MAX_MINUTES=""         # empty: no global cap
 RESUME=0
 ALLOW_MAIN=0           # --allow-main: deliver straight into main/master (ADR-0013)
-CREATE_INTEGRATION=0   # --create-integration: cut integration/<map-slug> off origin/<default>
+CREATE_INTEGRATION=0   # --create-integration: cut integration/<map-slug> off origin/<into>
+WORK_BRANCH=""         # --work-branch: where per-issue PRs merge (empty: the checkout)
+INTO=""                # --into: where the work branch goes at the end (empty: the default branch)
+VIA=""                 # --via pr|ff|none (empty: pr) — how it gets there (ADR-0016)
 RETRY_ISSUE=""         # set by --retry '#N'; only meaningful with --resume
 PLAN_ONLY=0            # --plan-only: read-only pre-flight + run plan, then exit (#65)
 JSON_OUT=0             # --json: the run plan as one JSON object (with --plan-only)
@@ -184,12 +200,15 @@ while [[ $# -gt 0 ]]; do
     --resume)               RESUME=1; shift ;;
     --allow-main)           ALLOW_MAIN=1; shift ;;
     --create-integration)   CREATE_INTEGRATION=1; shift ;;
+    --work-branch)          WORK_BRANCH="$2"; shift 2 ;;
+    --into)                 INTO="$2"; shift 2 ;;
+    --via)                  VIA="$2"; shift 2 ;;
     --retry)                RETRY_ISSUE="${2#\#}"; shift 2 ;;
     --plan-only)            PLAN_ONLY=1; shift ;;
     --json)                 JSON_OUT=1; shift ;;
     --status)               DO_STATUS=1; shift ;;
     --stop)                 DO_STOP=1; shift ;;
-    -h|--help)              sed -n '2,110p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)              awk 'NR > 1 && !/^#/ { exit } NR > 1' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -208,6 +227,15 @@ done
 [[ -z "$RETRY_ISSUE" || "$RESUME" -eq 1 ]] || die "--retry only makes sense with --resume"
 [[ "$CREATE_INTEGRATION" -eq 0 || "$RESUME" -eq 0 ]] || die "--create-integration starts a new run; it cannot be combined with --resume"
 [[ "$CREATE_INTEGRATION" -eq 0 || "$ALLOW_MAIN" -eq 0 ]] || die "--create-integration and --allow-main contradict each other (one delivers into a new integration branch, the other into main)"
+[[ -z "$VIA" || "$VIA" =~ ^(pr|ff|none)$ ]] || die "--via takes pr, ff or none"
+for _b in "$WORK_BRANCH" "$INTO"; do
+  [[ -z "$_b" ]] || git check-ref-format --branch "$_b" >/dev/null 2>&1 || die "'$_b' is not a valid branch name"
+done
+[[ -z "$WORK_BRANCH" || "$CREATE_INTEGRATION" -eq 0 ]] || die "--work-branch and --create-integration both name the work branch; pass one"
+[[ -z "$WORK_BRANCH" || "$RESUME" -eq 0 ]] || die "--work-branch starts a new run; --resume continues on the run's recorded branch"
+[[ -z "$WORK_BRANCH" || -z "$INTO" || "$WORK_BRANCH" != "$INTO" ]] || die "--work-branch and --into are the same branch ('$INTO')"
+[[ "$ALLOW_MAIN" -eq 0 || -z "$VIA" || "$VIA" == "none" ]] \
+  || die "--allow-main delivers straight into the default branch; there is nothing to integrate, so --via $VIA does not apply"
 [[ "$JSON_OUT" -eq 0 || "$PLAN_ONLY" -eq 1 ]] || die "--json goes with --plan-only"
 [[ "$(( PLAN_ONLY + DO_STATUS + DO_STOP ))" -le 1 ]] || die "--plan-only, --status and --stop are separate commands"
 [[ "$(( PLAN_ONLY + DO_STATUS + DO_STOP ))" -eq 0 || ( "$RESUME" -eq 0 && "$CREATE_INTEGRATION" -eq 0 ) ]] \
@@ -240,6 +268,36 @@ if [[ -n "$EXTRA_ALLOWED_TOOLS" ]]; then
   GRANT_PROBLEMS="$(forge_grant_violations "$EXTRA_ALLOWED_TOOLS")" \
     || die "--extra-allowed-tools refused (ADR-0007): $(printf '%s' "$GRANT_PROBLEMS" | tr '\n' ';')"
 fi
+
+# integration_check <base> <into> <via> <default> <base_tip> <wb_action>  —
+# prints "<ok|fail><TAB><detail>" for where and how the work branch goes at
+# the end of the run (ADR-0016). Read-only (ls-remote, no fetch); an empty
+# <base_tip>, or an <into> commit not fetched yet, skips the --via ff
+# ancestry check, which the run repeats after its own fetch.
+integration_check() {
+  local base="$1" into="$2" via="$3" def="$4" tip="$5" act="$6" into_oid
+  if [[ "$via" == "none" ]]; then
+    if [[ "$ALLOW_MAIN" -eq 1 ]]; then printf "ok\tnone: --allow-main delivers straight into '%s'\n" "$base"
+    else printf "ok\tnone: the run ends on '%s'; integrating it is up to you\n" "$base"; fi
+    return 0
+  fi
+  [[ -n "$into" ]] || { printf 'fail\tcannot read the default branch — pass --into <branch>\n'; return 0; }
+  [[ "$into" != "$base" ]] || { printf "fail\t'%s' is both the work branch and --into\n" "$into"; return 0; }
+  into_oid="$(git ls-remote origin "refs/heads/$into" 2>/dev/null | cut -f1)"
+  [[ -n "$into_oid" ]] || { printf "fail\t--into '%s' is not on origin\n" "$into"; return 0; }
+  if [[ "$via" == "pr" ]]; then
+    printf "ok\tpr: a final PR '%s' -> '%s', merged by a human\n" "$base" "$into"; return 0
+  fi
+  if [[ "$into" == "$def" ]]; then
+    printf "fail\t--via ff into the default branch '%s' is refused (ADR-0016) — use --via pr\n" "$into"; return 0
+  fi
+  if [[ "$act" != "create" && -n "$tip" ]] && git cat-file -e "$into_oid^{commit}" 2>/dev/null \
+     && ! git merge-base --is-ancestor "$into_oid" "$tip" 2>/dev/null; then
+    printf "fail\t'%s' has commits '%s' lacks, so it cannot be fast-forwarded — merge '%s' into '%s' first, or use --via pr\n" "$into" "$base" "$into" "$base"
+    return 0
+  fi
+  printf "ok\tff: the runner fast-forwards '%s' to '%s' and pushes it once every issue is merged\n" "$into" "$base"
+}
 
 # ---------------------------------------------------------------------------
 # --status / --stop (#65): talk to the newest run for --map. Read-only /
@@ -283,6 +341,8 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$PLAN_ONLY" -eq 1 ]]; then
   PF_NAMES=(); PF_STATUS=(); PF_DETAIL=(); PF_FAILED=0
+  PF_EFF_VIA="${VIA:-pr}"; [[ "$ALLOW_MAIN" -eq 1 ]] && PF_EFF_VIA=none
+  PF_WB_ACTION=current; PF_BASE_TIP=""; PF_DEFAULT=""; PF_INTO="$INTO"
   pf() { # <name> <ok|warn|fail> <detail>
     PF_NAMES+=("$1"); PF_STATUS+=("$2"); PF_DETAIL+=("$3")
     [[ "$2" == "fail" ]] && PF_FAILED=1
@@ -318,23 +378,48 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
     BASE=""
   else
     cd "$(git rev-parse --show-toplevel)" || die "cannot cd to repo root"
-    BASE="$(git branch --show-current 2>/dev/null || true)"
+    PF_CUR="$(git branch --show-current 2>/dev/null || true)"
+    BASE="${WORK_BRANCH:-$PF_CUR}"
+    # --work-branch other than the checkout: the run switches to it, or
+    # creates it off origin/<into> when it exists nowhere yet.
+    PF_WB_ACTION=current
+    if [[ -n "$WORK_BRANCH" && "$WORK_BRANCH" != "$PF_CUR" ]]; then
+      if git rev-parse --verify -q "refs/heads/$WORK_BRANCH" >/dev/null \
+         || [[ -n "$(git ls-remote origin "refs/heads/$WORK_BRANCH" 2>/dev/null)" ]]; then PF_WB_ACTION=switch
+      else PF_WB_ACTION=create; fi
+    fi
     case "$BASE" in
-      "")          pf base-branch fail "detached HEAD — check out the integration branch first" ;;
-      main|master) if [[ "$ALLOW_MAIN" -eq 1 ]]; then pf base-branch ok "delivering straight into '$BASE' (--allow-main; no final PR)"
-                   else pf base-branch fail "'$BASE' is the default branch — check out an integration branch, or pass --allow-main"; fi ;;
-      *)           pf base-branch ok "$BASE" ;;
+      "")          pf base-branch fail "detached HEAD — check out the work branch first, or pass --work-branch" ;;
+      main|master) if [[ "$ALLOW_MAIN" -eq 1 ]]; then pf base-branch ok "delivering straight into '$BASE' (--allow-main; nothing to integrate)"
+                   else pf base-branch fail "'$BASE' is the default branch — pass --work-branch <branch>, or --allow-main"; fi ;;
+      *)           case "$PF_WB_ACTION" in
+                     switch) pf base-branch ok "$BASE (the run switches to it)" ;;
+                     create) pf base-branch ok "$BASE (does not exist yet — the run creates it off origin/<into> and pushes it)" ;;
+                     *)      pf base-branch ok "$BASE" ;;
+                   esac ;;
     esac
     if [[ -z "$(git status --porcelain 2>/dev/null)" ]]; then pf clean-tree ok "working tree is clean"
     else pf clean-tree fail "working tree is dirty — commit or stash first"; fi
     if git check-ignore -q tmp/deliver/.probe 2>/dev/null; then pf tmp-ignored ok "tmp/ is gitignored"
     else pf tmp-ignored fail "tmp/ is not gitignored — run state would be committed into issue branches"; fi
-    if [[ -n "$BASE" ]]; then
+    PF_BASE_TIP=""
+    if [[ "$PF_WB_ACTION" == "create" ]]; then
+      pf base-synced ok "'$BASE' is created from origin at run start"
+    elif [[ -n "$BASE" ]]; then
       # ls-remote, not fetch: a fetch would move refs.
       PF_REMOTE_OID="$(git ls-remote origin "refs/heads/$BASE" 2>/dev/null | cut -f1)"
-      if [[ -z "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not on origin — push it first"
-      elif [[ "$(git rev-parse HEAD)" != "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not in sync with origin/$BASE — pull or push first"
-      else pf base-synced ok "HEAD is origin/$BASE"; fi
+      if [[ "$PF_WB_ACTION" == "switch" ]]; then
+        PF_BASE_TIP="$(git rev-parse --verify -q "refs/heads/$BASE" 2>/dev/null || true)"
+        if [[ -z "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not on origin — push it first"
+        elif [[ -z "$PF_BASE_TIP" ]]; then PF_BASE_TIP="$PF_REMOTE_OID"; pf base-synced ok "'$BASE' is checked out from origin/$BASE"
+        elif [[ "$PF_BASE_TIP" != "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not in sync with origin/$BASE — pull or push first"
+        else pf base-synced ok "'$BASE' is origin/$BASE"; fi
+      else
+        PF_BASE_TIP="$(git rev-parse HEAD 2>/dev/null || true)"
+        if [[ -z "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not on origin — push it first"
+        elif [[ "$PF_BASE_TIP" != "$PF_REMOTE_OID" ]]; then pf base-synced fail "'$BASE' is not in sync with origin/$BASE — pull or push first"
+        else pf base-synced ok "HEAD is origin/$BASE"; fi
+      fi
     fi
     [[ -n "$VERIFY_CMD" ]] || VERIFY_CMD="$(detect_verify_cmd || true)"
     if [[ -z "$VERIFY_CMD" ]]; then pf verify fail "no verify command found and --verify-cmd not given"
@@ -407,6 +492,10 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
       if [[ ${#PF_MISSING[@]} -eq 0 ]]; then pf labels ok "map, prd, ready-for-agent, needs-human, needs-triage all exist"
       else pf labels warn "missing: ${PF_MISSING[*]} — the run creates them at start"; fi
     else pf labels warn "could not list the repo's labels — the run creates missing ones at start"; fi
+    PF_DEFAULT="$(forge_default_branch 2>/dev/null)" || PF_DEFAULT=""
+    PF_INTO="${INTO:-$PF_DEFAULT}"
+    PF_DETAIL_I="$(integration_check "$BASE" "$PF_INTO" "$PF_EFF_VIA" "$PF_DEFAULT" "$PF_BASE_TIP" "$PF_WB_ACTION")"
+    pf integration "${PF_DETAIL_I%%$'\t'*}" "${PF_DETAIL_I#*$'\t'}"
     if [[ -n "$BASE" ]]; then
       if forge_branch_protected "$BASE"; then pf branch-protection warn "'$BASE' has branch protection — required reviews would park every merge"
       else pf branch-protection ok "'$BASE' has no protection rules"; fi
@@ -422,13 +511,18 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
   if [[ "$JSON_OUT" -eq 1 ]]; then
     jq -cn --argjson ok "$PF_OK" --argjson checks "$(pf_emit_checks)" --argjson issues "$PF_ISSUES" \
        --argjson skipped "$PF_SKIPPED" --argjson caps "$PF_CAPS" --argjson est "$PF_EST" --argjson map "$MAP" --arg base "${BASE:-}" \
-       '{ok:$ok, map:$map, base:$base, checks:$checks, issues:$issues, skipped:$skipped, caps:$caps, estimate_usd:$est}'
+       --arg wba "$PF_WB_ACTION" --arg into "${PF_INTO:-}" --arg via "$PF_EFF_VIA" --arg def "${PF_DEFAULT:-}" \
+       --argjson given "$(jq -cn --arg w "$WORK_BRANCH" --arg i "$INTO" --arg v "$VIA" '[if $w!="" then "work_branch" else empty end, if $i!="" then "into" else empty end, if $v!="" then "via" else empty end]')" \
+       '{ok:$ok, map:$map, base:$base, checks:$checks, issues:$issues, skipped:$skipped, caps:$caps, estimate_usd:$est,
+         integration:{work_branch:$base, work_branch_action:$wba, into:(if $into=="" then null else $into end), via:$via,
+                      default_branch:(if $def=="" then null else $def end), given:$given}}'
   else
     echo "Pre-flight for map #$MAP:"
     for (( i=0; i<${#PF_NAMES[@]}; i++ )); do
       printf '  %-4s %-18s %s\n' "$(case "${PF_STATUS[$i]}" in ok) echo ok;; warn) echo WARN;; *) echo FAIL;; esac)" "${PF_NAMES[$i]}" "${PF_DETAIL[$i]}"
     done
-    echo "Run plan (base: ${BASE:-?}):"
+    echo "Run plan (work branch: ${BASE:-?}):"
+    echo "Integration: $PF_EFF_VIA$([[ "$PF_EFF_VIA" == none ]] || echo "${PF_INTO:+ into $PF_INTO}")$([[ "$PF_WB_ACTION" == current ]] || echo " (work branch: $PF_WB_ACTION)")"
     jq -r '.[] | "  \(.id) \(.title)" + (if (.after|length)>0 then " (after: \(.after|join(" ")))" else "" end)' <<<"$PF_ISSUES"
     if [[ "$PF_SKIPPED" != "[]" ]]; then
       echo "Skipped (already ticked):"
@@ -481,6 +575,13 @@ if [[ "$RESUME" -eq 1 ]]; then
   fi
   RESUME_BASE="$(jq -r '.base' "$RESUME_STATE_JSON")"
   [[ "$(jq -r '.allow_main // false' "$RESUME_STATE_JSON")" == "true" ]] && ALLOW_MAIN=1
+  [[ "$ALLOW_MAIN" -eq 0 || -z "$VIA" || "$VIA" == "none" ]] \
+    || die "--resume: run $RESUME_RUN_ID delivers straight into the default branch (--allow-main); --via $VIA does not apply"
+  # Where the run integrates (ADR-0016): an --into / --via given now
+  # replaces the recorded one; a run from before 0.8.6 recorded none, so the
+  # defaults below give it the PR into the default branch it always had.
+  [[ -n "$INTO" ]] || INTO="$(jq -r '.integration.into // empty' "$RESUME_STATE_JSON")"
+  [[ -n "$VIA" ]] || VIA="$(jq -r '.integration.via // empty' "$RESUME_STATE_JSON")"
   RESUME_CUR_BRANCH="$(git branch --show-current 2>/dev/null || true)"
   if [[ "$RESUME_CUR_BRANCH" != "$RESUME_BASE" ]]; then
     [[ -z "$(git status --porcelain 2>/dev/null)" ]] \
@@ -490,30 +591,62 @@ if [[ "$RESUME" -eq 1 ]]; then
   fi
 fi
 
-# --create-integration (#62): cut and push the integration branch, then carry
-# on as if the user had checked it out. Skipped in the private-copy re-exec,
-# which starts on the branch this created.
-if [[ "$CREATE_INTEGRATION" -eq 1 && "${DELIVER_SNAPSHOT:-0}" != "1" ]]; then
+# --create-integration (#62) / --work-branch (ADR-0016): get onto the work
+# branch, then carry on as if the user had checked it out. --create-integration
+# cuts integration/<map-slug>, which must not exist yet; --work-branch switches
+# to the named branch, or cuts it when it exists neither locally nor on origin.
+# A new branch is cut off origin/<into> (the default branch unless --into).
+# Skipped in the private-copy re-exec, which starts on the branch this chose.
+if [[ "${DELIVER_SNAPSHOT:-0}" != "1" ]] && [[ "$CREATE_INTEGRATION" -eq 1 \
+     || ( -n "$WORK_BRANCH" && "$WORK_BRANCH" != "$(git branch --show-current 2>/dev/null)" ) ]]; then
+  WB_FLAG="--work-branch"; [[ "$CREATE_INTEGRATION" -eq 1 ]] && WB_FLAG="--create-integration"
   [[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "working tree is dirty. Commit or stash first."
   MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
-  CI_MAP_JSON="$(forge_issue_json "$MAP")" || die "--create-integration: cannot read map #$MAP"
-  CI_SLUG="$(map_integration_slug "$(jq -r '.title // ""' <<<"$CI_MAP_JSON")")"
-  [[ -n "$CI_SLUG" ]] || die "--create-integration: cannot derive a branch name from map #$MAP's title"
-  CI_BRANCH="integration/$CI_SLUG"
-  CI_DEFAULT="$(forge_default_branch)" || die "--create-integration: cannot read the default branch"
+  if [[ "$CREATE_INTEGRATION" -eq 1 ]]; then
+    CI_MAP_JSON="$(forge_issue_json "$MAP")" || die "--create-integration: cannot read map #$MAP"
+    CI_SLUG="$(map_integration_slug "$(jq -r '.title // ""' <<<"$CI_MAP_JSON")")"
+    [[ -n "$CI_SLUG" ]] || die "--create-integration: cannot derive a branch name from map #$MAP's title"
+    CI_BRANCH="integration/$CI_SLUG"
+  else
+    CI_BRANCH="$WORK_BRANCH"
+  fi
   git fetch -q origin || die "git fetch origin failed"
-  git rev-parse --verify -q "refs/heads/$CI_BRANCH" >/dev/null && die "--create-integration: '$CI_BRANCH' already exists locally"
-  git rev-parse --verify -q "refs/remotes/origin/$CI_BRANCH" >/dev/null && die "--create-integration: '$CI_BRANCH' already exists on origin"
-  git rev-parse --verify -q "origin/$CI_DEFAULT" >/dev/null || die "--create-integration: 'origin/$CI_DEFAULT' not found"
-  forge_create_integration "$CI_BRANCH" "$CI_DEFAULT" || die "--create-integration: could not create and push '$CI_BRANCH'"
-  log "created and pushed $CI_BRANCH from origin/$CI_DEFAULT"
+  CI_EXISTS=0
+  git rev-parse --verify -q "refs/heads/$CI_BRANCH" >/dev/null && CI_EXISTS=1
+  if [[ "$CREATE_INTEGRATION" -eq 1 && "$CI_EXISTS" -eq 1 ]]; then die "--create-integration: '$CI_BRANCH' already exists locally"; fi
+  git rev-parse --verify -q "refs/remotes/origin/$CI_BRANCH" >/dev/null && CI_EXISTS=1
+  if [[ "$CREATE_INTEGRATION" -eq 1 && "$CI_EXISTS" -eq 1 ]]; then die "--create-integration: '$CI_BRANCH' already exists on origin"; fi
+  # Refuse what the run would refuse anyway before the branch is switched to
+  # or pushed (ADR-0016): a refusal must leave no branch and no moved checkout.
+  case "$CI_BRANCH" in
+    main|master) [[ "$ALLOW_MAIN" -eq 1 ]] \
+                   || die "refusing to merge into '$CI_BRANCH'. Pass another --work-branch, or --allow-main to deliver straight into it (ADR-0013)." ;;
+  esac
+  CI_DEFAULT="$(forge_default_branch)" || die "$WB_FLAG: cannot read the default branch"
+  CI_FROM="${INTO:-$CI_DEFAULT}"
+  CI_VIA="${VIA:-pr}"; [[ "$ALLOW_MAIN" -eq 1 ]] && CI_VIA=none
+  CI_TIP=""
+  if [[ "$CI_EXISTS" -eq 1 ]]; then
+    CI_TIP="$(git rev-parse --verify -q "refs/heads/$CI_BRANCH" || git rev-parse --verify -q "refs/remotes/origin/$CI_BRANCH")"
+  fi
+  CI_CHECK="$(integration_check "$CI_BRANCH" "$CI_FROM" "$CI_VIA" "$CI_DEFAULT" "$CI_TIP" \
+    "$([[ "$CI_EXISTS" -eq 1 ]] && echo switch || echo create)")"
+  [[ "${CI_CHECK%%$'\t'*}" == "ok" ]] || die "integration refused: ${CI_CHECK#*$'\t'}"
+  if [[ "$CI_EXISTS" -eq 1 ]]; then
+    git switch -q "$CI_BRANCH" || die "--work-branch: cannot switch to '$CI_BRANCH'"
+    log "switched to work branch $CI_BRANCH"
+  else
+    git rev-parse --verify -q "origin/$CI_FROM" >/dev/null || die "$WB_FLAG: 'origin/$CI_FROM' not found"
+    forge_create_integration "$CI_BRANCH" "$CI_FROM" || die "$WB_FLAG: could not create and push '$CI_BRANCH'"
+    log "created and pushed $CI_BRANCH from origin/$CI_FROM"
+  fi
 fi
 
 BASE="$(git branch --show-current 2>/dev/null || true)"
 case "$BASE" in
   "")          die "detached HEAD — check out the integration branch first." ;;
   main|master) [[ "$ALLOW_MAIN" -eq 1 ]] \
-                 || die "refusing to merge into '$BASE'. Check out an integration branch (ADR-0007), or pass --allow-main to deliver straight into it (ADR-0013)." ;;
+                 || die "refusing to merge into '$BASE'. Pass --work-branch <branch> or check out an integration branch (ADR-0007), or pass --allow-main to deliver straight into it (ADR-0013)." ;;
 esac
 [[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "working tree is dirty. Commit or stash first."
 git check-ignore -q tmp/deliver/.probe 2>/dev/null \
@@ -531,6 +664,18 @@ git rev-parse --verify -q "origin/$BASE" >/dev/null || die "'$BASE' is not on or
 # gh present and authenticated: read-only, and before the runner copy below,
 # so a machine without a usable gh leaves nothing behind.
 MSG_ERR="$(forge_preflight)" || die "$MSG_ERR"
+
+# Where the work branch goes at the end, and how (ADR-0016). A refusal here
+# costs nothing yet: no run dir, no label, no model call. The --via ff
+# ancestry check is skipped on --resume — the work branch already carries
+# this run's merges, and a moved --into is reported at the end instead.
+DEFAULT_BRANCH="$(forge_default_branch)" || die "cannot read the repo's default branch"
+[[ -n "$INTO" ]] || INTO="$DEFAULT_BRANCH"
+[[ -n "$VIA" ]] || VIA=pr
+[[ "$ALLOW_MAIN" -eq 1 ]] && VIA=none
+INTEGRATION_CHECK="$(integration_check "$BASE" "$INTO" "$VIA" "$DEFAULT_BRANCH" \
+  "$([[ "$RESUME" -eq 1 ]] || git rev-parse HEAD)" current)"
+[[ "${INTEGRATION_CHECK%%$'\t'*}" == "ok" ]] || die "integration refused: ${INTEGRATION_CHECK#*$'\t'}"
 
 # ---------------------------------------------------------------------------
 # Private runner copy. BUILD edits files in this repo; when the repo is the
@@ -596,6 +741,8 @@ else
   state_init "$RUN_DIR" "$MAP" "$BASE" "$RUN_ID" "$RUNNER_VERSION"
   [[ "$ALLOW_MAIN" -eq 1 ]] && state_set_allow_main "$RUN_DIR"
 fi
+state_set_integration "$RUN_DIR" "$INTO" "$VIA"
+log "integration: ${INTEGRATION_CHECK#*$'\t'}"
 
 # active_seconds_now — this run's persisted active time plus this process's
 # own elapsed time; the figure both the time cap and status.json report.
@@ -1747,20 +1894,18 @@ park_issue() {
   run_status running
 }
 
-# final_pr — the integration → default PR (#62): created, or its body rewritten
-# when an open one for this head already exists (a --resume, a second run).
-# Closes every issue delivered so far (this run's merges plus Delivery lines
-# already ticked on the Map) and the Map itself only once every line is
-# ticked; parked, skipped, closed-externally and follow-up issues are listed,
-# never closed. Needs PLAN_* loaded from the fresh Map (finish does that).
-# Nothing to close, or $BASE being the default branch: no PR. A forge failure
-# here is logged, not fatal — the issues are already merged.
+# final_pr — the work branch → --into PR (#62, --via pr): created, or its
+# body rewritten when an open one for this head already exists (a --resume, a
+# second run). Closes every issue delivered so far (this run's merges plus
+# Delivery lines already ticked on the Map) and the Map itself only once every
+# line is ticked; parked, skipped, closed-externally and follow-up issues are
+# listed, never closed. Needs PLAN_* loaded from the fresh Map (finish does
+# that). Nothing to close, or $BASE being $INTO: no PR. A forge failure here
+# is logged, not fatal — the issues are already merged.
 final_pr() {
-  local i id title default pr verb body="$RUN_DIR/final-pr-body.md" f fn ft ticked_n=0
+  local i id title target="$INTO" pr verb body="$RUN_DIR/final-pr-body.md" f fn ft ticked_n=0
   local -a closes=() parked_l=() skipped_l=() closed_l=()
-  default="$(forge_default_branch 2>/dev/null)" || default=""
-  if [[ -z "$default" ]]; then log "final PR: cannot read the default branch — not opened."; return 0; fi
-  if [[ "$BASE" == "$default" ]]; then log "final PR: '$BASE' is the default branch — none to open."; return 0; fi
+  if [[ "$BASE" == "$target" ]]; then log "final PR: '$BASE' is the --into branch — none to open."; return 0; fi
   for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
     id="${PLAN_IDS[$i]}"
     title="$(map_line_title "${PLAN_ROW_RAW[$i]}")"
@@ -1773,11 +1918,15 @@ final_pr() {
   done
   if [[ "$ticked_n" -eq 0 ]]; then log "final PR: nothing delivered — none opened."; return 0; fi
   {
-    echo "Delivers map #$MAP: \`$BASE\` → \`$default\`, built by \`/deliver\` run \`$RUN_ID\`."
+    echo "Delivers map #$MAP: \`$BASE\` → \`$target\`, built by \`/deliver\` run \`$RUN_ID\`."
     echo
     for id in "${closes[@]}"; do echo "Closes $id"; done
     [[ "$ticked_n" -eq "${#PLAN_IDS[@]}" ]] && echo "Closes #$MAP"
     echo
+    if [[ "$target" != "$DEFAULT_BRANCH" ]]; then
+      echo "GitHub acts on these \`Closes\` lines only once the work reaches \`$DEFAULT_BRANCH\`."
+      echo
+    fi
     echo "**Merge this PR with a merge commit, not a squash** — each delivered issue is already one commit on \`$BASE\`, and a squash would fold them into one."
     if [[ ${#parked_l[@]} -gt 0 ]]; then
       echo; echo "## Parked (needs a human)"
@@ -1798,23 +1947,73 @@ final_pr() {
       done
     fi
   } > "$body"
-  title="deliver: map #$MAP into $default"
+  title="deliver: map #$MAP into $target"
   if pr="$(forge_pr_for_branch "$BASE")" && [[ "$(forge_pr_state "$pr")" == "OPEN" ]]; then
     forge_pr_set_body "$pr" "$body" || { log "final PR: could not update PR #$pr (continuing)"; return 0; }
     verb=updated
   else
-    pr="$(forge_pr_create "$default" "$BASE" "$title" "$body")" \
-      || { log "final PR: could not open $BASE → $default (continuing)"; return 0; }
+    pr="$(forge_pr_create "$target" "$BASE" "$title" "$body")" \
+      || { log "final PR: could not open $BASE → $target (continuing)"; return 0; }
     verb=created
   fi
-  state_set_final_pr "$RUN_DIR" "$pr" "$default" "$BASE"
-  state_event "$RUN_DIR" "" final-pr "$verb #$pr ($BASE -> $default)"
-  log "final PR #$pr $verb: $BASE → $default — merge it with a merge commit."
+  state_set_final_pr "$RUN_DIR" "$pr" "$target" "$BASE"
+  state_event "$RUN_DIR" "" final-pr "$verb #$pr ($BASE -> $target)"
+  log "final PR #$pr $verb: $BASE → $target — merge it with a merge commit."
+}
+
+# integrate_ff <complete>  — --via ff (ADR-0016): once every Delivery line is
+# merged (<complete> 1), move origin/$INTO to origin/$BASE, a fast-forward
+# only, pushed unforced. A partial run, an $INTO that has commits $BASE
+# lacks, or a refused push leaves $INTO where it was — logged, not fatal.
+integrate_ff() {
+  local tip into_tip
+  if [[ "$1" -ne 1 ]]; then
+    log "integration: the run is partial — '$INTO' was not fast-forwarded. Once the rest has landed: git push origin $BASE:$INTO"
+    state_event "$RUN_DIR" "" integration-skipped "partial run: $INTO not fast-forwarded to $BASE"
+    return 0
+  fi
+  if ! git fetch -q origin || ! tip="$(git rev-parse --verify -q "origin/$BASE")" \
+     || ! into_tip="$(git rev-parse --verify -q "origin/$INTO")"; then
+    log "integration: cannot read origin/$BASE or origin/$INTO — '$INTO' not fast-forwarded."
+    state_event "$RUN_DIR" "" integration-failed "cannot read origin/$BASE or origin/$INTO"
+    return 0
+  fi
+  if [[ "$tip" == "$into_tip" ]]; then
+    log "integration: '$INTO' is already at '$BASE' (${tip:0:12})."
+    state_set_integrated "$RUN_DIR" "$tip"
+    state_event "$RUN_DIR" "" integrated "$INTO already at $BASE (${tip:0:12})"
+    return 0
+  fi
+  if ! git merge-base --is-ancestor "$into_tip" "$tip"; then
+    log "integration: '$INTO' has commits '$BASE' lacks — not fast-forwarded. Merge '$INTO' into '$BASE', then: git push origin $BASE:$INTO"
+    state_event "$RUN_DIR" "" integration-failed "$INTO has commits $BASE lacks (not a fast-forward)"
+    return 0
+  fi
+  if ! forge_ff_push "$tip" "$INTO"; then
+    log "integration: the push of '$BASE' to '$INTO' was refused — '$INTO' not fast-forwarded."
+    state_event "$RUN_DIR" "" integration-failed "push $BASE -> $INTO refused"
+    return 0
+  fi
+  state_set_integrated "$RUN_DIR" "$tip"
+  state_event "$RUN_DIR" "" integrated "$INTO fast-forwarded to $BASE (${tip:0:12})"
+  log "integration: '$INTO' fast-forwarded to '$BASE' (${tip:0:12}) and pushed."
+}
+
+# integrate <complete>  — hand the work branch over the way --via says
+# (ADR-0016): pr opens or updates the final PR (a partial run too), ff
+# fast-forwards $INTO only when <complete> is 1, none leaves $BASE as it is.
+integrate() {
+  case "$VIA" in
+    pr)   final_pr ;;
+    ff)   integrate_ff "$1" ;;
+    none) log "integration: none — '$BASE' is left for you to integrate."
+          state_event "$RUN_DIR" "" integration "none: $BASE left as it is" ;;
+  esac
 }
 
 # finish — report what this run did and exit 0 (everything merged) or 2.
 finish() {
-  local i skipped=()
+  local i skipped=() complete=0
   plan_load "$MAP_PLAN"
   for (( i=0; i<${#PLAN_IDS[@]}; i++ )); do
     [[ "${PLAN_ROW_TICKED[$i]}" == "1" ]] && continue
@@ -1822,11 +2021,12 @@ finish() {
     [[ " ${CLOSED[*]:-} " == *" ${PLAN_IDS[$i]} "* ]] && continue
     skipped+=("${PLAN_IDS[$i]}")
   done
-  final_pr
+  [[ ${#PARKED[@]} -eq 0 && ${#CLOSED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]] && complete=1
+  integrate "$complete"
   log "map #$MAP: ${#MERGED[@]} merged this run${PARKED[*]:+, parked: ${PARKED[*]}}${CLOSED[*]:+, closed-externally: ${CLOSED[*]}}${skipped[*]:+, skipped (blocked by a parked issue): ${skipped[*]}}."
   CUR_ISSUE=""
   state_set_active_seconds "$RUN_DIR" "$(active_seconds_now)"
-  if [[ ${#PARKED[@]} -eq 0 && ${#CLOSED[@]} -eq 0 && ${#skipped[@]} -eq 0 ]]; then
+  if [[ "$complete" -eq 1 ]]; then
     run_status done
     exit 0
   fi

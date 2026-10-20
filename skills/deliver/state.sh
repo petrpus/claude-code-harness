@@ -7,6 +7,7 @@
 # (#61 S3) reads state.json as ground truth and must never see a torn file.
 #
 #   state.json    resume truth: map, base, runner_version, active_seconds,
+#                 integration {into, via[, pushed]} (ADR-0016),
 #                 and one entry per issue touched this run: {state, branch,
 #                 pr, round, head, issue_budget_usd, issue_max_minutes}.
 #   events.jsonl  one row per issue-state transition (append-only).
@@ -45,6 +46,19 @@ state_set_final_pr() {
   jq --argjson pr "$2" --arg base "$3" --arg head "$4" \
      '.final_pr = {number:$pr, base:$base, head:$head}' "$1/state.json" \
      > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
+}
+
+# state_set_integration <run_dir> <into> <via>  — where the work branch goes
+# at the end of the run and how (ADR-0016); --resume reads it back.
+state_set_integration() {
+  jq --arg into "$2" --arg via "$3" '.integration = ((.integration // {}) + {into:$into, via:$via})' "$1/state.json" \
+    > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
+}
+
+# state_set_integrated <run_dir> <sha>  — --via ff moved .integration.into to <sha>.
+state_set_integrated() {
+  jq --arg sha "$2" '.integration.pushed = $sha' "$1/state.json" \
+    > "$1/state.json.tmp" && mv "$1/state.json.tmp" "$1/state.json"
 }
 
 # state_set_allow_main <run_dir>  — the run started with --allow-main
