@@ -2,18 +2,21 @@
 name: deliver
 description: >-
   Deliver a Map issue: each issue in its Delivery section becomes its own PR
-  into the integration branch — built by autopilot, verified, reviewed,
-  squash-merged and ticked, in blocking-edge order. User-invoked only.
+  into the work branch — built by autopilot, verified, reviewed,
+  squash-merged and ticked, in blocking-edge order — then the work branch is
+  integrated by a PR, a fast-forward or not at all. User-invoked only.
+argument-hint: "#<map> [--work-branch <branch>] [--into <branch>] [--via pr|ff|none] [--yes]"
 disable-model-invocation: true
 ---
 
 # deliver — a Map of issues to merged PRs
 
 `/deliver` walks a **Map** (a `map`-labelled issue, `docs/adr/0008-*.md`) and,
-per issue, in blocking-edge order: branch off the integration branch → run
+per issue, in blocking-edge order: branch off the **work branch** → run
 autopilot's `loop.sh` with the issue as charter → verify the exact head →
-push → PR into the integration branch → independent review → squash merge →
-tick the Map line.
+push → PR into the work branch → independent review → squash merge →
+tick the Map line. At the end the work branch is **integrated** into the
+`--into` branch the way `--via` says (`docs/adr/0016-*.md`).
 The runner holds every forge operation; no model phase ever gets `gh` or
 `git push` (`docs/adr/0007-*.md`). Design: `docs/prd/0003-deliver.md`.
 
@@ -22,8 +25,16 @@ skill:
 
 - Only a person starts a run (`/code-harness:deliver #<map>`, ADR-0015). You
   plan, show the plan, ask once, launch detached and monitor. Never run the
-  runner's phases by hand, never merge a PR, never push to the integration
-  branch yourself — the runner holds every forge operation (ADR-0007).
+  runner's phases by hand, never merge a PR, never push to the work or
+  `--into` branch yourself — the runner holds every forge operation (ADR-0007).
+- **No run without an approved procedure.** The procedure is three values:
+  work branch, `--into` branch, `--via pr|ff|none`. Any the user did not pass
+  you propose, and the user approves or corrects explicitly; only then do
+  you launch, with all three passed to the runner. Never fall back silently
+  to a final PR into the default branch.
+- **No Map, no run — and no `/to-prd` on your own.** Without a Map number
+  you do not start `/start-feature`, `/grill-with-docs`, `/to-prd` or
+  `/to-issues`: you propose that path and wait for an explicit yes.
 - Run state lives in `tmp/deliver/<run-id>/`: `status.json` (headline),
   `events.jsonl` (milestones), `lock` (runner pid), `state.json` (resume truth).
 - Stop: `deliver.sh --map <N> --stop` (a `STOP` file, honoured at the next phase
@@ -31,32 +42,53 @@ skill:
   `--resume [--retry '#N']`.
 - Exit codes: 0 all merged · 1 precondition/runner failure · 2 partial ·
   3 `--max-minutes` · 4 `--budget-usd` · 6 stopped; 3, 4 and 6 are resumable.
-- The final integration → default-branch PR is merged by a human, with a merge
-  commit.
+- A final PR (`--via pr`) is merged by a human, with a merge commit. A
+  fast-forward (`--via ff`) never targets the default branch.
 
-## The final PR
+## Integration at the end (`--into`, `--via`)
 
-When a run ends (done or partial) the runner opens the PR from the
-integration branch into the repo's default branch — or, if an open one
-already exists for that branch (a `--resume`, a second run), rewrites its
-body. The body has one `Closes #N` per delivered issue (this run's merges plus
-Delivery lines already ticked), `Closes #<map>` only when every Delivery line
-is ticked, separate lists of parked, skipped (blocked by a parked issue),
-closed-externally and follow-up issues, and a request to **merge with a merge
-commit, not a squash**, so the per-issue commits survive. The human merges it.
-No final PR when nothing was delivered or the base is itself the default
-branch. It is recorded as `final_pr` in `state.json`, in `events.jsonl` and in
-the log; the body is kept at `tmp/deliver/<run-id>/final-pr-body.md`.
+The runner hands the work branch over once the graph walk ends (ADR-0016).
+`--into` defaults to the repo's default branch, `--via` to `pr`; both are
+recorded in `state.json` (`integration`), so `--resume` keeps them unless
+you pass new ones.
+
+- **`--via pr`** — when the run ends (done or partial) the runner opens the
+  PR from the work branch into `--into`, or, if an open one already exists
+  for that branch (a `--resume`, a second run), rewrites its body. The body
+  has one `Closes #N` per delivered issue (this run's merges plus Delivery
+  lines already ticked), `Closes #<map>` only when every Delivery line is
+  ticked, separate lists of parked, skipped (blocked by a parked issue),
+  closed-externally and follow-up issues, and a request to **merge with a
+  merge commit, not a squash**, so the per-issue commits survive. Into a
+  branch other than the default one it adds that GitHub acts on `Closes`
+  only once the work reaches the default branch. The human merges it. No
+  final PR when nothing was delivered. Recorded as `final_pr` in
+  `state.json`, in `events.jsonl` (`final-pr`) and in the log; the body is
+  kept at `tmp/deliver/<run-id>/final-pr-body.md`.
+- **`--via ff`** — only when **every** Delivery line merged: the runner
+  fetches and moves `origin/<into>` to the work branch's tip with an
+  unforced push, if that is a fast-forward (`integrated`, and
+  `integration.pushed` in `state.json`). A partial run leaves `--into` alone
+  and logs the push to run once the rest lands (`integration-skipped`); an
+  `--into` that gained commits the work branch lacks, or a refused push, is
+  logged too (`integration-failed`). Neither is fatal — the issues are
+  merged. Refused before the run starts: `--into` being the default branch
+  (that goes through a PR), and an `--into` that already has commits the
+  work branch lacks.
+- **`--via none`** — nothing; the work branch is left for you (`integration`).
+
+`--allow-main` delivers straight into the default branch, so it implies
+`--via none` and refuses `pr` / `ff`.
 
 ## When an issue does not make it
 
 An issue that cannot reach its merge is **parked** and the run carries on:
 autopilot did not finish (stuck, or an iteration / time / budget cap), it
 finished without a commit, verify failed on its head, the review held its PR
-(changes requested, or no usable verdict twice), the integration branch moved
+(changes requested, or no usable verdict twice), the work branch moved
 into a conflict, CI failed or stayed pending past `--ci-timeout`, or the forge
 refused the merge twice. Before merging, **final-verify** re-fetches and, if
-the integration branch moved, merges it into the issue branch (a conflict
+the work branch moved, merges it into the issue branch (a conflict
 parks the issue; a clean merge is re-verified and pushed); a merge the forge
 refuses goes back through final-verify once — a repo whose branch protection
 forbids squash merges gets a plain `--merge` instead, tried automatically,
@@ -78,21 +110,55 @@ issue's fault: it ends the run with exit 1, where it is.
 
 ## `/deliver #<map>` — the one command
 
-Pre-flight, one confirmation, a detached run, milestone reports. `<plugin>`
-is the installed plugin dir; `<N>` the Map number.
+```
+/code-harness:deliver #<map> [--work-branch <branch>] [--into <branch>] [--via pr|ff|none] [--yes] [runner flags…]
+```
 
+Pre-flight, an approved procedure, a detached run, milestone reports.
+`<plugin>` is the installed plugin dir; `<N>` the Map number.
+
+0. **No Map number?** Stop there. Say that `/deliver` needs a Map and
+   propose how to get one — `/start-feature` (grill → `/to-prd` →
+   `/to-issues`), or `/to-issues` from an existing PRD — then end the turn.
+   Start none of them until the user explicitly says so; a feature
+   description passed to `/deliver` is not that permission.
 1. **Plan.** Run `<plugin>/skills/deliver/deliver.sh --map <N> --plan-only --json`
-   (read-only: no run dir, no branch switch, no label or issue edits; pass
-   through any runner flag, e.g. `--allow-main`). It returns one JSON
-   object: `checks[]` (name/status/detail), `issues[]` (run order),
-   `skipped[]` (already ticked), `caps`, `estimate_usd`, `ok`.
-2. **Show it.** Print the ordered issues, the skipped ones, the caps, the
-   cost estimate and every check that is not `pass`. A hard failure (`ok` is
-   false, exit non-zero) is reported and the run is not launched. Warnings
-   (no `tmux`, branch protection) are shown but do not block.
-3. **Confirm once.** Ask a single yes/no to launch. `--yes` skips the
-   question (the plan is still shown). No other prompts follow.
-4. **Launch detached**, from the project root, without `--plan-only`/`--json`:
+   with whatever the user passed (`--work-branch`, `--into`, `--via`, and
+   any runner flag, e.g. `--allow-main`). Read-only: no run dir, no branch
+   switch or creation, no label or issue edits. It returns one JSON object:
+   `checks[]` (name/status/detail), `issues[]` (run order), `skipped[]`
+   (already ticked), `caps`, `estimate_usd`, `ok`, and `integration`
+   (`work_branch`, `work_branch_action` current/switch/create, `into`,
+   `via`, `default_branch`, `given[]` — which of the three the user passed).
+2. **Settle the procedure.** If `given` lacks any of `work_branch`, `into`,
+   `via`, propose a value for each missing one:
+   - the project's own convention first — its `CLAUDE.md` or docs naming an
+     integration branch or how it integrates;
+   - else, for `--into`, a branch on origin such as `test`, `staging` or
+     `develop` (`git ls-remote --heads origin`) as an option beside the
+     default branch, and say which you recommend;
+   - for the work branch, the current branch unless it is the default one,
+     else `integration/<map-slug>` (created off `--into`);
+   - `--via ff` is never proposed with `--into` the default branch.
+
+   Show the procedure as three lines (work branch and whether it is
+   switched to or created, `--into`, `--via` and what it does at the end)
+   and ask the user to approve or correct it. Only an explicit approval
+   counts; a correction means re-running step 1 with the corrected flags and
+   asking again. Do not launch, and do not treat silence or an unrelated
+   reply as approval.
+3. **Show the plan.** Print the procedure, the ordered issues, the skipped
+   ones, the caps, the cost estimate and every check that is not `ok`. A
+   hard failure (`ok` is false, exit non-zero) is reported and the run is
+   not launched. Warnings (no `tmux`, branch protection) are shown but do
+   not block.
+4. **Confirm once.** Ask a single yes/no to launch — when step 2 asked, its
+   approval of the procedure and this yes are one question. `--yes` skips
+   it only when the user passed all three of `--work-branch`, `--into`,
+   `--via` (the plan is still shown); otherwise step 2 still asks. No other
+   prompts follow.
+5. **Launch detached**, from the project root, without `--plan-only`/`--json`,
+   always with the approved `--work-branch`, `--into` and `--via`:
 
    ```bash
    tmux new-session -d -s deliver-<N> '<plugin>/skills/deliver/deliver.sh --map <N> [flags]'
@@ -103,15 +169,16 @@ is the installed plugin dir; `<N>` the Map number.
    `tmux has-session -t deliver-<N>` tells whether a run is alive; tmux
    refuses a second session of the same name. The runner bootstraps the five
    workflow labels itself before the graph walk.
-5. **Monitor.** Find the run dir (`tmp/deliver/<run-id>/`, the newest for this
+6. **Monitor.** Find the run dir (`tmp/deliver/<run-id>/`, the newest for this
    map) and arm Monitor on `tmp/deliver/<run-id>/events.jsonl`
    (`tail -F … | jq -c --unbuffered`). Report each milestone as it arrives —
-   `pr-open`, `merged`, `parked`, `closed-external`, `final-pr`, `stopped`,
-   `budget_exhausted`, `time_exhausted` — one line each. Monitor ends when its
+   `pr-open`, `merged`, `parked`, `closed-external`, `final-pr`,
+   `integrated`, `integration-skipped`, `integration-failed`, `integration`,
+   `stopped`, `budget_exhausted`, `time_exhausted` — one line each. Monitor ends when its
    command ends or times out: **re-arm it** until a terminal state, i.e.
    `status.json` reads `done`, `partial`, `stopped`, `budget_exhausted` or
    `time_exhausted`.
-6. **`runner-dead`.** On every re-arm, and whenever events stop, check the
+7. **`runner-dead`.** On every re-arm, and whenever events stop, check the
    run's `lock` file: if its PID is no longer alive (`kill -0 "$(cat lock)"`)
    or the lock is gone while `status.json` still reads `running`, report
    `runner-dead` (the run died without a terminal state), point at
@@ -125,19 +192,26 @@ Monitor as above.
 
 ## How to run (terminal)
 
-1. Be on a clean **integration branch** (`main`/`master` is refused unless you
-   pass `--allow-main` — per-issue PRs then merge straight into it and no final
-   PR is opened, ADR-0013; the flag is kept in `state.json` for `--resume`), in
-   sync with `origin`, with `tmp/` gitignored. No integration branch yet? Run
-   from a clean checkout with `--create-integration`: the runner derives
-   `integration/<map-slug>` from the Map's title, does `git switch -c` off
-   `origin/<default>` and `git push -u`, then delivers into it (the final PR
-   targets the default branch). It refuses if that branch already exists
-   locally or on origin, and cannot be combined with `--resume` or `--allow-main`.
+1. Be on a clean **work branch** — the branch per-issue PRs merge into — or
+   name it with `--work-branch <branch>`: the runner switches to it, or,
+   when it exists neither locally nor on origin, cuts it off
+   `origin/<into>` and pushes it with `-u`. `main`/`master` is refused unless
+   you pass `--allow-main` — per-issue PRs then merge straight into it and
+   nothing is integrated, ADR-0013; the flag is kept in `state.json` for
+   `--resume`. In sync with `origin`, with `tmp/` gitignored.
+   `--create-integration` is the older spelling of a new work branch: the
+   runner derives `integration/<map-slug>` from the Map's title and cuts it
+   the same way; it refuses if that branch already exists locally or on
+   origin, and cannot be combined with `--work-branch`, `--resume` or
+   `--allow-main`. `--work-branch` cannot be combined with `--resume` either
+   (a resume continues on the run's recorded branch).
+   `--into <branch>` / `--via pr|ff|none` choose the integration at the end
+   (above; defaults: the default branch, `pr`).
 2. Run the runner from the **installed plugin copy**:
 
    ```bash
-   <plugin>/skills/deliver/deliver.sh --map <N> [--allow-main | --create-integration] [--verify-cmd '<cmd>'] \
+   <plugin>/skills/deliver/deliver.sh --map <N> [--work-branch <b> | --create-integration | --allow-main] \
+     [--into <b>] [--via pr|ff|none] [--verify-cmd '<cmd>'] \
      [--issue-max-iterations 10] [--issue-max-minutes 120] [--issue-budget-usd 10] \
      [--review-model sonnet] [--extra-allowed-tools '<csv>'] [--per-call-timeout <s>] \
      [--plan-max-items 3] [--verify-every-iteration] [--iteration-verify-cmd '<cmd>'] \
@@ -365,16 +439,19 @@ edits the script running it.
 
 ## What you get
 
-- One squash commit per issue on the integration branch, subject = the Map
+- One squash commit per issue on the work branch, subject = the Map
   line's conventional title — a long one keeps its type and scope, its
   description cut at a word to fit 72 bytes — or `<type>: <Map line title>`
   (the issue title when the Map line has none), `(#<pr>)` appended.
 - The Map's Delivery lines ticked `[x]`, a comment on each merged issue.
-  Issues stay open: GitHub closes them only when the final integration →
-  default-branch PR merges. Under `--allow-main` there is no final PR, so each
-  issue PR says `Closes #N` itself (ADR-0013).
+  Issues stay open: GitHub closes them only when a `Closes #N` reaches the
+  default branch — the final PR's, once it (or a later integration) lands
+  there. Under `--via ff` / `none` nothing carries `Closes`, so close them
+  when the work reaches the default branch. Under `--allow-main` each issue
+  PR says `Closes #N` itself (ADR-0013).
 - Run state in `tmp/deliver/<run-id>/` — `state.json` (resume truth: map,
-  base, runner version, active time, per-issue state/branch/PR/round/head),
+  base, runner version, active time, integration, per-issue
+  state/branch/PR/round/head),
   `events.jsonl` (one row per issue-state transition), `status.json` (the
   run's current headline), a `lock` (this process's pid, removed on exit),
   the Map as read, the runner's own model calls in `run-<run-id>.jsonl`

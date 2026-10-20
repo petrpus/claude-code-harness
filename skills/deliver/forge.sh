@@ -60,12 +60,18 @@ forge_default_branch() {
   printf '%s\n' "$b"
 }
 
-# forge_create_integration <branch> <default>  — --create-integration (#62):
-# cut <branch> off origin/<default>, switch to it and push it with upstream.
-# Never forced; the caller has already checked the branch does not exist.
+# forge_create_integration <branch> <from>  — --create-integration (#62) or a
+# --work-branch that does not exist yet: cut <branch> off origin/<from> (the
+# --into branch), switch to it and push it with upstream. Never forced; the
+# caller has already checked the branch does not exist.
 forge_create_integration() {
   git switch -q -c "$1" "origin/$2" && git push -q -u origin "$1"
 }
+
+# forge_ff_push <sha> <branch>  — --via ff (ADR-0016): move origin/<branch>
+# to <sha>. Never forced, so the remote itself refuses anything that is not a
+# fast-forward, even if <branch> moved after the caller's ancestry check.
+forge_ff_push() { git push -q origin "$1:refs/heads/$2"; }
 
 # forge_pr_set_body <pr> <file>  — rewrite a PR's body (a fix round's updated
 # plan, #63). Never touches the title.
