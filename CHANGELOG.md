@@ -3,7 +3,10 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
-## [Unreleased]
+## [0.8.7] — 2026-10-22
+
+Patch release: `/deliver`'s review stops leaving a plugin install record
+behind for every reviewed PR.
 
 ### Fixed
 
