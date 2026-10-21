@@ -3,6 +3,20 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [0.8.7] — 2026-10-22
+
+Patch release: `/deliver`'s review stops leaving a plugin install record
+behind for every reviewed PR.
+
+### Fixed
+
+- `/deliver`'s review no longer leaves a plugin install record behind for
+  every reviewed PR. Its headless `claude -p` runs in a throwaway worktree,
+  and in a project whose `.claude/settings.json` enables a plugin, Claude
+  Code registers that plugin for the worktree's path in
+  `installed_plugins.json`. The runner now removes exactly the records naming
+  that path when it removes the worktree.
+
 ## [0.8.6] — 2026-10-20
 
 Patch release: `/deliver` lets you choose the work branch, the branch it
