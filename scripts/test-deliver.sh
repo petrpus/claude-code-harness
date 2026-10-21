@@ -671,6 +671,13 @@ case "$prompt" in
       inl=no; [[ "$prompt" == *"### Diff"* && "$prompt" == *"+++ b/work/issue-"* ]] && inl=yes
       printf '%s\t%s\t%s\t%s\t%s\n' "$(pwd)" "$tools" "$dis" "$perm" "$inl" >> "$STUB_REVIEW_LOG"
     fi
+    # What a real headless call does in a project whose settings enable a
+    # plugin: it registers the plugin for its own cwd.
+    if [[ -n "${STUB_PLUGIN_SYNC:-}" ]]; then
+      reg="${CLAUDE_CONFIG_DIR:?}/plugins/installed_plugins.json"
+      jq --arg p "$(pwd)" '.plugins["code-harness@claude-code-harness"] += [{scope:"local",projectPath:$p,version:"0.0.0"}]' \
+        "$reg" > "$reg.tmp" && mv "$reg.tmp" "$reg" && pwd >> "$CLAUDE_CONFIG_DIR/synced"
+    fi
     [[ -n "${STUB_REVIEW_TURNS_LOG:-}" ]] && { grep -oE -- '--max-turns [0-9]+' <<<"$*" >> "$STUB_REVIEW_TURNS_LOG" || true; }
     if [[ -n "${STUB_REVIEW_PROMPT_DIR:-}" ]]; then
       mkdir -p "$STUB_REVIEW_PROMPT_DIR"
@@ -893,7 +900,12 @@ bg() { # bg <job-fn> [args...] — semaphore over background jobs via wait -n
 job_happy() {
   new_fixture happy
   git -C "$WORK/happy/remote.git" rev-parse main > "$WORK/happy/main_before"
-  run_deliver happy STUB_REVIEW_LOG="$WORK/happy/review.log"
+  mkdir -p "$WORK/happy/cc/plugins"
+  jq -n '{version:2,plugins:{"code-harness@claude-code-harness":[{scope:"user",version:"0.0.0"},
+          {scope:"local",projectPath:"/elsewhere",version:"0.0.0"}],"other@m":[{scope:"user",version:"1"}]}}' \
+    > "$WORK/happy/cc/plugins/installed_plugins.json"
+  cp "$WORK/happy/cc/plugins/installed_plugins.json" "$WORK/happy/cc/before.json"
+  run_deliver happy STUB_REVIEW_LOG="$WORK/happy/review.log" STUB_PLUGIN_SYNC=1 CLAUDE_CONFIG_DIR="$WORK/happy/cc"
   echo $? > "$WORK/happy/rc"
 }
 job_finalresume() {
@@ -1624,6 +1636,10 @@ REVIEW_CWDS="$(cut -f1 "$WORK/happy/review.log" 2>/dev/null)"
   && [[ -z "$(git -C "$H/repo" worktree list --porcelain | grep -c '^worktree ' | grep -vx 1)" ]] \
   && ok "review: ran twice, each time in a throwaway worktree (not the checkout), all removed afterwards" \
   || note "review: cwds were: $(tr '\n' ' ' <<<"$REVIEW_CWDS"); worktrees: $(git -C "$H/repo" worktree list | wc -l)"
+[[ "$(grep -c deliver-review "$WORK/happy/cc/synced" 2>/dev/null)" -eq 2 ]] \
+  && cmp -s <(jq -S . "$WORK/happy/cc/before.json") <(jq -S . "$WORK/happy/cc/plugins/installed_plugins.json") \
+  && ok "review: the plugin install records claude writes for the throwaway worktree are removed, no other" \
+  || note "review: installed_plugins.json after the run: $(jq -c . "$WORK/happy/cc/plugins/installed_plugins.json")"
 REVIEW_PERMS="$(cut -f2-4 "$WORK/happy/review.log" | sort -u)"
 [[ "$REVIEW_PERMS" == $'Read,Grep,Glob\tBash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,Agent,TodoWrite,Skill\tdefault' ]] \
   && ok "review: no shell and no write tool — Read/Grep/Glob allowed, Bash/Edit/Write disallowed, default mode" \

@@ -218,11 +218,38 @@ finding_hash() {
   printf '%s' "$norm" | sha256sum | cut -d' ' -f1
 }
 
-# review_cleanup — remove the live throwaway worktree, if any. Safe to call
-# repeatedly; deliver.sh also calls it from its EXIT/INT/TERM traps, so a
-# killed run does not leave a worktree behind to confuse the next snapshot.
+# review_forget_plugin_installs <dir> — drop the plugin install records
+# `claude` wrote for <dir>. A headless call in a project whose
+# .claude/settings.json enables a plugin registers that plugin for the call's
+# directory in installed_plugins.json, even under --setting-sources user, so
+# every review left one record per plugin for a scratch path gone a moment
+# later. Only records naming exactly <dir> (as given or resolved) go; no
+# file, no jq or a file jq cannot read leaves everything as it was.
+review_forget_plugin_installs() {
+  local dir="$1" phys f tmp
+  f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+  [[ -n "$dir" && -f "$f" ]] || return 0
+  phys="$(cd "$dir" 2>/dev/null && pwd -P)" || phys="$dir"
+  jq -e --arg a "$dir" --arg b "$phys" \
+    'any(.plugins[]?[]?; .projectPath == $a or .projectPath == $b)' "$f" >/dev/null 2>&1 || return 0
+  tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 0
+  if jq --arg a "$dir" --arg b "$phys" \
+       '.plugins |= (map_values(map(select(.projectPath != $a and .projectPath != $b)))
+                     | with_entries(select(.value | length > 0)))' "$f" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# review_cleanup — remove the live throwaway worktree, if any, and the plugin
+# install records claude wrote for it. Safe to call repeatedly; deliver.sh
+# also calls it from its EXIT/INT/TERM traps, so a killed run does not leave
+# a worktree behind to confuse the next snapshot.
 review_cleanup() {
   [[ -n "$REVIEW_WT" ]] || return 0
+  review_forget_plugin_installs "$REVIEW_WT"
   git worktree remove --force "$REVIEW_WT" 2>/dev/null || rm -rf "$REVIEW_WT"
   git worktree prune 2>/dev/null
   REVIEW_WT=""
