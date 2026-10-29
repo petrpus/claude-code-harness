@@ -3,6 +3,28 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [0.8.8] — 2026-10-29
+
+Patch release: an issue can declare the feature flag its change ships behind,
+and the verifier then treats a default-off flag as spec instead of as the
+"feature flagged off" shortcut (#132).
+
+### Added
+
+- A line `Flag: <NAME> (default off|on)` in an issue body declares a flag.
+  `/deliver` carries it into each issue's charter under `## Declared flags`,
+  and `--plan-only` lists declared flags per issue (`flags: [{name, default}]`
+  in `--json`), so the human sees what ships dark before approving the run.
+  The autopilot charter template has the same section, and `/to-issues`,
+  `/implement-issue` and the code reviewer's checklist describe the line.
+
+### Changed
+
+- The verifier's shortcut 8 ("feature flagged off") now applies only when the
+  charter declares no flag. For a declared flag it checks the name and
+  default, a test that forces the flag on, and the flag-off path; a missing
+  flag-on test is shortcut 12.
+
 ## [0.8.7] — 2026-10-22
 
 Patch release: `/deliver`'s review stops leaving a plugin install record
