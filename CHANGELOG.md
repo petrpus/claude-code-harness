@@ -15,6 +15,8 @@ and the verifier then treats a default-off flag as spec instead of as the
   `/deliver` carries it into each issue's charter under `## Declared flags`,
   and `--plan-only` lists declared flags per issue (`flags: [{name, default}]`
   in `--json`), so the human sees what ships dark before approving the run.
+  A `Flag:` line inside a fenced code block is an example, not a
+  declaration, and a name declared twice keeps its first declaration.
   The autopilot charter template has the same section, and `/to-issues`,
   `/implement-issue` and the code reviewer's checklist describe the line.
 

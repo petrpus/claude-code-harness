@@ -242,6 +242,13 @@ CHARTER4="$(charter_from_issue "$WORK/issue4.json" "$WORK/map1.plan" 3)"
     == $'NEW_CHECKOUT\toff\nbeta_ui\ton\nBARE\toff' ]] \
   && ok "issue_flags: Flag: lines parse (key case-insensitive, CR stripped, default off when unstated)" \
   || note "issue_flags: '$(printf 'Flag: NEW_CHECKOUT (default off)\n' | issue_flags | tr '\t\n' ':|')'"
+[[ -z "$(printf 'Example:\n```\nFlag: QUOTED (default on)\n```\n~~~md\nFlag: TILDE\n~~~\n' | issue_flags)" ]] \
+  && [[ "$(printf '```\nFlag: IN (default on)\n```\nFlag: OUT\n' | issue_flags)" == $'OUT\toff' ]] \
+  && ok "issue_flags: a Flag: line inside a fenced code block is an example, not a declaration" \
+  || note "issue_flags (fenced): '$(printf '```\nFlag: IN\n```\nFlag: OUT\n' | issue_flags | tr '\t\n' ':|')'"
+[[ "$(printf 'Flag: A\nFlag: B (default on)\nFlag: A (default on)\n' | issue_flags)" == $'A\toff\nB\ton' ]] \
+  && ok "issue_flags: a name declared twice keeps its first declaration" \
+  || note "issue_flags (duplicate): '$(printf 'Flag: A\nFlag: A (default on)\n' | issue_flags | tr '\t\n' ':|')'"
 jq -n '{number:5,title:"Dark launch",url:"u",
         body:"## What to build\nShip the new checkout dark.\n\nFlag: NEW_CHECKOUT (default off)\n\n## Acceptance criteria\n- [ ] new checkout works with the flag on"}' \
   > "$WORK/issue5.json"

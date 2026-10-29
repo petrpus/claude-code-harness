@@ -28,15 +28,21 @@ _trim_blank() {
 # issue_flags — stdin issue body, prints one "<name>\t<off|on>" line per
 # declared flag (#132). A declaration is a line of its own,
 # `Flag: <NAME> (default off|on)`; the key is case-insensitive and the
-# default is off when the parenthesis is missing. The verifier treats a
-# declared default-off flag as spec, not as shortcut 8.
+# default is off when the parenthesis is missing. A line inside a ``` or ~~~
+# fenced block is a quoted example, not a declaration, and a name declared
+# twice keeps its first declaration. The verifier treats a declared flag as
+# spec, not as shortcut 8 — a wrong match loosens the gate, so stay strict.
 issue_flags() {
   tr -d '\r' | awk '
+    /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
+    fenced { next }
     {
       line = $0
       if (tolower(line) !~ /^[[:space:]]*flag:[[:space:]]*[a-z0-9_.-]+/) next
       sub(/^[[:space:]]*[Ff][Ll][Aa][Gg]:[[:space:]]*/, "", line)
       name = line; sub(/[^A-Za-z0-9_.-].*$/, "", name)
+      if (name in seen) next
+      seen[name] = 1
       def = (tolower(line) ~ /\([[:space:]]*default[[:space:]]+on[[:space:]]*\)/) ? "on" : "off"
       print name "\t" def
     }'

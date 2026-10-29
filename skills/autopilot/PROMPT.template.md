@@ -37,11 +37,12 @@ Mandatory. Concrete, checkable statements — this is what the verifier checks
 
 ## Declared flags
 
-<!-- Optional. Copy every `Flag: <NAME> (default off|on)` line from the issue.
-     A flag listed here is spec: the change ships behind it with that default,
-     and the verifier does not count it as shortcut 8 ("feature flagged off").
-     Delete this section when the issue declares no flag. -->
-- Flag: <NAME> (default off)
+<!-- Optional. Copy every `Flag: <NAME> (default off|on)` line from the issue
+     as a bullet here, e.g. "- Flag: NEW_CHECKOUT (default off)". A flag
+     listed here is spec: the change ships behind it with that default, and
+     the verifier does not count it as shortcut 8 ("feature flagged off").
+     Leave it as "none" when the issue declares no flag. -->
+- none
 
 ## Constraints & notes
 

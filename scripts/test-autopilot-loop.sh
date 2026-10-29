@@ -370,10 +370,12 @@ grep -q "not an attempt to alter" "$WORK/r1.calls" 2>/dev/null \
 # so the exception (and the flag-on test it demands instead) must be in it.
 grep -q "and the charter declares no flag" "$WORK/r1.calls" 2>/dev/null \
   && grep -q "forces the flag on" "$WORK/r1.calls" 2>/dev/null \
+  && grep -q "declared one is #17" "$WORK/r1.calls" 2>/dev/null \
   && ok "the verifier prompt's shortcut 8 excepts a declared flag and demands a flag-on test" \
   || note "verify_prompt() lacks the declared-flag exception to shortcut 8 (#132)"
 grep -q '^## Declared flags' skills/autopilot/PROMPT.template.md \
-  && ok "the autopilot charter template has a '## Declared flags' section" \
+  && ! grep -qE '^[[:space:]]*[-*][[:space:]]+Flag:' skills/autopilot/PROMPT.template.md \
+  && ok "the autopilot charter template has a '## Declared flags' section with no live placeholder flag" \
   || note "PROMPT.template.md has no '## Declared flags' section (#132)"
 
 # --- 2. no progress is still a failure, and still aborts -------------------
