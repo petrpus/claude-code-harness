@@ -39,7 +39,9 @@ Do **not** use it for exploratory work with no acceptance criteria, or on `main`
 2. **Scaffold the charter.** Create `tmp/autopilot/PROMPT.md` from
    `PROMPT.template.md` — derive it from a PRD or issue, and fill in the source
    link and acceptance criteria (these are mandatory; they're what the verifier
-   checks against). Leave `IMPLEMENTATION_PLAN.md` absent — the PLAN phase writes
+   checks against). Copy any `Flag: <NAME> (default off|on)` line from the
+   issue into `## Declared flags`; without it the verifier fails a
+   default-off flag as shortcut 8. Leave `IMPLEMENTATION_PLAN.md` absent — the PLAN phase writes
    it — or seed it from `PLAN.template.md`.
    Optionally, write acceptance scenarios the build model must never see from
    `HOLDOUT.template.md`, saved **outside the worktree** (default location

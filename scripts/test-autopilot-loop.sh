@@ -365,6 +365,17 @@ grep -q "not an attempt to alter" "$WORK/r1.calls" 2>/dev/null \
   && ok "the verifier prompt reassures it against self-referential charter edits" \
   || note "verify_prompt() is missing the self-edit reassurance text (regression: iteration-3 verifier confusion)"
 
+# #132: a flag the charter declares is spec, not shortcut 8. The verifier
+# reads its checklist from agents/verifier.md inside every verify_agent call,
+# so the exception (and the flag-on test it demands instead) must be in it.
+grep -q "and the charter declares no flag" "$WORK/r1.calls" 2>/dev/null \
+  && grep -q "forces the flag on" "$WORK/r1.calls" 2>/dev/null \
+  && ok "the verifier prompt's shortcut 8 excepts a declared flag and demands a flag-on test" \
+  || note "verify_prompt() lacks the declared-flag exception to shortcut 8 (#132)"
+grep -q '^## Declared flags' skills/autopilot/PROMPT.template.md \
+  && ok "the autopilot charter template has a '## Declared flags' section" \
+  || note "PROMPT.template.md has no '## Declared flags' section (#132)"
+
 # --- 2. no progress is still a failure, and still aborts -------------------
 R2="$WORK/r2"; new_repo "$R2"
 run_loop "$R2" stall true

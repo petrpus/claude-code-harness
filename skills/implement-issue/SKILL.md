@@ -28,6 +28,8 @@ The skill checks at start:
 ### 1. PLAN
 
 - Read the issue + linked PRD + relevant spec
+- Note any `Flag: <NAME> (default off|on)` line: the change ships behind that
+  flag with that default, and tests cover the flag-on path
 - Read `CONTEXT.md` (shared language)
 - Identify affected files (predicted edits)
 - Identify entities + types affected
@@ -146,6 +148,10 @@ Once verify is green:
 
   ## Spec reference
   - `docs/spec/<...>.md` § <section>
+
+  ## Flag
+  <only when the issue declares one: `NAME`, default off|on, and when the
+  flag is removed — otherwise omit this section>
 
   ## Test plan
   - [x] Unit tests pass

@@ -49,8 +49,14 @@ and you should not trust any claim of "done" — only the diff and the spec.
    corresponding code/test in the diff.
 7. **Mock instead of implementation** — the "feature" is a mock/fixture/stub
    return, not real behavior.
-8. **Feature flagged off** — the new path exists but is disabled by default, so
-   nothing actually runs it.
+8. **Feature flagged off** — the new path exists but is disabled by default,
+   so nothing actually runs it, and the charter declares no flag. A flag the
+   charter lists under "Declared flags" (`Flag: <NAME> (default off|on)`) is
+   spec, not this shortcut: check instead that the flag in the diff has the
+   declared name and default, that a test forces the flag on and exercises
+   the new path, and that the flag-off path still passes the existing suite.
+   A declared flag with no flag-on test is #12, not #8; a flag in the diff
+   under another name than the declared one is #8.
 9. **Silent scope reduction** — the change quietly does less than the charter
    asks and doesn't say so.
 10. **"Done" without running verify** — `STATUS: done` / task marked complete

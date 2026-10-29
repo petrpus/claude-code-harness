@@ -35,6 +35,14 @@ Mandatory. Concrete, checkable statements — this is what the verifier checks
 <!-- Anything the loop must NOT touch. The verifier flags silent scope creep. -->
 - …
 
+## Declared flags
+
+<!-- Optional. Copy every `Flag: <NAME> (default off|on)` line from the issue.
+     A flag listed here is spec: the change ships behind it with that default,
+     and the verifier does not count it as shortcut 8 ("feature flagged off").
+     Delete this section when the issue declares no flag. -->
+- Flag: <NAME> (default off)
+
 ## Constraints & notes
 
 <!-- Stack conventions, files to avoid, perf/security requirements, data-safety

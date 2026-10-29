@@ -25,6 +25,23 @@ _trim_blank() {
     for (i=s; i<=e; i++) print lines[i] }'
 }
 
+# issue_flags — stdin issue body, prints one "<name>\t<off|on>" line per
+# declared flag (#132). A declaration is a line of its own,
+# `Flag: <NAME> (default off|on)`; the key is case-insensitive and the
+# default is off when the parenthesis is missing. The verifier treats a
+# declared default-off flag as spec, not as shortcut 8.
+issue_flags() {
+  tr -d '\r' | awk '
+    {
+      line = $0
+      if (tolower(line) !~ /^[[:space:]]*flag:[[:space:]]*[a-z0-9_.-]+/) next
+      sub(/^[[:space:]]*[Ff][Ll][Aa][Gg]:[[:space:]]*/, "", line)
+      name = line; sub(/[^A-Za-z0-9_.-].*$/, "", name)
+      def = (tolower(line) ~ /\([[:space:]]*default[[:space:]]+on[[:space:]]*\)/) ? "on" : "off"
+      print name "\t" def
+    }'
+}
+
 # charter_from_issue <issue_json_file> <map_plan_file> <map_number>
 charter_from_issue() {
   local issue="$1" plan="$2" map="$3"
@@ -76,6 +93,14 @@ EOF
   done < "$plan"
   [[ "$others" -eq 1 ]] || echo "- Anything not described by issue #$n."
 
+  local flags flag_note=""
+  flags="$(printf '%s\n' "$body" | issue_flags)"
+  if [[ -n "$flags" ]]; then
+    printf '\n## Declared flags\n\n'
+    printf '%s\n' "$flags" | awk -F'\t' '{ printf "- Flag: %s (default %s)\n", $1, $2 }'
+    flag_note=$'\n- A flag under "Declared flags" is part of the spec: ship the change behind it\n  with the declared default, and test the new path with the flag forced on.'
+  fi
+
   cat <<EOF
 
 ## Constraints & notes
@@ -83,7 +108,7 @@ EOF
 - Follow the repo's \`CLAUDE.md\` (or \`.claude/CLAUDE.md\`) and \`CONTEXT.md\`.
 - Tests are required for every behavior change (TDD: red-green-refactor).
 - Record any architectural decision as a \`docs/adr/\` entry.
-- Do not open, push or merge anything — the /deliver runner does that (ADR-0007).
+- Do not open, push or merge anything — the /deliver runner does that (ADR-0007).$flag_note
 
 ## Issue #$n (verbatim)
 
