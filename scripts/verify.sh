@@ -32,7 +32,8 @@
 #      scripts/test-deliver.sh does the same for skills/deliver/deliver.sh,
 #      against a bare git remote and a fake `gh`.
 #      scripts/test-harvest.sh drives skills/worklog/harvest.sh and
-#      harvest-app.py against a stub `curl` playing the Harvest API.
+#      worklog-app.py against a stub `curl` playing the Harvest API;
+#      scripts/test-clockify.sh does the same for clockify.sh and Clockify.
 #   8. bash -n over hooks/*.sh, scripts/*.sh, skills/**/*.sh — a syntax floor
 #      that stands even if check-consistency's own walk regresses.
 #
@@ -431,6 +432,19 @@ if [[ -f scripts/test-harvest.sh ]]; then
   fi
 else
   note "scripts/test-harvest.sh is missing"
+fi
+
+# clockify.sh does the same for Clockify, and drives the shared page with
+# string ids, a project without tasks and interval times.
+section "worklog clockify (stub Clockify API)"
+if [[ -f scripts/test-clockify.sh ]]; then
+  if bash scripts/test-clockify.sh; then
+    ok "worklog clockify passed"
+  else
+    note "worklog clockify failed (see above)"
+  fi
+else
+  note "scripts/test-clockify.sh is missing"
 fi
 
 # ---------------------------------------------------------------------------

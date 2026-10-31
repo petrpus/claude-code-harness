@@ -1,4 +1,4 @@
-"""scripts/test-harvest-app.py — drives a running skills/worklog/harvest-app.py.
+"""scripts/test-harvest-app.py — drives a running skills/worklog/worklog-app.py --service harvest.
 
 Called by scripts/test-harvest.sh, which starts the server against its stub
 `curl` and passes APP_URL, STUB_DIR, BATCH and HARVEST_PROJECTS. Uses urllib,

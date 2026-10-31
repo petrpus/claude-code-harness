@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test-harvest.sh — offline tests for skills/worklog/harvest.sh and
-# harvest-app.py (the local review-and-log page, via scripts/test-harvest-app.py).
+# worklog-app.py --service harvest (the local review-and-log page, via
+# scripts/test-harvest-app.py).
 #
 # A stub `curl` on PATH plays the Harvest API (accounts, users/me, paged
 # project assignments and time entries, POST/PATCH/DELETE time_entries), records
@@ -20,7 +21,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 H="$PWD/skills/worklog/harvest.sh"
-A="$PWD/skills/worklog/harvest-app.py"
+A="$PWD/skills/worklog/worklog-app.py"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/home"
@@ -230,7 +231,7 @@ done
 
 # ---------------------------------------------------------------- the page ---
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "  (python3 absent — skipping harvest-app)"; exit "$FAIL"
+  echo "  (python3 absent — skipping worklog-app)"; exit "$FAIL"
 fi
 rm -f "$T/patches.log"
 cat > "$T/app.json" <<'JSON'
@@ -244,24 +245,24 @@ app_pid=$!
 for _ in $(seq 50); do [[ -s "$T/app.out" ]] && break; sleep 0.1; done
 url="$(head -1 "$T/app.out")"
 if [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+/#k=.+ ]]; then
-  ok "harvest-app prints a loopback URL carrying the key in the fragment"
+  ok "worklog-app (harvest) prints a loopback URL carrying the key in the fragment"
   APP_URL="$url" BATCH="$T/app.json" python3 scripts/test-harvest-app.py || FAIL=1
 else
-  note "harvest-app did not start: $(cat "$T/app.err")"
+  note "worklog-app (harvest) did not start: $(cat "$T/app.err")"
 fi
 for _ in $(seq 50); do kill -0 "$app_pid" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$app_pid" 2>/dev/null; then
-  kill "$app_pid"; note "harvest-app kept running after done"
+  kill "$app_pid"; note "worklog-app (harvest) kept running after done"
 elif grep -q '"exit": "done"' "$T/app.out" && grep -q '"action": "created"' "$T/app.out"; then
-  ok "harvest-app exits on done and prints each applied entry"
+  ok "worklog-app (harvest) exits on done and prints each applied entry"
 else
-  note "harvest-app stdout: $(cat "$T/app.out")"
+  note "worklog-app (harvest) stdout: $(cat "$T/app.out")"
 fi
 python3 "$A" "$T/app.json" --from 2026-10-15 --to 2026-10-13 >/dev/null 2>&1 \
-  && note "harvest-app accepted a backwards window" || ok "harvest-app refuses a backwards window"
+  && note "worklog-app (harvest) accepted a backwards window" || ok "worklog-app (harvest) refuses a backwards window"
 echo '[{"date":"2026-10-14","hours":1},{"date":"2026-10-14","hours":2}]' > "$T/dup.json"
 python3 "$A" "$T/dup.json" --from 2026-10-13 --to 2026-10-15 >/dev/null 2>&1 \
-  && note "harvest-app accepted a batch with a date twice" || ok "harvest-app refuses a batch with a date twice"
+  && note "worklog-app (harvest) accepted a batch with a date twice" || ok "worklog-app (harvest) refuses a batch with a date twice"
 
 # A project remembered for the repo wins over the guess.
 echo '{"/repo/a": 1}' > "$HARVEST_PROJECTS"
