@@ -3,6 +3,35 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [0.9.0] — 2026-11-01
+
+Minor release: `/worklog --clockify` logs the commit digest to Clockify on the
+same local review page that `--harvest` uses for Harvest.
+
+### Added
+
+- `skills/worklog/clockify.sh`, a Clockify API v1 client with the same
+  commands and output shapes as `harvest.sh`: `setup [workspace]`,
+  `workspaces`, `me`, `projects`, `entries`, `log`, `update`, `delete`. The
+  API key goes to curl on stdin, never argv, and lives in
+  `~/.config/clockify/env` (mode 0600) with the workspace, the user id and
+  the profile's time zone. `CLOCKIFY_API_BASE` selects a regional server.
+- Clockify keeps intervals, not hours. A new entry starts at 09:00 in the
+  user's Clockify time zone (`CLOCKIFY_DAY_START`), or right after that
+  day's last entry; new hours keep the start and move the end. An update
+  sends back the entry's tags, billable flag and custom fields, since
+  Clockify's PUT replaces the whole entry. A new entry is billable when its
+  project is. A project without any task is logged without one.
+- `scripts/test-clockify.sh` and `scripts/test-clockify-app.py`: offline
+  tests against a stub Clockify API, run by `scripts/verify.sh`.
+
+### Changed
+
+- `harvest-app.py` / `.html` are now `worklog-app.py` / `.html`, serving
+  either tracker (`--service harvest|clockify`, default `harvest`). Ids are
+  opaque on the page and in the server, and the page names the tracker it
+  talks to. Harvest behaviour is unchanged.
+
 ## [0.8.8] — 2026-10-29
 
 Patch release: an issue can declare the feature flag its change ships behind,
