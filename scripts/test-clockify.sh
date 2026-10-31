@@ -242,8 +242,12 @@ else
 fi
 [[ "$(bash "$C" entries 2026-10-14 2026-10-15 --project "$P1" 2>/dev/null | jq -r --arg e1 "$E1" 'map(.id) == [$e1]')" == true ]] \
   && ok "entries --project filters to that project" || note "entries --project returned other rows"
-grep -q 'start=2026-10-13T22:00:00Z&end=2026-10-15T21:59:59Z' "$T/calls.log" \
-  && ok "the window is the local days, converted to UTC" || note "window query: $(grep time-entries "$T/calls.log" | tail -1)"
+grep -q 'start=2026-10-13T10:00:00Z&end=2026-10-16T10:00:00Z' "$T/calls.log" \
+  && ok "the window query runs from local noon before to local noon after, trimmed by local date" \
+  || note "window query: $(grep time-entries "$T/calls.log" | tail -1)"
+CLOCKIFY_TIMEZONE=America/Santiago bash "$C" entries 2026-09-06 2026-09-06 >/dev/null 2>&1 \
+  && ok "a window on a day whose local midnight does not exist (DST gap) still reads" \
+  || note "entries failed on America/Santiago 2026-09-06 (no local midnight)"
 rm -f "$T/calls.log"
 n="$(CLOCKIFY_PAGE_SIZE=1 bash "$C" entries 2026-10-14 2026-10-15 2>/dev/null | jq 'length')"
 [[ "$n" == 2 ]] && grep -q 'page=4&page-size=1' "$T/calls.log" \
@@ -270,6 +274,13 @@ last_post | jq -e '.start == "2026-10-27T08:00:00Z"' >/dev/null \
 CLOCKIFY_DAY_START=13:15 bash "$C" log 2026-10-28 1 --project "$P2" --billable false --notes "" >/dev/null 2>&1
 last_post | jq -e '.start == "2026-10-28T12:15:00Z"' >/dev/null \
   && ok "CLOCKIFY_DAY_START moves the start of a day" || note "day start: $(last_post)"
+# 16 h from 09:00 local ends at 01:00 on the next local day; the day's next
+# entry must not start there, or it would land on the wrong date.
+bash "$C" log 2026-10-29 16 --project "$P2" --billable false --notes "" >/dev/null 2>&1
+bash "$C" log 2026-10-29 1 --project "$P2" --billable false --notes "" >/dev/null 2>&1
+last_post | jq -e '.start == "2026-10-29T08:00:00Z"' >/dev/null \
+  && ok "after a day's entry that runs past midnight, the next one starts at the day's start" \
+  || note "past-midnight start: $(last_post)"
 
 before="$(posts)"
 for args in "log 2026-10-14 2 --project xyz" "log 2026-10-14 25 --project $P1" "log 2026-10-14 2 --project $P1 --task 12" \

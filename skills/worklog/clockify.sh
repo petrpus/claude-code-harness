@@ -204,7 +204,11 @@ with_dates() {
 fetch_entries() {
   local from="$1" to="$2" project="${3:-}" uid s e url
   uid="$(user_id)" || exit $?
-  s="$(local_to_utc "$from" 00:00:00)" && e="$(local_to_utc "$to" 23:59:59)" || die "could not convert $from–$to to UTC"
+  # Noon of the day before and after, not midnight: in a few zones local
+  # midnight falls in a DST gap and GNU date rejects it. The date filter
+  # below trims the padding.
+  s="$(local_to_utc "$(date -d "$from -1 day" +%F)" 12:00:00)" && e="$(local_to_utc "$(date -d "$to +1 day" +%F)" 12:00:00)" \
+    || die "could not convert $from–$to to UTC"
   url="$WS_URL/user/$uid/time-entries?start=$s&end=$e&hydrated=true"
   [[ -n "$project" ]] && url="$url&project=$project"
   paged "$url" | normalize | with_dates \
@@ -353,7 +357,11 @@ cmd_log() {
   day="$(fetch_entries "$d" "$d")" || exit $?
   latest="$(jq -r '[.[].end | fromdate] | max // empty' <<<"$day")" || die "unreadable entries of $d"
   start_e="$(epoch_of "$(local_to_utc "$d" "$DAY_START")")" || die "could not convert $d $DAY_START"
-  [[ -n "$latest" && "$latest" -gt "$start_e" ]] && start_e="$latest"
+  # After the last entry, unless that one runs past midnight: an entry's date
+  # is the local date of its start, so it must not start on the next day.
+  if [[ -n "$latest" && "$latest" -gt "$start_e" ]] && [[ "$(iso_of "$latest" | local_dates)" == "$d" ]]; then
+    start_e="$latest"
+  fi
   end_e=$((start_e + $(seconds_of_hours "$h")))
   local body
   body="$(jq -nc --arg s "$(iso_of "$start_e")" --arg e "$(iso_of "$end_e")" --argjson b "$billable" \
