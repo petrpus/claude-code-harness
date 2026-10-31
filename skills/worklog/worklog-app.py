@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-"""skills/worklog/harvest-app.py — local review-and-log page for /worklog --harvest.
+"""skills/worklog/worklog-app.py — local review-and-log page for /worklog --harvest and --clockify.
 
-    harvest-app.py <batch.json> --from YYYY-MM-DD --to YYYY-MM-DD
-                   [--project ID] [--repo KEY] [--task-name NAME]
-                   [--port N] [--idle-minutes N] [--open]
+    worklog-app.py <batch.json> --from YYYY-MM-DD --to YYYY-MM-DD
+                   [--service harvest|clockify] [--project ID] [--repo KEY]
+                   [--task-name NAME] [--port N] [--idle-minutes N] [--open]
 
-Serves one page on 127.0.0.1: a project select, the user's Harvest entries for
-that project and task in the window, and an editable proposal per day with a
-button that creates or updates the entry. Every Harvest call goes through
-harvest.sh next to this file, so the token stays in harvest.sh's config and
-never reaches this process's responses or the page.
+Serves one page on 127.0.0.1: a project select, the user's entries in the
+time tracker (--service, default harvest) for that project and task in the
+window, and an editable proposal per day with a button that creates or
+updates the entry. Every tracker call goes through the service's script next
+to this file (harvest.sh or clockify.sh, which share one command contract),
+so the token stays in that script's config and never reaches this process's
+responses or the page.
 
 The batch file holds the proposals ([{date, hours, notes}]) the skill derived
 from the commits; each applied row gets its entry_id written back, so a rerun
-of the page shows what already went to Harvest.
+of the page shows what already went to the tracker.
 
-Project choice: a project remembered for --repo in $HARVEST_PROJECTS (default
-~/.config/harvest/projects.json) wins over --project, the skill's guess from
-context. Changing the select remembers the new choice for --repo.
+Project choice: a project remembered for --repo in the service's projects map
+($HARVEST_PROJECTS, default ~/.config/harvest/projects.json, or
+$CLOCKIFY_PROJECTS, default ~/.config/clockify/projects.json) wins over
+--project, the skill's guess from context. Changing the select remembers the
+new choice for --repo.
+
+Ids are opaque: Harvest's are integers, Clockify's 24-hex-digit strings. A
+Clockify project without any task is logged without one; a project whose
+tasks do not include --task-name cannot be chosen, in either service.
 
 Guards: the server binds 127.0.0.1 only, answers only to a Host header naming
 that address and port (no DNS rebinding), and every /api call must carry the
@@ -50,34 +58,73 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
-HARVEST = HERE / "harvest.sh"
-PAGE = HERE / "harvest-app.html"
-PROJECTS_MAP = Path(os.environ.get("HARVEST_PROJECTS", Path.home() / ".config/harvest/projects.json"))
+PAGE = HERE / "worklog-app.html"
 MAX_BODY = 1 << 20
 
 
-class HarvestError(Exception):
-    """harvest.sh failed or Harvest refused → 502."""
+def _harvest_id(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _clockify_id(value):
+    return value.lower() if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{24}", value) else None
+
+
+SERVICES = {
+    "harvest": {
+        "name": "Harvest",
+        "flag": "--harvest",
+        "script": HERE / "harvest.sh",
+        "projects_map": Path(os.environ.get("HARVEST_PROJECTS", Path.home() / ".config/harvest/projects.json")),
+        "id": _harvest_id,
+        "id_text": r"[0-9]{1,15}",
+        "id_from_text": int,
+        # Harvest has no entry without a task.
+        "task_optional": False,
+        "billable": False,
+    },
+    "clockify": {
+        "name": "Clockify",
+        "flag": "--clockify",
+        "script": HERE / "clockify.sh",
+        "projects_map": Path(os.environ.get("CLOCKIFY_PROJECTS", Path.home() / ".config/clockify/projects.json")),
+        "id": _clockify_id,
+        "id_text": r"[0-9a-fA-F]{24}",
+        "id_from_text": str.lower,
+        # A Clockify project may have no tasks at all; its entries carry none.
+        "task_optional": True,
+        # Clockify does not take a project's billable default on create.
+        "billable": True,
+    },
+}
+
+
+class ServiceError(Exception):
+    """The service script failed or the tracker refused → 502."""
 
 
 class Conflict(Exception):
     """The request would double-log a day → 409."""
 
 
-def harvest(*args):
-    proc = subprocess.run(["bash", str(HARVEST), *args], capture_output=True, text=True, encoding="utf-8")
+SERVICE = SERVICES["harvest"]
+
+
+def service(*args):
+    script = SERVICE["script"]
+    proc = subprocess.run(["bash", str(script), *args], capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
-        raise HarvestError(proc.stderr.strip() or f"harvest.sh {args[0]} exited {proc.returncode}")
+        raise ServiceError(proc.stderr.strip() or f"{script.name} {args[0]} exited {proc.returncode}")
     return json.loads(proc.stdout) if proc.stdout.strip() else None
 
 
-def harvest_with_notes(args, notes):
+def service_with_notes(args, notes):
     # Notes go through a file: they are free text of any length.
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
         f.write(notes)
         path = f.name
     try:
-        return harvest(*args, "--notes-file", path)
+        return service(*args, "--notes-file", path)
     finally:
         os.unlink(path)
 
@@ -105,18 +152,20 @@ def write_json(path, data):
 
 
 def read_projects_map():
+    path = SERVICE["projects_map"]
     try:
-        mapping = read_json(PROJECTS_MAP, {})
+        mapping = read_json(path, {})
     except ValueError:
         mapping = None
     if not isinstance(mapping, dict):
-        print(f"harvest-app: ignoring unreadable {PROJECTS_MAP}", file=sys.stderr, flush=True)
+        print(f"worklog-app: ignoring unreadable {path}", file=sys.stderr, flush=True)
         return {}
     return mapping
 
 
-def is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
+def as_id(value):
+    """A service id from JSON, normalised, or None when it is not one."""
+    return SERVICE["id"](value)
 
 
 def is_hours(value):
@@ -157,27 +206,31 @@ class App:
     def load_projects(self):
         if self.projects is None:
             want = self.opts.task_name.casefold()
-            self.projects = [
-                {
-                    "project_id": p["project_id"],
-                    "label": f'{p["client"]} / {p["project"]}',
-                    "task_id": next((t["task_id"] for t in p["tasks"] if t["task"].casefold() == want), None),
-                }
-                for p in harvest("projects")
-            ]
+            self.projects = []
+            for p in service("projects"):
+                task_id = next((t["task_id"] for t in p["tasks"] if t["task"].casefold() == want), None)
+                self.projects.append({
+                    "project_id": as_id(p["project_id"]),
+                    "label": f'{p["client"]} / {p["project"]}' if p.get("client") else p["project"],
+                    "task_id": task_id,
+                    "loggable": task_id is not None or (SERVICE["task_optional"] and not p["tasks"]),
+                    "billable": p.get("billable"),
+                })
         return self.projects
 
     def selected_project(self):
-        ids = {p["project_id"] for p in self.load_projects() if p["task_id"]}
+        ids = {p["project_id"] for p in self.load_projects() if p["loggable"]}
         remembered = read_projects_map().get(self.opts.repo) if self.opts.repo else None
-        for candidate in (remembered, self.opts.project):
-            if candidate in ids:
+        for candidate in (as_id(remembered), self.opts.project):
+            if candidate is not None and candidate in ids:
                 return candidate
         return None
 
     def state(self):
         rows = {r["date"]: r for r in self.batch()}
         return {
+            "service": SERVICE["name"],
+            "flag": SERVICE["flag"],
             "from": self.opts.date_from,
             "to": self.opts.date_to,
             "task_name": self.opts.task_name,
@@ -194,62 +247,69 @@ class App:
             ],
         }
 
-    def task_for(self, project_id):
+    def project(self, project_id):
         for p in self.load_projects():
-            if p["project_id"] == project_id and p["task_id"]:
-                return p["task_id"]
+            if p["project_id"] == project_id and p["loggable"]:
+                return p
         raise ValueError(f"project {project_id} has no active {self.opts.task_name} task")
+
+    def task_for(self, project_id):
+        return self.project(project_id)["task_id"]
 
     def entries(self, project_id):
         task_id = self.task_for(project_id)
-        rows = harvest("entries", self.opts.date_from, self.opts.date_to, "--project", str(project_id))
+        rows = service("entries", self.opts.date_from, self.opts.date_to, "--project", str(project_id))
         return [e for e in rows if e["task_id"] == task_id]
 
     # ----------------------------------------------------------- writes ---
     def remember(self, project_id):
-        self.task_for(project_id)
+        self.project(project_id)
         if not self.opts.repo:
             return
         with self.lock:
             mapping = read_projects_map()
             mapping[self.opts.repo] = project_id
-            write_json(PROJECTS_MAP, mapping)
+            write_json(SERVICE["projects_map"], mapping)
 
     def apply(self, body):
-        project_id, date, hours = body.get("project_id"), body.get("date"), body.get("hours")
-        notes, entry_id, new = body.get("notes", ""), body.get("entry_id"), body.get("new") is True
-        if not is_int(project_id):
-            raise ValueError("project_id must be a number")
+        project_id, date, hours = as_id(body.get("project_id")), body.get("date"), body.get("hours")
+        notes, raw_entry, new = body.get("notes", ""), body.get("entry_id"), body.get("new") is True
+        entry_id = None if raw_entry is None else as_id(raw_entry)
+        if project_id is None:
+            raise ValueError(f"project_id must be a {SERVICE['name']} id")
         if date not in self.window():
             raise ValueError(f"{date} is outside the window")
         if not is_hours(hours):
             raise ValueError("hours must be a number in (0, 24]")
         if not isinstance(notes, str):
             raise ValueError("notes must be text")
-        if entry_id is not None and not is_int(entry_id):
-            raise ValueError("entry_id must be a number or null")
-        # Re-read Harvest on every write: the page's copy may be stale (a
-        # second tab, an entry added in Harvest meanwhile).
-        existing = [e["id"] for e in self.entries(project_id) if e["date"] == date]
+        if raw_entry is not None and entry_id is None:
+            raise ValueError(f"entry_id must be a {SERVICE['name']} id or null")
+        # Re-read the tracker on every write: the page's copy may be stale (a
+        # second tab, an entry added in the tracker meanwhile).
+        existing = [as_id(e["id"]) for e in self.entries(project_id) if e["date"] == date]
         if entry_id is not None:
             if entry_id not in existing:
                 raise ValueError(f"entry {entry_id} is not a {self.opts.task_name} entry of this project on {date}")
-            entry = harvest_with_notes(["update", str(entry_id), "--hours", str(hours)], notes)
+            entry = service_with_notes(["update", str(entry_id), "--hours", str(hours)], notes)
             action = "updated"
         else:
             if existing and not new:
                 raise Conflict(
-                    f"{date} already holds entry {', '.join(f'#{i}' for i in existing)} in Harvest — "
+                    f"{date} already holds entry {', '.join(f'#{i}' for i in existing)} in {SERVICE['name']} — "
                     "reload the page, or pick “New entry” to add another one"
                 )
-            task_id = self.task_for(project_id)
-            entry = harvest_with_notes(
-                ["log", date, str(hours), "--project", str(project_id), "--task", str(task_id)], notes
-            )
+            project = self.project(project_id)
+            args = ["log", date, str(hours), "--project", str(project_id)]
+            if project["task_id"] is not None:
+                args += ["--task", str(project["task_id"])]
+            if SERVICE["billable"] and isinstance(project["billable"], bool):
+                args += ["--billable", "true" if project["billable"] else "false"]
+            entry = service_with_notes(args, notes)
             action = "created"
         print(json.dumps({"action": action, "date": date, "hours": hours, "entry_id": entry["id"]}), flush=True)
         result = {"action": action, "entry": entry}
-        # Harvest already holds the entry; a failed write-back must not hide that.
+        # The tracker already holds the entry; a failed write-back must not hide that.
         try:
             with self.lock:
                 batch = self.batch()
@@ -261,7 +321,7 @@ class App:
                 row.update(hours=hours, notes=notes, entry_id=entry["id"], project_id=project_id)
                 write_json(self.opts.batch, batch)
         except (OSError, ValueError) as e:
-            result["warning"] = f"entry #{entry['id']} is in Harvest, but {self.opts.batch} was not updated: {e}"
+            result["warning"] = f"entry #{entry['id']} is in {SERVICE['name']}, but {self.opts.batch} was not updated: {e}"
         return result
 
 
@@ -301,7 +361,7 @@ def make_handler(app, host_ok):
                 self.send(400, {"error": str(e)})
             except Conflict as e:
                 self.send(409, {"error": str(e)})
-            except HarvestError as e:
+            except ServiceError as e:
                 self.send(502, {"error": str(e)})
 
         def do_GET(self):
@@ -325,10 +385,10 @@ def make_handler(app, host_ok):
                 self.send(200, {})
             elif url.path == "/api/entries":
                 project = parse_qs(url.query).get("project", [""])[0]
-                if not re.fullmatch(r"[0-9]{1,15}", project):
-                    self.send(400, {"error": "project must be a numeric id"})
+                if not re.fullmatch(SERVICE["id_text"], project):
+                    self.send(400, {"error": f"project must be a {SERVICE['name']} id"})
                     return
-                self.run(lambda: app.entries(int(project)))
+                self.run(lambda: app.entries(SERVICE["id_from_text"](project)))
             else:
                 self.send(404, {"error": "not found"})
 
@@ -352,9 +412,9 @@ def make_handler(app, host_ok):
                 return
             path = urlparse(self.path).path
             if path == "/api/project":
-                project_id = body.get("project_id")
-                if not is_int(project_id):
-                    self.send(400, {"error": "project_id must be a number"})
+                project_id = as_id(body.get("project_id"))
+                if project_id is None:
+                    self.send(400, {"error": f"project_id must be a {SERVICE['name']} id"})
                     return
                 self.run(lambda: (app.remember(project_id), {"project_id": project_id})[1])
             elif path == "/api/apply":
@@ -369,11 +429,13 @@ def make_handler(app, host_ok):
 
 
 def main():
+    global SERVICE
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("batch")
     ap.add_argument("--from", dest="date_from", required=True)
     ap.add_argument("--to", dest="date_to", required=True)
-    ap.add_argument("--project", type=int)
+    ap.add_argument("--service", choices=sorted(SERVICES), default="harvest")
+    ap.add_argument("--project")
     ap.add_argument("--repo", default="")
     ap.add_argument("--task-name", default="Programming")
     ap.add_argument("--port", type=int, default=0)
@@ -387,6 +449,11 @@ def main():
         ap.error("--from and --to must be YYYY-MM-DD")
     if end < start or (end - start).days > 62:
         ap.error("the window must run forward and span at most 63 days")
+    SERVICE = SERVICES[opts.service]
+    if opts.project is not None:
+        if not re.fullmatch(SERVICE["id_text"], opts.project):
+            ap.error(f"--project must be a {SERVICE['name']} id")
+        opts.project = SERVICE["id_from_text"](opts.project)
     try:
         problem = check_batch(read_json(opts.batch, []))
     except ValueError:

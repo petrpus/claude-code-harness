@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Worklog → Harvest</title>
+<title>Worklog</title>
 <style>
   :root { --bg:#f7f7f5; --fg:#1d1d1b; --muted:#6b6b66; --line:#dcdcd7; --card:#fff; --field:#fff;
           --accent:#f36c21; --accent-fg:#fff; --ok:#1f7a3d; --err:#b3261e; --changed:#fff4e8; }
@@ -64,7 +64,7 @@
 </head>
 <body>
 <main id="app">
-  <h1>Worklog → Harvest</h1>
+  <h1 id="title">Worklog</h1>
   <p class="sub" id="window">Loading…</p>
   <div class="bar">
     <label class="field">Project<select id="project"></select></label>
@@ -75,7 +75,7 @@
   <section class="card">
     <table>
       <thead><tr>
-        <th>Day</th><th>In Harvest now</th><th>Hours</th><th>Proposed notes</th><th>Action</th>
+        <th>Day</th><th id="now-head">In the tracker now</th><th>Hours</th><th>Proposed notes</th><th>Action</th>
       </tr></thead>
       <tbody id="rows"></tbody>
       <tfoot><tr>
@@ -93,7 +93,7 @@
     <button id="done" type="button">Done — close</button>
   </div>
   <p class="status" id="message"></p>
-  <p class="hint">Nothing reaches Harvest until you press a row's button or “Send all changes”. A day with an existing entry updates that entry; pick “New entry” to add another one instead. Hours take 1.5, 1,5 or 1:30.</p>
+  <p class="hint" id="hint"></p>
 </main>
 <script>
 "use strict";
@@ -106,6 +106,14 @@ const el = (tag, props = {}, ...kids) => {
   return n;
 };
 let state = null;
+const service = () => (state ? state.service : "the tracker");
+// Ids are opaque: Harvest's are numbers, Clockify's hex strings. The DOM only
+// holds their text, so map it back to the id the server sent.
+const projectId = () => {
+  const p = state && state.projects.find((x) => String(x.project_id) === $("project").value);
+  return p ? p.project_id : null;
+};
+const shortId = (id) => (typeof id === "string" && id.length > 8 ? "…" + id.slice(-6) : String(id));
 let entries = [];
 let entriesOk = false;
 let busy = false;
@@ -120,7 +128,7 @@ async function api(path, body) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {
-    throw new Error("The page's server has stopped. Run /worklog --harvest again; edits not sent yet are only on this page.");
+    throw new Error(`The page's server has stopped. Run /worklog ${state ? state.flag : ""} again; edits not sent yet are only on this page.`);
   }
   const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -146,6 +154,11 @@ function message(text, kind = "", retry = null) {
 
 async function load() {
   state = await api("/api/state");
+  document.title = `Worklog → ${state.service}`;
+  $("title").textContent = `Worklog → ${state.service}`;
+  $("now-head").textContent = `In ${state.service} now`;
+  $("hint").textContent = `Nothing reaches ${state.service} until you press a row's button or “Send all changes”. `
+    + "A day with an existing entry updates that entry; pick “New entry” to add another one instead. Hours take 1.5, 1,5 or 1:30.";
   $("window").textContent = `Window ${state.from} – ${state.to}. Proposals come from the commits; edit them, then send.`;
   $("task").textContent = state.task_name;
   const sel = $("project");
@@ -154,11 +167,11 @@ async function load() {
   for (const p of state.projects) {
     sel.append(el("option", {
       value: String(p.project_id),
-      textContent: p.task_id ? p.label : `${p.label} (no ${state.task_name} task)`,
-      disabled: !p.task_id,
+      textContent: !p.loggable ? `${p.label} (no ${state.task_name} task)` : p.task_id == null ? `${p.label} (no tasks)` : p.label,
+      disabled: !p.loggable,
     }));
   }
-  sel.value = state.project_id ? String(state.project_id) : "";
+  sel.value = state.project_id != null ? String(state.project_id) : "";
   for (const r of state.rows) {
     rowState.set(r.date, { hours: r.hours == null ? "" : fmt(r.hours), notes: r.notes, entryId: r.entry_id, target: undefined, status: null });
   }
@@ -166,17 +179,17 @@ async function load() {
 }
 
 async function loadEntries() {
-  const pid = Number($("project").value);
+  const pid = projectId();
   entries = [];
   entriesOk = false;
-  if (pid) {
+  if (pid != null) {
     try {
-      entries = await api(`/api/entries?project=${pid}`);
+      entries = await api(`/api/entries?project=${encodeURIComponent(pid)}`);
       entriesOk = true;
     } catch (e) {
       // Without the current entries every day would look empty and offer
       // "Create entry": keep every write disabled until a read succeeds.
-      message(`Could not read Harvest: ${e.message}`, "err", () => { message(""); loadEntries(); });
+      message(`Could not read ${service()}: ${e.message}`, "err", () => { message(""); loadEntries(); });
     }
   }
   render();
@@ -195,7 +208,7 @@ function targetOf(date) {
 function pending(date) {
   const rs = rowState.get(date);
   const h = parseHours(rs.hours);
-  if (busy || !entriesOk || !Number($("project").value) || h == null) return null;
+  if (busy || !entriesOk || projectId() == null || h == null) return null;
   const target = targetOf(date);
   if (target !== "new") {
     const e = entries.find((x) => x.id === target);
@@ -222,14 +235,14 @@ function render() {
     for (const e of list) {
       now.append(el("div", { className: "entry" },
         el("span", { className: "h", textContent: `${fmt(Number(e.hours))} h` }),
-        el("span", { className: "muted", textContent: ` · #${e.id}` }),
+        el("span", { className: "muted", textContent: ` · #${shortId(e.id)}`, title: String(e.id) }),
         el("div", { className: "n", textContent: e.notes || "" })));
     }
 
     const hours = el("input", { name: `hours-${r.date}`, value: rs.hours, inputMode: "decimal", placeholder: "h", ariaLabel: `${r.date} hours` });
     const notes = el("textarea", { name: `notes-${r.date}`, value: rs.notes, ariaLabel: `${r.date} notes` });
     const target = el("select", { name: `target-${r.date}`, ariaLabel: `${r.date} target` });
-    for (const e of list) target.append(el("option", { value: String(e.id), textContent: `Update #${e.id} (${fmt(Number(e.hours))} h)` }));
+    for (const e of list) target.append(el("option", { value: String(e.id), textContent: `Update #${shortId(e.id)} (${fmt(Number(e.hours))} h)` }));
     target.append(el("option", { value: "new", textContent: "New entry" }));
     target.value = String(targetOf(r.date));
     target.hidden = list.length === 0;
@@ -254,7 +267,10 @@ function render() {
     };
     hours.addEventListener("input", () => { rs.hours = hours.value; refresh(); updateTotals(); });
     notes.addEventListener("input", () => { rs.notes = notes.value; fit(notes); refresh(); });
-    target.addEventListener("change", () => { rs.target = target.value === "new" ? "new" : Number(target.value); refresh(); });
+    target.addEventListener("change", () => {
+      rs.target = target.value === "new" ? "new" : (list.find((e) => String(e.id) === target.value) || {}).id;
+      refresh();
+    });
     button.addEventListener("click", () => applyRows([r.date]));
     refresh();
     tbody.append(tr);
@@ -287,7 +303,7 @@ function updateSendAll() {
 }
 
 async function applyRows(dates) {
-  const pid = Number($("project").value);
+  const pid = projectId();
   const todo = dates.map((d) => pending(d)).filter(Boolean);
   busy = true;
   $("project").disabled = true;
@@ -301,8 +317,8 @@ async function applyRows(dates) {
       rs.target = res.entry.id;
       const verb = res.action === "created" ? "Created" : "Updated";
       rs.status = res.warning
-        ? { kind: "err", text: `${verb} #${res.entry.id} — ${res.warning}` }
-        : { kind: "ok", text: `${verb} #${res.entry.id}` };
+        ? { kind: "err", text: `${verb} #${shortId(res.entry.id)} — ${res.warning}` }
+        : { kind: "ok", text: `${verb} #${shortId(res.entry.id)}` };
     } catch (e) {
       failed += 1;
       rs.status = { kind: "err", text: e.message };
@@ -312,14 +328,14 @@ async function applyRows(dates) {
   busy = false;
   $("project").disabled = false;
   for (const id of ["done", "confirm-yes", "confirm-no"]) $(id).disabled = false;
-  message(failed ? "Stopped at the first refused row; the rows before it are in Harvest." : "", failed ? "err" : "");
+  message(failed ? `Stopped at the first refused row; the rows before it are in ${service()}.` : "", failed ? "err" : "");
   await loadEntries();
 }
 
 $("project").addEventListener("change", async () => {
-  const pid = Number($("project").value);
+  const pid = projectId();
   for (const rs of rowState.values()) { rs.target = undefined; rs.status = null; }
-  if (pid) {
+  if (pid != null) {
     try { await api("/api/project", { project_id: pid }); } catch (e) { message(e.message, "err"); }
   }
   await loadEntries();
@@ -327,7 +343,7 @@ $("project").addEventListener("change", async () => {
 
 $("send-all").addEventListener("click", () => {
   const n = pendingDates().length;
-  $("confirm-text").textContent = `Send ${n} ${n === 1 ? "entry" : "entries"} to Harvest?`;
+  $("confirm-text").textContent = `Send ${n} ${n === 1 ? "entry" : "entries"} to ${service()}?`;
   $("confirm").classList.add("open");
   $("send-all").hidden = true;
 });

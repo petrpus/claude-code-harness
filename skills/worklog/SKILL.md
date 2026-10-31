@@ -1,7 +1,7 @@
 ---
 name: worklog
-description: Generate a per-day, per-author time-tracking summary from git commits across all local and remote branches. Optional integer argument = days back (default 3). With --harvest, open a local page to review the days against Harvest and create or update the entries there.
-argument-hint: "[days-back, default 3] [--harvest]"
+description: Generate a per-day, per-author time-tracking summary from git commits across all local and remote branches. Optional integer argument = days back (default 3). With --harvest or --clockify, open a local page to review the days against that time tracker and create or update the entries there.
+argument-hint: "[days-back, default 3] [--harvest|--clockify]"
 ---
 
 # /worklog
@@ -11,17 +11,23 @@ Daily commit-history digest for time tracking. Walks `git log --all` (local + re
 ## Inputs
 
 - A number — optional integer **X**, the number of days back from today (inclusive). Defaults to `3` (= today and the previous 3 days, so 4 calendar days).
-- `--harvest` — after the digest, log the days into Harvest through the
-  `## Harvest mode` flow below. The integer may come before or after the flag.
+- `--harvest` or `--clockify` — after the digest, log the days into that time
+  tracker through the `## Time-tracker mode` flow below. The integer may come
+  before or after the flag; the two flags exclude each other.
 
 ## Behavior
 
 ### 1. Parse the argument
 
 ```bash
-HARVEST=0; X=""
+TRACKER=""; X=""
 for a in $ARGUMENTS; do
-  case "$a" in --harvest) HARVEST=1 ;; *) X="$a" ;; esac
+  case "$a" in
+    --harvest|--clockify)
+      [[ -z "$TRACKER" || "$TRACKER" == "${a#--}" ]] || { echo "worklog: --harvest and --clockify exclude each other"; exit 1; }
+      TRACKER="${a#--}" ;;
+    *) X="$a" ;;
+  esac
 done
 X="${X:-3}"
 [[ "$X" =~ ^[0-9]+$ ]] || { echo "worklog: argument must be a non-negative integer"; exit 1; }
@@ -96,7 +102,7 @@ If multiple authors, render one `### {author}` section per author, days in desce
 
 ### 6. Ask about saving
 
-With `--harvest`, skip this step and continue with `## Harvest mode`.
+With `--harvest` or `--clockify`, skip this step and continue with `## Time-tracker mode`.
 
 After printing, ask the user (one sentence, no menu) whether to save the output as a markdown file to the project's `tmp/` directory.
 
@@ -110,37 +116,44 @@ out="tmp/worklog-$(date -d "${X} days ago" +%Y-%m-%d)_to_$(date +%Y-%m-%d).md"
 
 Filename pattern: `tmp/worklog-{from}_to_{to}.md`. If the file already exists, overwrite without prompting (it's a regenerated artifact, not history).
 
-## Harvest mode (`--harvest`)
+## Time-tracker mode (`--harvest` / `--clockify`)
 
-Turns the digest into Harvest time entries for **the user running the skill**
-(their own commits only — never log another author's work), on the
-**Programming** task. The user reviews and sends them on a local page:
-a project select, what Harvest already holds for that project and task in the
-window, and an editable proposal per day with a button that creates the entry
-or updates the existing one.
+Turns the digest into time entries for **the user running the skill** (their
+own commits only — never log another author's work), on the **Programming**
+task, in Harvest (`--harvest`) or Clockify (`--clockify`). The user reviews
+and sends them on a local page: a project select, what the tracker already
+holds for that project and task in the window, and an editable proposal per
+day with a button that creates the entry or updates the existing one.
 
-Harvest is reached only through `harvest.sh` (bundled, curl + jq, no MCP).
-`harvest-app.py` (python3, standard library only) serves the page on
-127.0.0.1 and calls `harvest.sh` for every read and write, so the token never
-reaches the page, the chat or this skill. Both scripts live in this skill's
+Each tracker is reached only through its bundled script, `harvest.sh` or
+`clockify.sh` (curl + jq, no MCP). Both have the same commands (`setup`, `me`,
+`projects`, `entries`, `log`, `update`, `delete`) and output shapes. Below,
+`{tracker}` is `harvest` or `clockify` and `{tracker}.sh` its script.
+`worklog-app.py` (python3, standard library only) serves the page on
+127.0.0.1 and calls the script for every read and write, so the token never
+reaches the page, the chat or this skill. The scripts live in this skill's
 directory and are not on `PATH`: call them by the full path shown in each
 step. `tmp/` is the consumer project's gitignored `tmp/`.
 
 ### 0. Credentials
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh me
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/{tracker}.sh me
 ```
 
-Exit 1 with "no token" or "no account id" means there is no config yet (exit 1
-also covers a missing curl or jq, or a network failure — say which). Exit 2
-with HTTP 401 means the token expired or was revoked: `setup` again replaces
-it. Tell the user, in two numbered steps, to:
+Exit 1 with "no token", "no API key", "no account id" or "no workspace id"
+means there is no config yet (exit 1 also covers a missing curl or jq, or a
+network failure — say which). Exit 2 with HTTP 401 means the token or key
+expired or was revoked: `setup` again replaces it. Tell the user, in two
+numbered steps, how to get a token and then to run `setup` in **their own
+terminal** (not through `!`: the token goes into a hidden prompt, never onto
+a command line or into the conversation). Stop here until `me` succeeds.
+
+**Harvest:**
 
 1. create a personal access token at https://id.getharvest.com/developers
    (Create new personal access token) and copy it;
-2. run, in **their own terminal** (not through `!`: the token goes into a
-   hidden prompt, never onto a command line or into the conversation):
+2. run:
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh setup [account-name]
@@ -148,12 +161,29 @@ ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh setup [account-name]
 
 It writes `~/.config/harvest/env` (mode 0600) with the token and the resolved
 account id (exact name or id first, name substring as a fallback; the
-argument is only needed when the token sees several accounts). Stop here until
-`harvest.sh me` succeeds.
+argument is only needed when the token sees several accounts).
+
+**Clockify:**
+
+1. in Clockify, open Profile settings → Preferences → Advanced → Manage API
+   keys, click Generate new, name the key and copy it (it is shown once; a
+   workspace on its own subdomain needs a key generated for that workspace);
+2. run:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/clockify.sh setup [workspace-name]
+```
+
+It writes `~/.config/clockify/env` (mode 0600) with the key, the resolved
+workspace (exact name or id first, name substring as a fallback; the argument
+is only needed when the key sees several workspaces), the user id and the
+time zone from the Clockify profile. A workspace on a regional server needs
+that server's API base on the `setup` line, which `setup` then stores, e.g.
+`CLOCKIFY_API_BASE=https://euc1.clockify.me/api/v1`.
 
 ### 1. Build the proposals
 
-Write `tmp/worklog-harvest-{from}_to_{to}.json`, one row per day the user has
+Write `tmp/worklog-{tracker}-{from}_to_{to}.json`, one row per day the user has
 commits (or session-log activity with no commit — say so in the notes):
 
 ```json
@@ -174,16 +204,18 @@ commits (or session-log activity with no commit — say so in the notes):
 ### 2. Guess the project
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest.sh projects --text
+${CLAUDE_PLUGIN_ROOT}/skills/worklog/{tracker}.sh projects --text
 ```
 
 Pick the project that fits the repo from context (CLAUDE.md, README, the
 remote's name, the client the code is for) and pass it as `--project`. It is
 only the default of the select: a project the user chose earlier for this
-repo (remembered in `~/.config/harvest/projects.json`) wins, and the user can
-change it on the page. Projects without an active Programming task show
-disabled. If `projects` prints nothing, or no project has an active
-Programming task, there is nothing the page could log to — stop and say so.
+repo (remembered in `~/.config/{tracker}/projects.json`) wins, and the user
+can change it on the page. Projects without an active Programming task show
+disabled. In Clockify, a project with no tasks at all (`(no tasks)` in the
+listing) is logged without a task. If `projects` prints nothing, or no
+project can be logged to, there is nothing the page could do — stop and say
+so.
 
 ### 3. Open the page
 
@@ -192,8 +224,8 @@ re-invoked when it exits; `--open` makes it open the page in the default
 browser itself:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/skills/worklog/harvest-app.py \
-  tmp/worklog-harvest-{from}_to_{to}.json --from {from} --to {to} \
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/worklog/worklog-app.py \
+  tmp/worklog-{tracker}-{from}_to_{to}.json --service {tracker} --from {from} --to {to} \
   --project {project_id} --repo "$(git rev-parse --show-toplevel)" --open
 ```
 
@@ -208,30 +240,41 @@ After that, do not poll: wait for the background task to finish.
 The page lists every day of the window, newest first. A day that already has a
 Programming entry in that project shows it, and the row's button updates it
 (the target select can switch to a new entry instead); a day without one
-creates it. The server re-reads the day from Harvest before every write and
-refuses a plain create on a day that already has an entry (the user must pick
-“New entry” for a second one), so a stale page cannot log a day twice. If the
-entries cannot be read, every button stays disabled until a retry succeeds.
-Every write goes through `harvest.sh log` / `update`, prints one JSON line on
-the server's stdout and writes `entry_id` back into the proposals file.
+creates it. The server re-reads the day from the tracker before every write
+and refuses a plain create on a day that already has an entry (the user must
+pick “New entry” for a second one), so a stale page cannot log a day twice. If
+the entries cannot be read, every button stays disabled until a retry
+succeeds. Every write goes through `{tracker}.sh log` / `update`, prints one
+JSON line on the server's stdout and writes `entry_id` back into the
+proposals file.
+
+**Clockify stores intervals, not hours.** A new entry starts at 09:00 in the
+user's Clockify time zone, or right after the user's last entry of that day
+when that ends later (`CLOCKIFY_DAY_START=HH:MM` moves the 09:00). New hours
+keep an entry's start and move its end. An update keeps the entry's tags,
+billable flag and custom fields; a new entry is billable when its project is.
+Entries still running are not shown and cannot be updated.
 
 ### 4. Report
 
 When the server exits (`{"exit": "done"}`, or `{"exit": "idle"}` after 45
 minutes without a request — an open page pings it every minute, so idle means
-the tab was closed), read its stdout and report what reached Harvest:
+the tab was closed), read its stdout and report what reached the tracker:
 date, hours, created/updated, entry id. If nothing was sent, say so. A row
-that Harvest refused showed its message on the page; repeat it as is — a 422
-usually means a locked period or a missing assignment, which the user has to
-fix in Harvest. Undo is per entry: `harvest.sh delete <entry_id>`.
+that the tracker refused showed its message on the page; repeat it as is. In
+Harvest a 422 usually means a locked period or a missing assignment; in
+Clockify a 400 usually means a locked period or a required field the
+workspace demands; a 429 is the rate limit, so wait and send again. The user
+has to fix the first two in the tracker. Undo is per entry:
+`{tracker}.sh delete <entry_id>`.
 
 ### Rules
 
-- Every write to Harvest is a click of the user on the page. The skill never
-  calls `log`, `update`, `log-batch` or `delete` itself, except `delete` when
-  the user asks for it in the chat.
+- Every write to the tracker is a click of the user on the page. The skill
+  never calls `log`, `update`, `log-batch` or `delete` itself, except `delete`
+  when the user asks for it in the chat.
 - The page and the server never see the token; it stays in
-  `~/.config/harvest/env`, read only by `harvest.sh`.
+  `~/.config/{tracker}/env`, read only by `{tracker}.sh`.
 - The server binds 127.0.0.1 only and exits on Done or when idle. Never expose
   it on another interface or forward its port. The key reaches the browser on
   its command line, so another account on the same machine could read it from
@@ -260,8 +303,8 @@ fix in Harvest. Undo is per entry: `harvest.sh delete <entry_id>`.
 - **Inventing work.** If a day has only a "chore: bump deps" commit, say so honestly — don't pad.
 - **Translating the summary.** Keep the language of the commits; don't auto-translate Czech → English or vice versa.
 - **Writing to `/tmp` instead of `tmp/`.** The project-local `tmp/` dir matches existing harness convention (`tmp/.last-verify-status`).
-- **Logging straight from the digest.** Harvest mode always goes through the page, where the user presses the button — an estimate the user never saw is not a time entry.
-- **Putting the token in the page or the chat.** `harvest.sh setup` runs in the user's terminal; the skill only ever sees `harvest.sh me` succeed or fail.
+- **Logging straight from the digest.** Time-tracker mode always goes through the page, where the user presses the button — an estimate the user never saw is not a time entry.
+- **Putting the token in the page or the chat.** `{tracker}.sh setup` runs in the user's terminal; the skill only ever sees `{tracker}.sh me` succeed or fail.
 
 ## Edge cases
 
@@ -270,6 +313,6 @@ fix in Harvest. Undo is per entry: `harvest.sh delete <entry_id>`.
 - **`git fetch` failed (offline)** → proceed with local refs, mention it in a one-line preamble so the user knows the digest may miss teammates' work.
 - **Detached HEAD / shallow clone** → still works, but warn that history may be incomplete.
 - **X = 0** → only today's commits.
-- **`--harvest` with no commits by the user in the window** → say so and stop; there is nothing to log.
-- **`--harvest` and `harvest.sh projects` prints `[]`** (no active assignments) → the user has no active project in that Harvest account; stop and say so.
-- **`--harvest` without python3** → say so; the page needs it. `harvest.sh log` / `update` still work by hand.
+- **`--harvest` / `--clockify` with no commits by the user in the window** → say so and stop; there is nothing to log.
+- **`{tracker}.sh projects` prints `[]`** (no active assignments in Harvest, no active project in the Clockify workspace) → stop and say so.
+- **`--harvest` / `--clockify` without python3** → say so; the page needs it. `{tracker}.sh log` / `update` still work by hand.
