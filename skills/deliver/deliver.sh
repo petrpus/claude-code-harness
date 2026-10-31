@@ -58,7 +58,8 @@
 # ones as skipped, the caps, a cost estimate of ~$6-8 per remaining issue —
 # and exits non-zero when a hard check fails. --json prints the same as one
 # object: {ok, checks:[{name,status,detail}], issues:[], skipped:[], caps,
-# estimate_usd:{low,high}}. A real run creates the five labels
+# estimate_usd:{low,high}}; each planned issue carries the flags its body
+# declares (`Flag: NAME (default off|on)`, #132) as flags:[{name,default}]. A real run creates the five labels
 # (map, prd, ready-for-agent, needs-human, needs-triage) before it walks the
 # graph.
 # --status prints the newest run's status.json for --map (read-only); --stop
@@ -475,8 +476,14 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
               [[ "$PF_PROGRESS" -eq 1 ]] || break
             done
             for i in "${PF_ORDER[@]}"; do
+              # Declared flags (#132): read-only issue view, so the human sees
+              # what ships dark before approving. Unreadable issue: no flags.
+              PF_FLAGS="$(forge_issue_json "${PLAN_IDS[$i]#\#}" 2>/dev/null | jq -r '.body // ""' 2>/dev/null | issue_flags \
+                | jq -Rsc 'split("\n") | map(select(length>0) | split("\t") | {name:.[0], default:.[1]})')"
+              [[ -n "$PF_FLAGS" ]] || PF_FLAGS="[]"
               PF_ISSUES="$(jq -c --arg id "${PLAN_IDS[$i]}" --arg t "$(map_line_title "${PLAN_ROW_RAW[$i]}")" --arg a "${PLAN_ROW_AFTER[$i]}" \
-                '. + [{id:$id, number:($id|ltrimstr("#")|tonumber), title:$t, after:($a|split(" ")|map(select(length>0)))}]' <<<"$PF_ISSUES")"
+                --argjson flags "$PF_FLAGS" \
+                '. + [{id:$id, number:($id|ltrimstr("#")|tonumber), title:$t, after:($a|split(" ")|map(select(length>0))), flags:$flags}]' <<<"$PF_ISSUES")"
             done
             PF_REMAINING="${#PF_ORDER[@]}"
           fi
@@ -523,7 +530,8 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
     done
     echo "Run plan (work branch: ${BASE:-?}):"
     echo "Integration: $PF_EFF_VIA$([[ "$PF_EFF_VIA" == none ]] || echo "${PF_INTO:+ into $PF_INTO}")$([[ "$PF_WB_ACTION" == current ]] || echo " (work branch: $PF_WB_ACTION)")"
-    jq -r '.[] | "  \(.id) \(.title)" + (if (.after|length)>0 then " (after: \(.after|join(" ")))" else "" end)' <<<"$PF_ISSUES"
+    jq -r '.[] | "  \(.id) \(.title)" + (if (.after|length)>0 then " (after: \(.after|join(" ")))" else "" end)
+                  + ((.flags // []) | map(" [flag: \(.name) \(.default)]") | join(""))' <<<"$PF_ISSUES"
     if [[ "$PF_SKIPPED" != "[]" ]]; then
       echo "Skipped (already ticked):"
       jq -r '.[] | "  \(.id) \(.title)"' <<<"$PF_SKIPPED"

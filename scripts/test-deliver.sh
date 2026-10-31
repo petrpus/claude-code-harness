@@ -237,6 +237,29 @@ CHARTER4="$(charter_from_issue "$WORK/issue4.json" "$WORK/map1.plan" 3)"
   && ok "charter: an issue without sections still yields a checkable criterion" \
   || note "charter: fallback criterion missing"
 
+# #132: a `Flag:` line in the issue body declares a flag the change ships behind
+[[ "$(printf 'x\nFlag: NEW_CHECKOUT (default off)\r\n  flag:beta_ui (Default ON)\nFlag: BARE\nnot a Flag: line\nFlags: NOPE\n' | issue_flags)" \
+    == $'NEW_CHECKOUT\toff\nbeta_ui\ton\nBARE\toff' ]] \
+  && ok "issue_flags: Flag: lines parse (key case-insensitive, CR stripped, default off when unstated)" \
+  || note "issue_flags: '$(printf 'Flag: NEW_CHECKOUT (default off)\n' | issue_flags | tr '\t\n' ':|')'"
+[[ -z "$(printf 'Example:\n```\nFlag: QUOTED (default on)\n```\n~~~md\nFlag: TILDE\n~~~\n' | issue_flags)" ]] \
+  && [[ "$(printf '```\nFlag: IN (default on)\n```\nFlag: OUT\n' | issue_flags)" == $'OUT\toff' ]] \
+  && ok "issue_flags: a Flag: line inside a fenced code block is an example, not a declaration" \
+  || note "issue_flags (fenced): '$(printf '```\nFlag: IN\n```\nFlag: OUT\n' | issue_flags | tr '\t\n' ':|')'"
+[[ "$(printf 'Flag: A\nFlag: B (default on)\nFlag: A (default on)\n' | issue_flags)" == $'A\toff\nB\ton' ]] \
+  && ok "issue_flags: a name declared twice keeps its first declaration" \
+  || note "issue_flags (duplicate): '$(printf 'Flag: A\nFlag: A (default on)\n' | issue_flags | tr '\t\n' ':|')'"
+jq -n '{number:5,title:"Dark launch",url:"u",
+        body:"## What to build\nShip the new checkout dark.\n\nFlag: NEW_CHECKOUT (default off)\n\n## Acceptance criteria\n- [ ] new checkout works with the flag on"}' \
+  > "$WORK/issue5.json"
+CHARTER5="$(charter_from_issue "$WORK/issue5.json" "$WORK/map1.plan" 3)"
+[[ "$(_md_section 'Declared flags' <<<"$CHARTER5" | _trim_blank)" == "- Flag: NEW_CHECKOUT (default off)" ]] \
+  && ok "charter: a declared flag gets its own '## Declared flags' section" \
+  || note "charter: declared flags section: $(_md_section 'Declared flags' <<<"$CHARTER5" | tr '\n' '|')"
+! grep -q '^## Declared flags' "$WORK/charter1.md" \
+  && ok "charter: no flag declared, no '## Declared flags' section" \
+  || note "charter: flag section without a Flag: line"
+
 # ===========================================================================
 # Unit: review.sh
 # ===========================================================================
@@ -2555,6 +2578,18 @@ run_deliver pfint -- --plan-only --json --via ff; RC=$?
   && pojq pfint '.checks[]|select(.name=="integration")|.detail' | grep -q 'ADR-0016' \
   && ok "plan-only: --via ff into the default branch fails the integration check" \
   || note "plan-only ff into main: rc=$RC $(pojq pfint '.checks[]|select(.name=="integration")')"
+# #132: declared flags are listed per issue, so the human sees what ships dark
+new_fixture pfflag
+jq '.body += "\n\nFlag: NEW_CHECKOUT (default off)"' "$WORK/pfflag/gh/issues/1.json" > "$WORK/pfflag/x" && mv "$WORK/pfflag/x" "$WORK/pfflag/gh/issues/1.json"
+run_deliver pfflag -- --plan-only --json; RC=$?
+[[ "$RC" -eq 0 ]] \
+  && [[ "$(pojq pfflag '[.issues[]|"\(.id)=\(.flags|map("\(.name):\(.default)")|join(","))"]|join(" ")')" == "#1=NEW_CHECKOUT:off #2=" ]] \
+  && ok "plan-only --json: each issue carries its declared flags (empty array when none)" \
+  || note "plan-only flags: rc=$RC $(pojq pfflag '[.issues[]|{id,flags}]' | tr '\n' ' ')"
+run_deliver pfflag -- --plan-only; RC=$?
+grep -q '#1 feat(a): first feature \[flag: NEW_CHECKOUT off\]' "$WORK/pfflag/out" && ! grep -q '#2 .*\[flag' "$WORK/pfflag/out" \
+  && ok "plan-only text: a declared flag is shown on its issue's line" \
+  || note "plan-only flag text: $(grep '#1' "$WORK/pfflag/out" | head -2 | tr '\n' '|')"
 
 # a ticked issue is skipped, not planned or costed
 new_fixture pf2

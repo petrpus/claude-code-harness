@@ -117,6 +117,10 @@ can (state machine, reducer, schema, type shape), inline it and note briefly tha
 it came from a prototype. Trim to the decision-rich parts — not a working demo,
 just the important bits.
 
+If the slice ships dark, add a line of its own: `Flag: <NAME> (default off)`.
+The harness carries it into the charter, and the verifier then treats the
+default-off path as spec rather than as a shortcut.
+
 ## Acceptance criteria
 
 - [ ] Criterion 1

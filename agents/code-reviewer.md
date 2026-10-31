@@ -82,6 +82,10 @@ For each file in the diff, walk through:
       assignment
 - [ ] Guards live in a `checkGuards` helper, not inline in the route
 - [ ] New enum values are in the spec (`docs/spec/`)
+- [ ] A flag the issue declares (`Flag: <NAME> (default off|on)`) keeps that
+      name and default, and tests exercise both branches: flag on and off
+- [ ] A flag the issue does not declare that gates the whole change is a 🟠
+      issue: suggest declaring it in the issue or enabling the path
 
 #### Server / data layer
 
