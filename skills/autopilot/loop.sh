@@ -269,7 +269,9 @@ elif [[ "$RESUME" -eq 1 ]]; then
   LATEST_LOG="$(ls -t "$STATE_DIR"/run-*.jsonl 2>/dev/null | head -1)"
   if [[ -n "$LATEST_LOG" ]]; then
     RUN_ID="$(basename "$LATEST_LOG" .jsonl)"; RUN_ID="${RUN_ID#run-}"
-    ITER="$(jq -s 'map(.iter // 0) | max // 0' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
+    # A `usage_limit` row (#140) resets the count to the iterations that
+    # ran: the cut-short one's call rows carry its number but it never ran.
+    ITER="$(jq -s 'reduce .[] as $r (0; if $r.phase == "usage_limit" then ($r.iter // 0) else ([., ($r.iter // 0)] | max) end)' "$LATEST_LOG" 2>/dev/null)"; ITER="${ITER:-0}"
     TOTAL_COST="$(jq -s '[.[] | select(.phase!="iteration") | .cost_usd // 0] | add // 0' "$LATEST_LOG" 2>/dev/null)"; TOTAL_COST="${TOTAL_COST:-0}"
     # #78's time cap must survive a resume too — restore the run's original
     # start time from the earliest ts in its own log rather than the current
@@ -484,20 +486,39 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
 #     and tick count — the rerun's first iteration diffs its gates from that
 #     base and counts ticks from that count, so the work is gated, not
 #     waved through (the checkout is left clean, as /deliver requires).
+#     The secret scan runs before that commit: work it flags is discarded,
+#     never committed unscanned into history a later push would carry.
+#   - Inside an iteration (any phase but the initial PLAN), the cut-short
+#     iteration is uncharged: ITER drops back and a `usage_limit` run-log
+#     row records the count, which --resume-run restores from.
 # Never returns.
 usage_limit_stop() {
-  local phase="$1"
+  local phase="$1" hits
   log_err "usage limit hit during $phase: ${AGENT_LAST_USAGE_LIMIT_MSG:-} — stopping; rerun after the reset to continue (exit 7)."
   if [[ "$phase" == "plan" && -f "$PLAN_FILE" ]]; then
     mv -f "$PLAN_FILE" "$PLAN_FILE.usage-limited" 2>/dev/null || rm -f "$PLAN_FILE"
   fi
   if [[ -n "${ITER_GATE_BASE:-}" ]]; then
-    jq -cn --arg base "$ITER_GATE_BASE" --argjson ticked "${TICKED_BEFORE:-0}" \
-      '{base_sha:$base, ticked_before:$ticked}' > "$PENDING_GATE_FILE" 2>/dev/null || true
-    git add -A >/dev/null 2>&1 \
-      && git commit -q -m "autopilot: iteration $ITER (wip, usage-limited)" >/dev/null 2>&1 || true
-    # The cut-short iteration did not run: status.json counts the ones that did.
+    git add -A >/dev/null 2>&1
+    if ! git diff --cached --quiet 2>/dev/null; then
+      if hits="$(secret_scan)"; then
+        git commit -q -m "autopilot: iteration $ITER (wip, usage-limited)" >/dev/null 2>&1 || true
+      else
+        log_err "the cut-short work fails the secret scan — discarded, not committed: $(printf '%s' "$hits" | head -1)"
+        append_feedback "secret" "A usage limit cut the last attempt short, and its work was discarded: the secret scan flagged it ($(printf '%s' "$hits" | head -1)). Redo the item without committing credentials."
+        git reset -q --hard HEAD >/dev/null 2>&1 || true
+      fi
+    fi
+    if [[ "$(git rev-parse HEAD 2>/dev/null)" != "$ITER_GATE_BASE" ]]; then
+      jq -cn --arg base "$ITER_GATE_BASE" --argjson ticked "${TICKED_BEFORE:-0}" \
+        '{base_sha:$base, ticked_before:$ticked}' > "$PENDING_GATE_FILE" 2>/dev/null || true
+    fi
+  fi
+  if [[ "$phase" != "plan" && "$ITER" -gt 0 ]]; then
+    # The cut-short iteration did not run: status.json and a resume count
+    # the ones that did.
     ITER=$(( ITER - 1 ))
+    logline "usage_limit" "-" 0 0 0 0 7 "stopped"
   fi
   write_status "usage-limited" "${AGENT_LAST_USAGE_LIMIT_MSG:-usage limit}"; exit 7
 }
@@ -920,7 +941,10 @@ while :; do
   # iteration's gates diff from the commit before it and count ticks from
   # the count before it, so the work is gated together with this BUILD's.
   # A base that is no longer an ancestor of HEAD (history rewritten since)
-  # is ignored. Consumed either way: one iteration takes it over.
+  # is dropped here. A valid one stays on disk until BUILD takes it over
+  # (below): an iteration that replans and `continue`s before BUILD, or a
+  # limit that hits that replan, must not lose it — that would wave the
+  # WIP work past the gates.
   PENDING_BASE=""
   if [[ -f "$PENDING_GATE_FILE" ]]; then
     _pb="$(jq -r '.base_sha // ""' "$PENDING_GATE_FILE" 2>/dev/null)"
@@ -928,8 +952,9 @@ while :; do
     if [[ -n "$_pb" && "$_pt" =~ ^[0-9]+$ ]] && git merge-base --is-ancestor "$_pb" HEAD 2>/dev/null; then
       PENDING_BASE="$_pb"; TICKED_BEFORE="$_pt"
       log_err "gating the work a usage limit left ungated (since ${_pb:0:7}) in this iteration."
+    else
+      rm -f "$PENDING_GATE_FILE"
     fi
-    rm -f "$PENDING_GATE_FILE"
   fi
 
   # S4A: reconcile the per-slice ladder state against the CURRENT plan before
@@ -1070,6 +1095,9 @@ while :; do
   # add/commit and can no longer hide its own changes inside a commit).
   ITER_BASE_SHA="${PENDING_BASE:-$(git rev-parse HEAD)}"
   ITER_GATE_BASE="$ITER_BASE_SHA"
+  # From here this iteration's gates own the pending base (#140); a limit
+  # from now on re-records it in usage_limit_stop.
+  rm -f "$PENDING_GATE_FILE"
   BUILD_COST_START="$TOTAL_COST"
   run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
   # #96: a BUILD that ran out of --max-turns left its work half done in the

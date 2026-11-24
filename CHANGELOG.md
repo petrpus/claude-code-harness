@@ -17,16 +17,19 @@ Patch release: a usage limit no longer parks a `/deliver` issue.
   the branch (#140).
   - `agent.sh` sets `AGENT_LAST_USAGE_LIMIT` / `AGENT_LAST_USAGE_LIMIT_MSG`
     on a failed call (non-zero exit or `is_error`) whose short reply is a
-    usage- or rate-limit notice. A successful reply that only quotes such a
-    notice does not count.
+    usage- or rate-limit notice (an API `rate_limit_error` counts too). A
+    successful reply that only quotes such a notice does not count.
   - `loop.sh` stops at once with **exit 7**, state `usage-limited` (the
     notice in `status.json .usage_limit`). It runs no replan, records no
     slice failure and writes no iteration row; the call's run-log row has
-    verdict `usage-limit`. Work BUILD had already done goes into a
-    `(wip, usage-limited)` commit. The new `pending-gate.json` makes the next
-    run's first iteration gate that work: its diff starts at the cut-short
-    iteration's base, so the work is not waved through. A half-written plan
-    from a cut-short PLAN call is moved aside.
+    verdict `usage-limit`. The cut-short iteration is not counted, and
+    `--resume-run` restores the count without it. Work BUILD had already
+    done goes into a `(wip, usage-limited)` commit once the secret scan
+    passes it; work the scan flags is discarded instead. The new
+    `pending-gate.json` makes the next run gate that work: its diff starts
+    at the cut-short iteration's base, and a replan before BUILD keeps the
+    file, so the work is not waved through. A half-written plan from a
+    cut-short PLAN call is moved aside.
   - `/deliver` treats autopilot's exit 7, and a reviewer call that hits the
     limit, as **exit 7, state `usage_limited`**. The issue is not parked.
     `events.jsonl` gets a row with the notice, and `--resume` after the reset

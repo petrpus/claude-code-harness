@@ -100,7 +100,8 @@ emit() { # result
 # limit notice and exit 1. STUB_LIMIT_PHASE (plan|build|verify) names the
 # phase that hits it, once: STUB_LIMIT_MARKER records that it fired.
 # STUB_LIMIT_PLAIN=1 prints the notice as plain text instead of a JSON
-# result; STUB_LIMIT_PARTIAL=1 has a PLAN call write half a plan first.
+# result; STUB_LIMIT_PARTIAL=1 has a PLAN call write half a plan, or a BUILD
+# call half its work, first (STUB_LIMIT_SECRET=1: that work holds a secret).
 if [[ -n "${STUB_LIMIT_PHASE:-}" && ! -f "${STUB_LIMIT_MARKER:?}" ]]; then
   ph=other
   case "$prompt" in
@@ -111,6 +112,10 @@ if [[ -n "${STUB_LIMIT_PHASE:-}" && ! -f "${STUB_LIMIT_MARKER:?}" ]]; then
   if [[ "$ph" == "$STUB_LIMIT_PHASE" ]]; then
     touch "$STUB_LIMIT_MARKER"
     [[ "$ph" == plan && -n "${STUB_LIMIT_PARTIAL:-}" ]] && printf -- '# plan\n- [ ] slice 1\n' > "$plan"
+    if [[ "$ph" == build && -n "${STUB_LIMIT_PARTIAL:-}" ]]; then
+      mkdir -p src && echo "half done" > src/half.txt
+      [[ -n "${STUB_LIMIT_SECRET:-}" ]] && printf 'token = "AKIAABCDEFGHIJKLMNOP"\n' >> src/half.txt
+    fi
     notice="You've hit your 5-hour limit · resets 5:30pm (Europe/Prague)"
     if [[ -n "${STUB_LIMIT_PLAIN:-}" ]]; then
       printf '%s\n' "$notice"
@@ -1841,6 +1846,12 @@ LIM_JSON='{"type":"result","subtype":"success","is_error":true,"result":"You'"'"
 [[ "$(limit_flag 1 '{"result":"Error: verify failed","is_error":true,"total_cost_usd":0}')" == "0" ]] \
   && ok "agent.sh: an ordinary failed call is not a usage limit" \
   || note "agent.sh: an ordinary failure was read as a usage limit"
+[[ "$(limit_flag 1 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')" == "0" ]] \
+  && ok "agent.sh: a short failed reply naming no limit (overloaded) is not a usage limit" \
+  || note "agent.sh: an overloaded error was read as a usage limit"
+[[ "$(limit_flag 1 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your rate limit"}}')" == "1" ]] \
+  && ok "agent.sh: an API rate_limit_error (429) counts as a usage limit" \
+  || note "agent.sh: an API rate_limit_error was not read as a usage limit"
 
 # --- 46. usage limit in BUILD: resumable exit 7, no replan, no failure counted (#140)
 R46="$WORK/r46"; new_repo "$R46"
@@ -1867,6 +1878,15 @@ RC46=$?
 [[ -z "$(git -C "$R46" status --porcelain)" ]] \
   && ok "usage limit in BUILD: the tree is left clean" \
   || note "usage limit in BUILD: dirty tree: $(git -C "$R46" status --porcelain | head -3 | tr '\n' ' ')"
+[[ "$(cat "$R46"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase=="usage_limit")][0].iter // -1')" -eq 0 ]] \
+  && ok "usage limit in BUILD: a usage_limit row records the count without the cut-short iteration" \
+  || note "usage limit in BUILD: usage_limit row: $(cat "$R46"/tmp/autopilot/run-*.jsonl | jq -c 'select(.phase=="usage_limit")')"
+( cd "$R46" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress \
+    bash "$LOOP_ABS" --resume-run --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r46r.out" 2>"$WORK/r46r.err" )
+[[ "$(cat "$R46"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase=="iteration")] | map(.iter) | join(",")')" == '"1"' ]] \
+  && ok "usage limit in BUILD: --resume-run reruns the cut-short iteration, not charged against --max-iterations" \
+  || note "usage limit in BUILD: iteration rows after --resume-run: $(cat "$R46"/tmp/autopilot/run-*.jsonl | jq -c 'select(.phase=="iteration") | .iter' | tr '\n' ' ')"
 run_loop "$R46" progress true; RC46B=$?
 [[ "$RC46B" -eq 0 ]] \
   && ok "usage limit in BUILD: a rerun after the reset finishes (exit 0)" \
@@ -1917,6 +1937,59 @@ run_loop "$R48" progress true; RC48B=$?
 [[ "$RC48B" -eq 0 ]] \
   && ok "usage limit in PLAN: a rerun plans afresh and finishes (exit 0)" \
   || note "usage limit in PLAN: rerun exited $RC48B"
+
+# --- 49. usage limit mid-BUILD over work the secret scan flags: discarded (#140)
+R49="$WORK/r49"; new_repo "$R49"
+HEAD49="$(git -C "$R49" rev-parse HEAD)"
+( cd "$R49" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=build \
+    STUB_LIMIT_PARTIAL=1 STUB_LIMIT_SECRET=1 STUB_LIMIT_MARKER="$WORK/r49.limit" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r49.out" 2>"$WORK/r49.err" )
+RC49=$?
+[[ "$RC49" -eq 7 && "$(git -C "$R49" rev-parse HEAD)" == "$HEAD49" \
+   && ! -e "$R49/src/half.txt" && -z "$(git -C "$R49" status --porcelain)" \
+   && ! -e "$R49/tmp/autopilot/pending-gate.json" ]] \
+  && ! git -C "$R49" log --all -p | grep -q AKIAABCDEFGHIJKLMNOP \
+  && ok "usage limit over flagged work: exit 7, the work discarded, nothing committed unscanned" \
+  || note "usage limit over flagged work: exit $RC49, HEAD '$(git -C "$R49" log -1 --format=%s)', status '$(git -C "$R49" status --porcelain | tr '\n' ' ')'"
+R49B="$WORK/r49b"; new_repo "$R49B"
+HEAD49B="$(git -C "$R49B" rev-parse HEAD)"
+( cd "$R49B" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=build \
+    STUB_LIMIT_PARTIAL=1 STUB_LIMIT_MARKER="$WORK/r49b.limit" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r49b.out" 2>"$WORK/r49b.err" )
+git -C "$R49B" log -1 --format=%s | grep -q 'usage-limited' \
+  && [[ "$(jq -r .base_sha "$R49B/tmp/autopilot/pending-gate.json" 2>/dev/null)" == "$HEAD49B" ]] \
+  && ok "usage limit mid-BUILD over clean work: a WIP commit and a pending gate" \
+  || note "usage limit mid-BUILD over clean work: HEAD '$(git -C "$R49B" log -1 --format=%s)', pending '$(cat "$R49B/tmp/autopilot/pending-gate.json" 2>/dev/null)'"
+
+# --- 50. a pending gate survives a replan before BUILD (#140) ----------------
+# A replan `continue`s before BUILD; a limit can hit that replan too. Neither
+# may lose the base, or the WIP work would never be gated.
+R50="$WORK/r50"; new_repo "$R50"
+BASE50="$(git -C "$R50" rev-parse HEAD)"
+( cd "$R50" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=verify \
+    STUB_LIMIT_MARKER="$WORK/r50.limit" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r50.out" 2>"$WORK/r50.err" )
+cyclic50() { printf -- '- [ ] A — (after: B)\n- [ ] B — (after: A)\n\nSTATUS: in-progress\n' > "$R50/tmp/autopilot/IMPLEMENTATION_PLAN.md"; }
+cyclic50
+( cd "$R50" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=plan \
+    STUB_LIMIT_MARKER="$WORK/r50b.limit" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r50b.out" 2>"$WORK/r50b.err" )
+RC50B=$?
+[[ "$RC50B" -eq 7 && "$(jq -r .base_sha "$R50/tmp/autopilot/pending-gate.json" 2>/dev/null)" == "$BASE50" ]] \
+  && ok "pending gate: a limit in the replan before BUILD keeps the pending base" \
+  || note "pending gate: replan limit exit $RC50B, pending '$(cat "$R50/tmp/autopilot/pending-gate.json" 2>/dev/null)'"
+( cd "$R50" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_VERIFY_DIFF_LOG="$WORK/r50.diff" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 2 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r50c.out" 2>"$WORK/r50c.err" )
+grep -q "plan_dag" "$WORK/r50c.err" \
+  && grep -q '^new file mode' "$WORK/r50.diff" && grep -q 'src/work.txt' "$WORK/r50.diff" \
+  && [[ ! -e "$R50/tmp/autopilot/pending-gate.json" ]] \
+  && ok "pending gate: an iteration that replans and continues hands the base to the next BUILD" \
+  || note "pending gate: after a replan continue the verifier saw: $(head -5 "$WORK/r50.diff" 2>/dev/null | tr '\n' '|') err: $(grep -c plan_dag "$WORK/r50c.err")"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then
