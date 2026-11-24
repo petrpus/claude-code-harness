@@ -36,7 +36,11 @@
 #     had run up is unknowable, and AGENT_LAST_COST's 0 means "unknown", not
 #     "free"; 0 otherwise, dry runs included),
 #     AGENT_LAST_SUBTYPE (the reply's `subtype`: "success", or an error such
-#     as "error_max_turns" — the call ran out of --max-turns, #96)
+#     as "error_max_turns" — the call ran out of --max-turns, #96),
+#     AGENT_LAST_USAGE_LIMIT (1 when the call failed on the subscription's
+#     usage or rate limit — see agent_classify_usage_limit, #140; 0
+#     otherwise) and AGENT_LAST_USAGE_LIMIT_MSG (the notice, reset time
+#     included)
 #
 #   Missing fields (a stub, a crashed call, a dry run) read as 0 / "" — the
 #   output shape is never a hard requirement. Needs jq and coreutils timeout.
@@ -111,6 +115,31 @@ agent_withhold_forge_credentials() {
   export GIT_CONFIG_COUNT=$(( n + 1 ))
 }
 
+# agent_classify_usage_limit <rc> <raw_output> — sets AGENT_LAST_USAGE_LIMIT
+# (1/0) and AGENT_LAST_USAGE_LIMIT_MSG (#140). Once the subscription's usage
+# or rate limit is reached, every `claude -p` call answers at once with a
+# short notice ("You've hit your 5-hour limit · resets 5:30pm") and exit 1 —
+# a failure of the machinery, not of the work, which callers must not count
+# against an issue. Only a FAILED call (non-zero exit, or `is_error` in the
+# JSON) with a short reply qualifies: a successful reply that merely quotes
+# such a notice (a BUILD working on this very code) is not one.
+agent_classify_usage_limit() {
+  local rc="$1" out="$2" text is_error
+  AGENT_LAST_USAGE_LIMIT=0; AGENT_LAST_USAGE_LIMIT_MSG=""
+  [[ "${AGENT_DRY_RUN:-0}" -eq 1 ]] && return 0
+  is_error="$(printf '%s' "$out" | jq -r '.is_error // false' 2>/dev/null)" || is_error=false
+  [[ "$rc" -ne 0 || "$is_error" == "true" ]] || return 0
+  text="$AGENT_LAST_RESULT"
+  # A non-JSON reply (the notice printed as plain text) has no .result.
+  printf '%s' "$out" | jq -e . >/dev/null 2>&1 || text="$out"
+  (( ${#text} > 0 && ${#text} <= 400 )) || return 0
+  if printf '%s' "$text" | grep -qiE "(hit|reached) (your|the) [^.]{0,40}limit|usage limit|rate[ _]limit"; then
+    AGENT_LAST_USAGE_LIMIT=1
+    AGENT_LAST_USAGE_LIMIT_MSG="$(printf '%s' "$text" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  fi
+  return 0
+}
+
 agent_run() {
   local phase="$1" model="$2" allowed="$3" perm="$4" prompt="$5" cwd="${6:-}"
   local t0 t1 out rc errlog="${AGENT_STDERR_LOG:-/dev/null}"
@@ -175,6 +204,7 @@ agent_run() {
     AGENT_LAST_TURNS AGENT_LAST_CACHE_READ AGENT_LAST_CACHE_CREATION AGENT_LAST_SUBTYPE <<<"$fields"
   [[ "$AGENT_LAST_SUBTYPE" == "-" ]] && AGENT_LAST_SUBTYPE=""
   AGENT_LAST_RESULT="$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" || AGENT_LAST_RESULT=""
+  agent_classify_usage_limit "$rc" "$out"
   if [[ -n "${AGENT_TRANSCRIPT_DIR:-}" ]] && mkdir -p "$AGENT_TRANSCRIPT_DIR" 2>/dev/null; then
     # Continue after the files already there: a resumed or reloaded run is a
     # new process, and must not overwrite the replies of the one before.

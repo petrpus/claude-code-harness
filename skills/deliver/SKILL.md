@@ -41,7 +41,8 @@ skill:
   boundary); hard stop `tmux kill-session -t deliver-<N>`. Continue:
   `--resume [--retry '#N']`.
 - Exit codes: 0 all merged · 1 precondition/runner failure · 2 partial ·
-  3 `--max-minutes` · 4 `--budget-usd` · 6 stopped; 3, 4 and 6 are resumable.
+  3 `--max-minutes` · 4 `--budget-usd` · 6 stopped · 7 usage-limited; 3, 4, 6
+  and 7 are resumable.
 - A final PR (`--via pr`) is merged by a human, with a merge commit. A
   fast-forward (`--via ff`) never targets the default branch.
 
@@ -174,10 +175,13 @@ Pre-flight, an approved procedure, a detached run, milestone reports.
    (`tail -F … | jq -c --unbuffered`). Report each milestone as it arrives —
    `pr-open`, `merged`, `parked`, `closed-external`, `final-pr`,
    `integrated`, `integration-skipped`, `integration-failed`, `integration`,
-   `stopped`, `budget_exhausted`, `time_exhausted` — one line each. Monitor ends when its
+   `stopped`, `budget_exhausted`, `time_exhausted`, `usage_limited` — one line
+   each. Monitor ends when its
    command ends or times out: **re-arm it** until a terminal state, i.e.
-   `status.json` reads `done`, `partial`, `stopped`, `budget_exhausted` or
-   `time_exhausted`.
+   `status.json` reads `done`, `partial`, `stopped`, `budget_exhausted`,
+   `time_exhausted` or `usage_limited`. On `usage_limited`, report the notice
+   (the event's `reason` carries the reset time) and tell the user to
+   `--resume` after it.
 7. **`runner-dead`.** On every re-arm, and whenever events stop, check the
    run's `lock` file: if its PID is no longer alive (`kill -0 "$(cat lock)"`)
    or the lock is gone while `status.json` still reads `running`, report
@@ -390,6 +394,13 @@ time is this run's accumulated `active_seconds`, which survives a
 `--resume`. Checked at the same phase boundaries as the STOP file. Tripping
 a cap ends the run with exit **4** (budget) or **3** (time), state
 `budget_exhausted` / `time_exhausted`, the in-flight issue left non-terminal.
+
+**Usage limit (#140).** When a model call — a build's or the reviewer's —
+hits the subscription's usage limit, the issue is not at fault and is **not
+parked**: the run ends with exit **7**, state `usage_limited` (an
+`events.jsonl` row too), the in-flight issue left non-terminal on its branch
+with its work kept. `--resume` after the reset continues it — no `--retry`,
+nothing discarded; an interrupted review round is re-entered.
 A call cut off by `--per-call-timeout` reports no cost; it is counted as
 `cost_unknown` (per call row) and `cost_unknown_calls` (`status.json`), not as
 $0, so a cap reached with timed-out calls in it is a lower bound (#84).
@@ -462,4 +473,6 @@ edits the script running it.
 Exit codes: 0 every Delivery line merged · 1 precondition or runner failure ·
 2 partial (something was parked, and whatever waits on it skipped) · 3 global
 `--max-minutes` reached · 4 global `--budget-usd` reached · 6 stopped (a
-`STOP` file was present). 3, 4 and 6 leave the run resumable with `--resume`.
+`STOP` file was present) · 7 usage-limited (a model call hit the
+subscription's usage limit). 3, 4, 6 and 7 leave the run resumable with
+`--resume`.

@@ -76,6 +76,7 @@ dir inside the repo that git does not ignore: checkpoint commits are
 | `lock` | `PID run_id` — concurrency guard with stale-PID detection. |
 | `calls/<seq>-<phase>.md` | Every model call's reply, in order (PLAN, BUILD, verifier, replan), with its exit code and duration — the only record of *why* an iteration did what it did. Runner-written; never read by a prompt. |
 | `slices.json` | Per-slice retry/park ladder state (S4A, `slices.sh`). Runner-owned; never named in any prompt. Missing = nothing has failed yet. |
+| `pending-gate.json` | Written only when a usage limit cut an iteration short after BUILD ran (#140): `{base_sha, ticked_before}`. The next run's first iteration to reach BUILD gates from that base and counts ticks from that count, and deletes it as BUILD starts (a replan before BUILD keeps it). Runner-owned. |
 
 `HOLDOUT.md` (optional, S2) is deliberately **not** one of these — it lives
 outside the worktree entirely (below), because BUILD already reads
@@ -454,6 +455,24 @@ to go missing from the budget.
   lets that iteration's gates and checkpoint finish, then exits **6** with state
   `stopped`. The file belongs to its creator — the runner never removes it, so
   resuming with it still present stops again immediately.
+- **Usage limit (#140)** is not a failure of the work: once the subscription's
+  usage or rate limit is reached, every `claude -p` call fails within seconds
+  with a short notice (`You've hit your 5-hour limit · resets …`).
+  `agent.sh` recognises it (a failed call, short reply, limit wording — a
+  successful reply that only quotes it does not count), and the runner stops
+  at once with exit **7**, state `usage-limited` (`status.json` also carries
+  the notice as `usage_limit`): no replan, no slice failure,
+  no iteration row; the call's row carries verdict `usage-limit`, and a
+  `usage_limit` row records the iteration count without the cut-short
+  iteration, which `--resume-run` restores. Work BUILD had done is kept in an
+  `autopilot: iteration N (wip, usage-limited)` commit once the secret scan
+  passes it (work the scan flags is discarded, never committed), and
+  `pending-gate.json` makes the next run gate it (its gates diff from the
+  cut-short iteration's base). A plan file a cut-short PLAN call left is moved
+  to `IMPLEMENTATION_PLAN.md.usage-limited`. An API rate-limit error
+  (`rate_limit_error`, 429) reads the same way: also machinery, also
+  resumable. Rerun after the reset — a fresh run or `--resume-run` — to
+  continue.
 - **Stuck detection (S4A):** on an annotated plan, driven by a per-slice
   `fails` counter (retry → park at 3 → replan once all candidates are parked
   or blocked → abort on the next failure) — see § The stuck ladder above. On
@@ -473,7 +492,7 @@ Per-call row:
 ```json
 {"ts":"…","run_id":"…","iter":3,"phase":"build|plan|verify_cmd|secret_scan|verify_agent|replan|runner_reload|escalation",
  "model":"sonnet","duration_s":42,"cost_usd":0.11,"input_tokens":8000,"output_tokens":1200,
- "exit_code":0,"verdict":"pass|fail|no_verdict|turn-limit|skipped-turn-limit|","holdout_failed":0,
+ "exit_code":0,"verdict":"pass|fail|no_verdict|turn-limit|skipped-turn-limit|usage-limit|","holdout_failed":0,
  "turns":6,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500,"violations":[],
  "cost_unknown":false}
 ```
@@ -592,7 +611,8 @@ whichever side has no data in the logs given renders as `—`, not an error.
 
 A killed run leaves its state dir intact and the lock is stale-detected on the
 next start. A stopped run (exit 6) is the same, minus the stale lock: remove the
-stop file and `--resume-run`. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
+stop file and `--resume-run`. A usage-limited run (exit 7) needs nothing
+removed: rerun after the limit resets. Re-run with `--resume-run`, which now (R1) adopts the killed run's id,
 iteration count, accumulated cost and start time from its `run-<id>.jsonl`
 instead of starting a new run at iteration 0 / cost 0 / now — a missing log
 behaves like a fresh run (contract item 8). WIP checkpoints (`autopilot: iteration N (wip, gate=…)`) let

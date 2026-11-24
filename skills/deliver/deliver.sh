@@ -104,7 +104,9 @@
 # caps have left before that issue's loop.sh call. Exit codes: 0 every
 # Delivery line merged · 1 precondition or runner failure · 2 partial (an
 # issue was parked; its dependents were skipped) · 3 global time cap ·
-# 4 global budget cap · 6 stopped (STOP file present).
+# 4 global budget cap · 6 stopped (STOP file present) · 7 usage_limited (a
+# model call hit the subscription's usage limit, #140: the in-flight issue
+# stays non-terminal; --resume after the reset continues it on its branch).
 #
 # --resume picks the newest tmp/deliver/*/state.json for this --map, removes
 # a stale lock (a pid that is no longer alive; a live one refuses the run),
@@ -762,13 +764,13 @@ run_status() {
     "$(state_total_cost "$RUN_DIR")" "$(active_seconds_now)" "$(state_cost_unknown_calls "$RUN_DIR")"
 }
 
-# stop_run <exit_code> <state_label> — a global cap or STOP tripped: persist
-# where the run ended (issue left non-terminal, resumable) and exit. Never
-# returns.
+# stop_run <exit_code> <state_label> [detail] — a global cap, STOP or usage
+# limit tripped: persist where the run ended (issue left non-terminal,
+# resumable) and exit. Never returns.
 stop_run() {
   state_set_active_seconds "$RUN_DIR" "$(active_seconds_now)"
   run_status "$2"
-  state_event "$RUN_DIR" "$CUR_ISSUE" "$2" ""
+  state_event "$RUN_DIR" "$CUR_ISSUE" "$2" "${3:-}"
   log "run $2 (exit $1): ${#MERGED[@]} merged, ${#PARKED[@]} parked this run."
   exit "$1"
 }
@@ -1100,6 +1102,13 @@ review_issue() {
       2) # A turn-limited reply, a failed call (timeout, crash) and an
          # off-contract reply all leave no verdict; the run log keeps them apart.
          turn_limited=false
+         if [[ "${AGENT_LAST_USAGE_LIMIT:-0}" -eq 1 ]]; then
+           # #140: a retry would hit the same limit; the round is re-entered
+           # by --resume after the reset (same marker, nothing posted twice).
+           deliver_logline review "$n" "$round" usage-limit
+           log "#$n: round $round — the reviewer hit the usage limit: ${AGENT_LAST_USAGE_LIMIT_MSG:-}"
+           stop_run 7 usage_limited "${AGENT_LAST_USAGE_LIMIT_MSG:-}"
+         fi
          if [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]]; then
            turn_limited=true
            deliver_logline review "$n" "$round" turn-limit
@@ -1408,6 +1417,10 @@ run_autopilot() {
   # loop.sh's own STOP-file exit is this run's stop, never a park (#61) — the
   # STOP file it found is the same one check_caps would find.
   [[ "$loop_rc" -eq 6 ]] && stop_run 6 stopped
+  # A usage limit (#140) is the machinery failing, not the issue: no park.
+  # loop.sh left the checkout clean and its state dir resumable.
+  [[ "$loop_rc" -eq 7 ]] \
+    && stop_run 7 usage_limited "$(jq -r '.usage_limit // ""' "$dir/status.json" 2>/dev/null)"
   check_caps "after a build (#$n)"
   return "$loop_rc"
 }
