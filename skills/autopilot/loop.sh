@@ -19,8 +19,10 @@
 #           [--plan-max-items <n>] [--verify-at-completion] [--iteration-verify-cmd '<cmd>']
 #
 # Exit codes: 0 done+verified · 2 iteration cap · 3 time cap · 4 budget/stuck
-#             cap · 6 stopped (--stop-file appeared) · 1 runner error (bad
-#             preconditions, missing deps).
+#             cap · 6 stopped (--stop-file appeared) · 7 usage-limited (a
+#             model call hit the subscription's usage limit; rerun after
+#             the reset, #140) · 1 runner error (bad preconditions, missing
+#             deps).
 
 set -uo pipefail
 
@@ -98,7 +100,7 @@ while [[ $# -gt 0 ]]; do
     --plan-max-items)   PLAN_MAX_ITEMS="$2"; shift 2 ;;
     --verify-at-completion) VERIFY_AT_COMPLETION=1; shift ;;
     --iteration-verify-cmd) ITERATION_VERIFY_CMD="$2"; shift 2 ;;
-    -h|--help)          sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)          sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) log_err "unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -126,6 +128,9 @@ LOCK_FILE="$STATE_DIR/lock"
 # S4A: runner-owned per-slice ladder state — written and read only by
 # loop.sh, never named in any prompt (skills/autopilot/slices.sh).
 SLICES_FILE="$STATE_DIR/slices.json"
+# #140: an iteration a usage limit cut short after BUILD ran — its base
+# commit and tick count, so the next run's first iteration gates that work.
+PENDING_GATE_FILE="$STATE_DIR/pending-gate.json"
 
 # agent_run() knobs (agent.sh), from this run's flags.
 AGENT_TIMEOUT="$PER_CALL_TIMEOUT"
@@ -424,14 +429,15 @@ run_aggregates() {
   ' "$RUN_LOG" 2>/dev/null || echo '{"iterations":0,"gate_fail_rate":0,"cost_per_ticked_slice":null,"replans":0,"mean_dag_width":0,"parked_total":0,"escalations":0,"verify_deferred":0,"cost_unknown_calls":0}'
 }
 
-write_status() { # state
+write_status() { # state [usage_limit notice]
   local agg
   agg="$(run_aggregates)"
   jq -cn --arg run "$RUN_ID" --arg state "$1" --argjson iter "${ITER:-0}" \
      --argjson cost "$TOTAL_COST" --arg branch "$BRANCH" \
      --arg sha "$(git rev-parse --short HEAD 2>/dev/null || echo '')" \
-     --argjson agg "$agg" \
-     '{run_id:$run,state:$state,iterations_done:$iter,total_cost_usd:$cost,branch:$branch,head:$sha} + $agg' \
+     --argjson agg "$agg" --arg limit "${2:-}" \
+     '{run_id:$run,state:$state,iterations_done:$iter,total_cost_usd:$cost,branch:$branch,head:$sha} + $agg
+      + (if $limit == "" then {} else {usage_limit:$limit} end)' \
      > "$STATUS_FILE" 2>/dev/null || true
 }
 
@@ -457,11 +463,43 @@ run_claude() { # phase model allowed_tools permission_mode prompt_text
   # reads like any other failed call (exit 1, empty reply).
   local call_verdict=""
   [[ "${AGENT_LAST_SUBTYPE:-}" == "error_max_turns" ]] && call_verdict="turn-limit"
+  [[ "${AGENT_LAST_USAGE_LIMIT:-0}" -eq 1 ]] && call_verdict="usage-limit"
   logline "$phase" "$model" "$AGENT_LAST_DURATION" "${AGENT_LAST_COST:-0}" \
     "${AGENT_LAST_IN_TOKENS:-0}" "${AGENT_LAST_OUT_TOKENS:-0}" "$rc" "$call_verdict" 0 \
     "${AGENT_LAST_TURNS:-0}" "${AGENT_LAST_CACHE_READ:-0}" "${AGENT_LAST_CACHE_CREATION:-0}" \
     '[]' "${AGENT_LAST_COST_UNKNOWN:-0}"
+  [[ "${AGENT_LAST_USAGE_LIMIT:-0}" -eq 1 ]] && usage_limit_stop "$phase"
   return "$rc"
+}
+
+# usage_limit_stop <phase> — a model call hit the subscription's usage limit
+# (#140). Every further call would fail the same way within seconds, so
+# nothing about the limit-hit call is the work's fault: no gate verdict, no
+# slice failure, no replan, no iteration row. The run stops resumably
+# (exit 7, state "usage-limited") and a rerun after the reset carries on.
+#   - In PLAN: a plan file the cut-short call left is moved aside, so the
+#     rerun plans afresh instead of building from half a plan.
+#   - After BUILD started (ITER_GATE_BASE set): BUILD's work is kept in a
+#     WIP commit, and PENDING_GATE_FILE records the iteration's base commit
+#     and tick count — the rerun's first iteration diffs its gates from that
+#     base and counts ticks from that count, so the work is gated, not
+#     waved through (the checkout is left clean, as /deliver requires).
+# Never returns.
+usage_limit_stop() {
+  local phase="$1"
+  log_err "usage limit hit during $phase: ${AGENT_LAST_USAGE_LIMIT_MSG:-} — stopping; rerun after the reset to continue (exit 7)."
+  if [[ "$phase" == "plan" && -f "$PLAN_FILE" ]]; then
+    mv -f "$PLAN_FILE" "$PLAN_FILE.usage-limited" 2>/dev/null || rm -f "$PLAN_FILE"
+  fi
+  if [[ -n "${ITER_GATE_BASE:-}" ]]; then
+    jq -cn --arg base "$ITER_GATE_BASE" --argjson ticked "${TICKED_BEFORE:-0}" \
+      '{base_sha:$base, ticked_before:$ticked}' > "$PENDING_GATE_FILE" 2>/dev/null || true
+    git add -A >/dev/null 2>&1 \
+      && git commit -q -m "autopilot: iteration $ITER (wip, usage-limited)" >/dev/null 2>&1 || true
+    # The cut-short iteration did not run: status.json counts the ones that did.
+    ITER=$(( ITER - 1 ))
+  fi
+  write_status "usage-limited" "${AGENT_LAST_USAGE_LIMIT_MSG:-usage limit}"; exit 7
 }
 
 over_budget() { jq -en --argjson c "$TOTAL_COST" --argjson b "$BUDGET_USD" '$c >= $b' >/dev/null 2>&1; }
@@ -502,6 +540,7 @@ holdout_notice_once() {
 #    decision 6 / PRD § S4). Reset to 0 whenever the run makes real progress,
 #    so a later, unrelated slice getting stuck still gets its own one replan.
 LAST_FP=""; REPEAT=0
+ITER_GATE_BASE=""        # set from BUILD until the gates have run (#140)
 BUILD_TURN_LIMIT=false   # set per iteration, right after BUILD (#96)
 PARK_REPLAN_DONE=0
 
@@ -876,6 +915,23 @@ while :; do
   TICKED_BEFORE="$(count_ticked)"
   TOTAL_BOXES="$(count_boxes)"
 
+  # #140: an earlier run stopped on a usage limit after BUILD had worked but
+  # before the gates judged it. That work sits in a WIP commit; this
+  # iteration's gates diff from the commit before it and count ticks from
+  # the count before it, so the work is gated together with this BUILD's.
+  # A base that is no longer an ancestor of HEAD (history rewritten since)
+  # is ignored. Consumed either way: one iteration takes it over.
+  PENDING_BASE=""
+  if [[ -f "$PENDING_GATE_FILE" ]]; then
+    _pb="$(jq -r '.base_sha // ""' "$PENDING_GATE_FILE" 2>/dev/null)"
+    _pt="$(jq -r '.ticked_before // ""' "$PENDING_GATE_FILE" 2>/dev/null)"
+    if [[ -n "$_pb" && "$_pt" =~ ^[0-9]+$ ]] && git merge-base --is-ancestor "$_pb" HEAD 2>/dev/null; then
+      PENDING_BASE="$_pb"; TICKED_BEFORE="$_pt"
+      log_err "gating the work a usage limit left ungated (since ${_pb:0:7}) in this iteration."
+    fi
+    rm -f "$PENDING_GATE_FILE"
+  fi
+
   # S4A: reconcile the per-slice ladder state against the CURRENT plan before
   # selecting — an id the plan no longer has, OR one that's now ticked,
   # retires silently (a ticked slice needs no more retry tracking, and this
@@ -1012,7 +1068,8 @@ while :; do
   # can diff the whole iteration against it, not just what's still unstaged
   # after BUILD (which is nothing, once BUILD_ALLOWED_TOOLS drops git
   # add/commit and can no longer hide its own changes inside a commit).
-  ITER_BASE_SHA="$(git rev-parse HEAD)"
+  ITER_BASE_SHA="${PENDING_BASE:-$(git rev-parse HEAD)}"
+  ITER_GATE_BASE="$ITER_BASE_SHA"
   BUILD_COST_START="$TOTAL_COST"
   run_claude "build" "$BUILD_MODEL_THIS_ITER" "$BUILD_ALLOWED_TOOLS" "acceptEdits" "$(build_prompt "$SELECTED_ID" "$SELECTED_LINE" "$REPO_MAP_DIGEST")" >/dev/null
   # #96: a BUILD that ran out of --max-turns left its work half done in the
@@ -1189,6 +1246,10 @@ while :; do
       fi
     fi
   fi
+
+  # Every gate has run: a usage limit from here on (a replan) cuts nothing
+  # short that still needs gating.
+  ITER_GATE_BASE=""
 
   # Prune memory mechanically (instructions to the model are advisory).
   if [[ -f "$MEMORY_FILE" ]]; then tail -n 100 "$MEMORY_FILE" > "$MEMORY_FILE.tmp" && mv "$MEMORY_FILE.tmp" "$MEMORY_FILE"; fi

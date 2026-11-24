@@ -146,7 +146,9 @@ blocked a single replan unparks everything — a second failure after that
 replan aborts. A plan with no real slice ids falls back to the pre-S4A rule
 verbatim (same fingerprint twice → replan, third time → abort).
 Exit codes: 0 done · 2 iteration cap · 3 time cap · 4 budget/stuck ·
-6 stopped (`--stop-file`) · 1 precondition error. Budget cap and stuck share 4;
+6 stopped (`--stop-file`) · 7 usage-limited (a call hit the subscription's
+usage limit — rerun after the reset; the work is kept and gated next run) ·
+1 precondition error. Budget cap and stuck share 4;
 `status.json .state` (`budget-cap` vs `stuck`) tells them apart.
 
 Gate (d) parses the verifier's output three ways, not just pass/fail: a reply

@@ -683,6 +683,20 @@ review_json() { # verdict findings-json [head]
 }
 head="$(printf '%s' "$prompt" | grep -oE 'Head: `[0-9a-f]{40}`' | head -1 | tr -d '`' | cut -d' ' -f2)"
 common_root() { cd "$(git rev-parse --git-common-dir)/.." && pwd; }
+# #140: the usage limit, once (STUB_LIMIT_MARKER), in the phase
+# STUB_LIMIT_PHASE names (build|review): the limit notice and exit 1.
+if [[ -n "${STUB_LIMIT_PHASE:-}" && ! -f "${STUB_LIMIT_MARKER:?}" ]]; then
+  ph=other
+  case "$prompt" in
+    *"# Agent: code-reviewer"*) ph=review ;;
+    *"ONE iteration of an autonomous BUILD loop"*) ph=build ;;
+  esac
+  if [[ "$ph" == "$STUB_LIMIT_PHASE" ]]; then
+    touch "$STUB_LIMIT_MARKER"
+    printf '{"type":"result","subtype":"success","is_error":true,"result":"You'"'"'ve hit your 5-hour limit · resets 5:30pm (Europe/Prague)","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n'
+    exit 1
+  fi
+fi
 case "$prompt" in
   *"# Agent: code-reviewer"*)
     if [[ -n "${STUB_REVIEW_LOG:-}" ]]; then
@@ -1253,6 +1267,25 @@ job_stopresume() {
   run_deliver stopresume -- --resume
   echo $? > "$WORK/stopresume/rc"
 }
+# #140: a usage limit is the machinery failing, not the issue — the run
+# stops resumably (exit 7) and --resume carries on without --retry.
+job_limitbuild() {
+  new_fixture limitbuild
+  run_deliver limitbuild STUB_LIMIT_PHASE=build STUB_LIMIT_MARKER="$WORK/limitbuild/limit.marker"
+  echo $? > "$WORK/limitbuild/rc1"
+  cp "$(ls -d "$WORK"/limitbuild/repo/tmp/deliver/*/ | head -1)status.json" "$WORK/limitbuild/status1.json" 2>/dev/null
+  cp "$WORK/limitbuild/gh/issues/1.json" "$WORK/limitbuild/issue1-after1.json"
+  run_deliver limitbuild -- --resume
+  echo $? > "$WORK/limitbuild/rc"
+}
+job_limitreview() {
+  new_fixture limitreview
+  run_deliver limitreview STUB_LIMIT_PHASE=review STUB_LIMIT_MARKER="$WORK/limitreview/limit.marker"
+  echo $? > "$WORK/limitreview/rc1"
+  cp "$WORK/limitreview/gh/issues/1.json" "$WORK/limitreview/issue1-after1.json"
+  run_deliver limitreview -- --resume
+  echo $? > "$WORK/limitreview/rc"
+}
 job_locklive() {
   new_fixture locklive
   local d="$WORK/locklive"
@@ -1539,6 +1572,8 @@ bg job_budget
 bg job_killresume
 bg job_budgetresume
 bg job_stopresume
+bg job_limitbuild
+bg job_limitreview
 bg job_locklive
 bg job_lockstale
 bg job_retry
@@ -2405,6 +2440,28 @@ SR="$WORK/stopresume"
 [[ "$(jq -r .state "$SR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$SR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
   && ok "stop+resume: both issues end up merged" \
   || note "stop+resume: PR states #4=$(jq -r .state "$SR/gh/prs/4.json" 2>/dev/null) #5=$(jq -r .state "$SR/gh/prs/5.json" 2>/dev/null)"
+
+# --- #140: a usage limit stops the run resumably instead of parking ------------
+LB="$WORK/limitbuild"
+RC1="$(cat "$LB/rc1")"; RC="$(cat "$LB/rc")"
+[[ "$RC1" -eq 7 && "$(jq -r .state "$LB/status1.json" 2>/dev/null)" == "usage_limited" ]] \
+  && ok "usage limit in BUILD: the run stops with exit 7, status usage_limited" \
+  || note "usage limit in BUILD: exit $RC1, status $(jq -r .state "$LB/status1.json" 2>/dev/null) — $(tail -3 "$LB/err" | tr '\n' '|')"
+[[ "$(jq -r '[.labels[].name] | index("needs-human")' "$LB/issue1-after1.json")" == "null" ]] \
+  && grep '"event":"usage_limited"' "$LB"/repo/tmp/deliver/*/events.jsonl | grep -q 'resets 5:30pm' \
+  && ok "usage limit in BUILD: the issue is not parked; events.jsonl records usage_limited with the notice" \
+  || note "usage limit in BUILD: issue #1 labels $(jq -c '[.labels[].name]' "$LB/issue1-after1.json")"
+[[ "$RC" -eq 0 && "$(jq -r .state "$LB/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$LB/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "usage limit in BUILD: --resume without --retry delivers both issues (exit 0)" \
+  || note "usage limit in BUILD: --resume exited $RC — $(tail -3 "$LB/err" | tr '\n' '|')"
+LR="$WORK/limitreview"
+RC1="$(cat "$LR/rc1")"; RC="$(cat "$LR/rc")"
+[[ "$RC1" -eq 7 && "$(jq -r '[.labels[].name] | index("needs-human")' "$LR/issue1-after1.json")" == "null" ]] \
+  && ok "usage limit in review: the run stops with exit 7 and the issue is not parked" \
+  || note "usage limit in review: exit $RC1, labels $(jq -c '[.labels[].name]' "$LR/issue1-after1.json") — $(tail -3 "$LR/err" | tr '\n' '|')"
+[[ "$RC" -eq 0 && "$(jq -r .state "$LR/gh/prs/4.json" 2>/dev/null)" == "MERGED" && "$(jq -r .state "$LR/gh/prs/5.json" 2>/dev/null)" == "MERGED" ]] \
+  && ok "usage limit in review: --resume re-reviews and delivers both issues (exit 0)" \
+  || note "usage limit in review: --resume exited $RC — $(tail -3 "$LR/err" | tr '\n' '|')"
 
 # --- #61 S3: --resume refuses a live lock, removes a stale one ------------------
 RC="$(cat "$WORK/locklive/rc")"

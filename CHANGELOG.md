@@ -3,6 +3,35 @@
 All notable changes to the harness (the `code-harness` plugin, named
 `claude-code-harness` up to 0.6.x). Semver via git tags.
 
+## [0.9.1] — 2026-11-24
+
+Patch release: a usage limit no longer parks a `/deliver` issue.
+
+### Fixed
+
+- When the subscription's usage limit is reached, every `claude -p` call fails
+  within seconds with a short notice. autopilot read those calls as ordinary
+  failures: the semantic gate as `no_verdict`, BUILD and REPLAN as failed. The
+  issue used up its iterations, ended `stuck`, and `/deliver` parked it and
+  skipped everything waiting on it. Recovery meant `--retry`, which discards
+  the branch (#140).
+  - `agent.sh` sets `AGENT_LAST_USAGE_LIMIT` / `AGENT_LAST_USAGE_LIMIT_MSG`
+    on a failed call (non-zero exit or `is_error`) whose short reply is a
+    usage- or rate-limit notice. A successful reply that only quotes such a
+    notice does not count.
+  - `loop.sh` stops at once with **exit 7**, state `usage-limited` (the
+    notice in `status.json .usage_limit`). It runs no replan, records no
+    slice failure and writes no iteration row; the call's run-log row has
+    verdict `usage-limit`. Work BUILD had already done goes into a
+    `(wip, usage-limited)` commit. The new `pending-gate.json` makes the next
+    run's first iteration gate that work: its diff starts at the cut-short
+    iteration's base, so the work is not waved through. A half-written plan
+    from a cut-short PLAN call is moved aside.
+  - `/deliver` treats autopilot's exit 7, and a reviewer call that hits the
+    limit, as **exit 7, state `usage_limited`**. The issue is not parked.
+    `events.jsonl` gets a row with the notice, and `--resume` after the reset
+    continues the issue on its branch without `--retry`.
+
 ## [0.9.0] — 2026-11-01
 
 Minor release: `/worklog --clockify` logs the commit digest to Clockify on the

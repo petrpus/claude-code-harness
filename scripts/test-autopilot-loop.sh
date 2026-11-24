@@ -96,6 +96,31 @@ emit() { # result
   printf '{"result":%s,"total_cost_usd":%s,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$1" "$cost"
 }
 
+# #140: the subscription's usage limit. claude -p answers every call with the
+# limit notice and exit 1. STUB_LIMIT_PHASE (plan|build|verify) names the
+# phase that hits it, once: STUB_LIMIT_MARKER records that it fired.
+# STUB_LIMIT_PLAIN=1 prints the notice as plain text instead of a JSON
+# result; STUB_LIMIT_PARTIAL=1 has a PLAN call write half a plan first.
+if [[ -n "${STUB_LIMIT_PHASE:-}" && ! -f "${STUB_LIMIT_MARKER:?}" ]]; then
+  ph=other
+  case "$prompt" in
+    *"PLAN phase"*|*"autonomous run is stuck"*)  ph=plan ;;
+    *"ONE iteration of an autonomous BUILD loop"*) ph=build ;;
+    *"verdict"*|*"shortcut"*|*"Verdict"*)        ph=verify ;;
+  esac
+  if [[ "$ph" == "$STUB_LIMIT_PHASE" ]]; then
+    touch "$STUB_LIMIT_MARKER"
+    [[ "$ph" == plan && -n "${STUB_LIMIT_PARTIAL:-}" ]] && printf -- '# plan\n- [ ] slice 1\n' > "$plan"
+    notice="You've hit your 5-hour limit · resets 5:30pm (Europe/Prague)"
+    if [[ -n "${STUB_LIMIT_PLAIN:-}" ]]; then
+      printf '%s\n' "$notice"
+    else
+      printf '{"type":"result","subtype":"success","is_error":true,"result":"%s","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}\n' "$notice"
+    fi
+    exit 1
+  fi
+fi
+
 case "$prompt" in
   *"PLAN phase"*|*"autonomous run is stuck"*)
     # S4A: some fixtures hand-craft a plan whose STRUCTURE (ids, after:
@@ -1790,6 +1815,108 @@ printf '%s\n' '{"ts":"2026-09-01T10:00:00Z","run_id":"20260901T100000Z-1","iter"
 bash "$REPORT_ABS" "$RU" 2>/dev/null | grep -q '2026-09-01 | sonnet | 1 call(s) with unknown cost' \
   && ok "report.sh prints the count of calls with unknown cost per day/model" \
   || note "report.sh did not print the unknown-cost count"
+
+# --- 45. usage limit: agent.sh tells the limit notice from an ordinary failure (#140)
+AGENT_SH_ABS="$(cd "$(dirname "$LOOP")" && pwd)/agent.sh"
+FAKE_DIR="$WORK/fakeclaude"; mkdir -p "$FAKE_DIR"
+printf '#!/usr/bin/env bash\ncat >/dev/null\nprintf "%%s\\n" "$FAKE_OUT"\nexit "$FAKE_RC"\n' > "$FAKE_DIR/claude"
+chmod +x "$FAKE_DIR/claude"
+limit_flag() { # rc stdout -> echoes AGENT_LAST_USAGE_LIMIT
+  ( export PATH="$FAKE_DIR:$PATH" FAKE_RC="$1" FAKE_OUT="$2"
+    # shellcheck source=/dev/null
+    source "$AGENT_SH_ABS"
+    agent_run build sonnet Read acceptEdits "p" >/dev/null 2>&1
+    echo "${AGENT_LAST_USAGE_LIMIT:-unset}"; agent_cleanup )
+}
+LIM_JSON='{"type":"result","subtype":"success","is_error":true,"result":"You'"'"'ve hit your 5-hour limit · resets 5:30pm (Europe/Prague)","total_cost_usd":0}'
+[[ "$(limit_flag 1 "$LIM_JSON")" == "1" ]] \
+  && ok "agent.sh: a JSON limit reply (exit 1, is_error) is a usage limit" \
+  || note "agent.sh: JSON limit reply read as $(limit_flag 1 "$LIM_JSON")"
+[[ "$(limit_flag 1 "Claude usage limit reached. Your limit will reset at 5pm.")" == "1" ]] \
+  && ok "agent.sh: a plain-text limit notice (exit 1) is a usage limit" \
+  || note "agent.sh: plain-text limit notice not detected"
+[[ "$(limit_flag 0 '{"result":"Done. loop.sh now detects \"You have hit your 5-hour limit\" replies.","total_cost_usd":0.1}')" == "0" ]] \
+  && ok "agent.sh: a successful reply that only quotes the notice is not a usage limit" \
+  || note "agent.sh: a successful reply quoting the notice was read as a usage limit"
+[[ "$(limit_flag 1 '{"result":"Error: verify failed","is_error":true,"total_cost_usd":0}')" == "0" ]] \
+  && ok "agent.sh: an ordinary failed call is not a usage limit" \
+  || note "agent.sh: an ordinary failure was read as a usage limit"
+
+# --- 46. usage limit in BUILD: resumable exit 7, no replan, no failure counted (#140)
+R46="$WORK/r46"; new_repo "$R46"
+( cd "$R46" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=build \
+    STUB_LIMIT_MARKER="$WORK/r46.limit" STUB_CALL_LOG="$WORK/r46.calls" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r46.out" 2>"$WORK/r46.err" )
+RC46=$?
+[[ "$RC46" -eq 7 ]] \
+  && ok "usage limit in BUILD: exit 7" \
+  || note "usage limit in BUILD exited $RC46 — expected 7: $(tail -2 "$WORK/r46.err" | tr '\n' '|')"
+[[ "$(jq -r .state "$R46/tmp/autopilot/status.json" 2>/dev/null)" == "usage-limited" ]] \
+  && jq -r .usage_limit "$R46/tmp/autopilot/status.json" | grep -q 'resets 5:30pm' \
+  && ok "usage limit in BUILD: status.json reads usage-limited and carries the notice" \
+  || note "usage limit in BUILD: status.json state '$(jq -r .state "$R46/tmp/autopilot/status.json" 2>/dev/null)'"
+[[ "$(cat "$R46"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase=="build" and .verdict=="usage-limit")] | length')" -eq 1 ]] \
+  && ok "usage limit in BUILD: the call's run-log row carries verdict usage-limit" \
+  || note "usage limit in BUILD: no build row with verdict usage-limit"
+! grep -q "autonomous run is stuck" "$WORK/r46.calls" \
+  && [[ "$(cat "$R46"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase=="iteration")] | length')" -eq 0 ]] \
+  && [[ "$(jq -r '[.. | objects | .fails? // empty] | add // 0' "$R46/tmp/autopilot/slices.json" 2>/dev/null || echo 0)" -eq 0 ]] \
+  && ok "usage limit in BUILD: no replan, no iteration row, no slice failure recorded" \
+  || note "usage limit in BUILD: the limit was treated as a failure: $(cat "$R46/tmp/autopilot/slices.json" 2>/dev/null)"
+[[ -z "$(git -C "$R46" status --porcelain)" ]] \
+  && ok "usage limit in BUILD: the tree is left clean" \
+  || note "usage limit in BUILD: dirty tree: $(git -C "$R46" status --porcelain | head -3 | tr '\n' ' ')"
+run_loop "$R46" progress true; RC46B=$?
+[[ "$RC46B" -eq 0 ]] \
+  && ok "usage limit in BUILD: a rerun after the reset finishes (exit 0)" \
+  || note "usage limit in BUILD: rerun exited $RC46B"
+
+# --- 47. usage limit after BUILD worked: WIP kept, the next run gates it (#140)
+R47="$WORK/r47"; new_repo "$R47"
+BASE47="$(git -C "$R47" rev-parse HEAD)"
+( cd "$R47" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=verify \
+    STUB_LIMIT_MARKER="$WORK/r47.limit" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r47.out" 2>"$WORK/r47.err" )
+RC47=$?
+[[ "$RC47" -eq 7 ]] \
+  && ok "usage limit in the verifier: exit 7" \
+  || note "usage limit in the verifier exited $RC47 — expected 7: $(tail -2 "$WORK/r47.err" | tr '\n' '|')"
+git -C "$R47" log -1 --format=%s | grep -q 'usage-limited' \
+  && [[ -z "$(git -C "$R47" status --porcelain)" ]] \
+  && ok "usage limit in the verifier: BUILD's work is kept in a usage-limited WIP commit" \
+  || note "usage limit in the verifier: HEAD is '$(git -C "$R47" log -1 --format=%s)', status '$(git -C "$R47" status --porcelain | head -2 | tr '\n' ' ')'"
+[[ "$(jq -r .base_sha "$R47/tmp/autopilot/pending-gate.json" 2>/dev/null)" == "$BASE47" \
+   && "$(jq -r .ticked_before "$R47/tmp/autopilot/pending-gate.json" 2>/dev/null)" == "0" ]] \
+  && ok "usage limit in the verifier: pending-gate.json records the ungated base and tick count" \
+  || note "usage limit in the verifier: pending-gate.json is '$(cat "$R47/tmp/autopilot/pending-gate.json" 2>/dev/null)'"
+( cd "$R47" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_VERIFY_DIFF_LOG="$WORK/r47.diff" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 1 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r47b.out" 2>"$WORK/r47b.err" )
+grep -q '^new file mode' "$WORK/r47.diff" && grep -q 'src/work.txt' "$WORK/r47.diff" \
+  && ok "usage limit in the verifier: the next run's verifier diffs from the ungated base" \
+  || note "usage limit in the verifier: the next verifier saw: $(head -5 "$WORK/r47.diff" 2>/dev/null | tr '\n' '|')"
+[[ ! -e "$R47/tmp/autopilot/pending-gate.json" ]] \
+  && [[ "$(cat "$R47"/tmp/autopilot/run-*.jsonl | jq -s '[.[] | select(.phase=="iteration" and .verdict=="progressed")][0].ticked_delta // 0')" -eq 2 ]] \
+  && ok "usage limit in the verifier: the gated iteration counts both ticks and consumes pending-gate.json" \
+  || note "usage limit in the verifier: pending=$(cat "$R47/tmp/autopilot/pending-gate.json" 2>/dev/null) rows=$(cat "$R47"/tmp/autopilot/run-*.jsonl | jq -c 'select(.phase=="iteration")' | head -2)"
+
+# --- 48. usage limit in PLAN: a half-written plan is set aside (#140) --------
+R48="$WORK/r48"; new_repo "$R48"
+( cd "$R48" && PATH="$STUB_DIR:$PATH" STUB_MODE=progress STUB_LIMIT_PHASE=plan STUB_LIMIT_PLAIN=1 \
+    STUB_LIMIT_PARTIAL=1 STUB_LIMIT_MARKER="$WORK/r48.limit" \
+    bash "$LOOP_ABS" --verify-cmd true --max-iterations 12 --max-minutes 30 --budget-usd 5 \
+    >"$WORK/r48.out" 2>"$WORK/r48.err" )
+RC48=$?
+[[ "$RC48" -eq 7 && ! -e "$R48/tmp/autopilot/IMPLEMENTATION_PLAN.md" \
+   && -e "$R48/tmp/autopilot/IMPLEMENTATION_PLAN.md.usage-limited" ]] \
+  && ok "usage limit in PLAN: exit 7, the half-written plan moved aside" \
+  || note "usage limit in PLAN: exit $RC48, state dir: $(ls "$R48/tmp/autopilot" | tr '\n' ' ')"
+run_loop "$R48" progress true; RC48B=$?
+[[ "$RC48B" -eq 0 ]] \
+  && ok "usage limit in PLAN: a rerun plans afresh and finishes (exit 0)" \
+  || note "usage limit in PLAN: rerun exited $RC48B"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then
